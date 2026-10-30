@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Append a board benchmark run entry to runs_ledger.md.
 
-Implements PLAN.md section 9, step 4 & P-PRE-02 requirements:
+Implements PLAN.md section 9, step 4 & P-PRE-02 / P-PRE-03 requirements:
   - Requires --run-id (official board run ID)
   - Requires -T/--t and -M/--m taken strictly from the board results
-  - Never computes K from local numbers (K must come from the board)
+  - Validates -M with ^[0-9]+(\\.[0-9]+)?\\s?(B|KB|MB|MiB|GB|GiB)$ and rejects anything else
+  - Labels -K as "board K, copied, not verified" (never computed locally)
   - Never uses Docker image size as M (M must be memory.peak from board)
   - Refuses execution if required board measurements are missing
   - Allows --dry-run with prominent [DRY RUN] label without modifying ledger
@@ -28,6 +29,9 @@ DEFAULT_LEDGER = os.path.join(ROOT, "runs_ledger.md")
 HEADER_ROW = "| run ID | time | track | commit | hypothesis | T | M | K | kept/reverted |\n"
 DIVIDER_ROW = "|---|---|---|---|---|---|---|---|---|\n"
 
+# Strict memory regex required by P-PRE-03
+M_REGEX = r"^[0-9]+(\.[0-9]+)?\s?(B|KB|MB|MiB|GB|GiB)$"
+
 
 def get_current_git_commit():
     try:
@@ -38,24 +42,23 @@ def get_current_git_commit():
 
 
 def validate_board_memory(m_str):
-    """Validate that M looks like a memory reading and not an image size."""
+    """Validate that M strictly matches the required board memory pattern."""
     s = str(m_str).strip()
     if "image" in s.lower():
         raise ValueError("M must be peak memory (memory.peak) from the board run, never Docker image size.")
-    # Match number optionally followed by B, KB, MB, GB, MiB, etc.
-    if not re.match(r"^[0-9.]+\s*(B|K|KB|KIB|M|MB|MIB|G|GB|GIB)?$", s, re.IGNORECASE):
-        raise ValueError(f"Invalid peak memory format from board: {m_str!r}")
+    if not re.match(M_REGEX, s):
+        raise ValueError(f"Invalid peak memory format: {m_str!r}. Must match regex {M_REGEX}")
     return s
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Log board run results to runs_ledger.md (P-PRE-02).")
+    parser = argparse.ArgumentParser(description="Log board run results to runs_ledger.md (P-PRE-03).")
     parser.add_argument("--run-id", help="Official board run ID (required for real logging)")
     parser.add_argument("--track", choices=["a", "b", "c", "d"], help="Track (a, b, c, d)")
     parser.add_argument("--hypothesis", help="Hypothesis / experiment description")
     parser.add_argument("-T", "--t", "--time-sec", dest="time_sec", type=float, help="Board wall time in seconds")
-    parser.add_argument("-M", "--m", "--memory", dest="memory", help="Board peak memory (e.g. 48MB, 48234496). Never image size.")
-    parser.add_argument("-K", "--k", dest="k_score", type=float, help="Official K score from the board report (never computed locally)")
+    parser.add_argument("-M", "--m", "--memory", dest="memory", help=f"Board peak memory (e.g. 48MB, 215MiB; regex {M_REGEX}). Never image size.")
+    parser.add_argument("-K", "--k", dest="k_score", type=float, help="Official K score from the board report (board K, copied, not verified)")
     parser.add_argument("--commit", help="Candidate commit short SHA (defaults to git rev-parse --short HEAD)")
     parser.add_argument("--time", help="Timestamp (defaults to current UTC ISO-8601)")
     parser.add_argument("--verdict", default="kept", choices=["kept", "reverted", "pending"], help="verdict (kept/reverted/pending)")
@@ -109,13 +112,14 @@ def main():
     timestamp = args.time or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     # K is strictly taken from the board (--k / -K). Never computed from local numbers.
+    # Label: "board K, copied, not verified"
     k_str = f"{args.k_score:.2f}" if args.k_score is not None else "N/A"
     safe_hypo = hypo.replace("|", "/")
 
     row = f"| {run_id} | {timestamp} | {track} | {commit} | {safe_hypo} | {t_str} | {m_str} | {k_str} | {args.verdict} |\n"
 
     if args.dry_run:
-        print("[DRY RUN] Would append to ledger:")
+        print("[DRY RUN] Would append to ledger (K is board K, copied, not verified):")
         print(row, end="")
         return
 
@@ -129,7 +133,7 @@ def main():
     with open(ledger_path, "a", encoding="utf-8", newline="\n") as f:
         f.write(row)
 
-    print(f"Logged run {run_id} to {args.ledger}:")
+    print(f"Logged run {run_id} to {args.ledger} (K={k_str}: board K, copied, not verified):")
     print(row.strip())
 
 
