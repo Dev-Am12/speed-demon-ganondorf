@@ -1,0 +1,2 @@
+BOOL left OR right
+PHRASE "left right"

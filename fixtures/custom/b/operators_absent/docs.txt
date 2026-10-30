@@ -1,0 +1,4 @@
+0	and or not alpha beta
+1	alpha beta
+2	and alpha
+3	
