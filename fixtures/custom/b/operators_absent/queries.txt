@@ -1,0 +1,8 @@
+BOOL and
+BOOL or
+BOOL not
+BOOL alpha NOT beta
+BOOL alpha NOT beta NOT alpha
+BOOL alpha NOT alpha
+BOOL absent
+BOOL alpha OR absent

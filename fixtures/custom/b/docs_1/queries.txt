@@ -1,0 +1,2 @@
+BOOL solo
+BOOL absent

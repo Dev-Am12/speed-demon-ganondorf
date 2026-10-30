@@ -1,0 +1,5 @@
+0	bail bail bail bond
+1	bail bond bail bond
+2	estate. bond
+3	end
+4	start

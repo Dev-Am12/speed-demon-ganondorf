@@ -1,0 +1,10 @@
+BOOL z
+BOOL rich
+BOOL zurich
+BOOL 007
+BOOL 7
+BOOL na
+BOOL ve
+BOOL bail AND bond
+PHRASE "bail bond"
+PHRASE "a b"

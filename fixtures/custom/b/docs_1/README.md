@@ -1,0 +1,1 @@
+One-document corpus.
