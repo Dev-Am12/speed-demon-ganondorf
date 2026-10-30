@@ -2,13 +2,15 @@ use std::ffi::c_void;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::sync::OnceLock;
 use std::thread;
 
 const EMPTY_ID: u32 = u32::MAX;
 const MAX_TERM_LEN: usize = 32;
 const MAX_THREADS: usize = 12;
+const QUERY_BLOCK_SIZE: usize = 256;
 const PROT_READ: i32 = 1;
 const MAP_PRIVATE: i32 = 2;
 
@@ -855,6 +857,85 @@ fn parse_queries(query_bytes: &[u8], vocabulary: &mut Vocabulary) -> Vec<Query> 
     queries
 }
 
+fn evaluate_query(
+    output: &mut Vec<u8>,
+    query: &Query,
+    docs: &[u8],
+    document_starts: &[usize],
+    postings: &PostingIndex,
+    vocabulary: &Vocabulary,
+    classes: &[u8; 256],
+    scratch: &mut Scratch,
+    threshold: usize,
+) {
+    match query {
+        Query::Bool { terms, ops } => {
+            let mut result = terms
+                .first()
+                .copied()
+                .map(Accumulator::Term)
+                .unwrap_or(Accumulator::List(0));
+            for (index, &op) in ops.iter().enumerate() {
+                if let Some(&rhs) = terms.get(index + 1) {
+                    result = apply_operator(result, rhs, op, postings, scratch, threshold);
+                }
+            }
+            let view = accumulator_view(result, postings, scratch);
+            append_view_result(output, view, postings.doc_count);
+        }
+        Query::Phrase(phrase) => {
+            let mut distinct = phrase.clone();
+            distinct.sort_unstable();
+            distinct.dedup();
+            distinct.sort_by_key(|&id| postings.set(id).df());
+            let mut candidates = Vec::new();
+            if let Some(&seed) = distinct.first() {
+                match postings.view(seed) {
+                    SetView::List(ids) => candidates.extend_from_slice(ids),
+                    SetView::Bits(words) => {
+                        for (word_index, &word) in words.iter().enumerate() {
+                            let mut remaining = word;
+                            while remaining != 0 {
+                                let id = word_index * 64 + remaining.trailing_zeros() as usize;
+                                if id < postings.doc_count {
+                                    candidates.push(id as u32);
+                                }
+                                remaining &= remaining - 1;
+                            }
+                        }
+                    }
+                }
+            }
+            let mut matches = Vec::new();
+            for doc_id in candidates {
+                if distinct
+                    .iter()
+                    .skip(1)
+                    .any(|&term_id| !postings.contains(term_id, doc_id))
+                {
+                    continue;
+                }
+                let index = doc_id as usize;
+                let start = document_starts[index];
+                let mut end = document_starts[index + 1];
+                if end > start && docs[end - 1] == b'\n' {
+                    end -= 1;
+                }
+                let line = &docs[start..end];
+                let text_start = line
+                    .iter()
+                    .position(|&byte| byte == b'\t')
+                    .map(|tab| start + tab + 1)
+                    .unwrap_or(end);
+                if phrase_matches(&docs[text_start..end], phrase, vocabulary, classes) {
+                    matches.push(doc_id);
+                }
+            }
+            append_result(output, &matches);
+        }
+    }
+}
+
 fn run(docs: &[u8]) -> io::Result<()> {
     let query_bytes = fs::read("/data/queries.txt")?;
     let mut vocabulary = Vocabulary::new();
@@ -923,85 +1004,71 @@ fn run(docs: &[u8]) -> io::Result<()> {
     // threshold expression to force either representation during the gate.
     let threshold = (documents_before / 32).max(1);
     let postings = PostingIndex::from_flat(ids, &offsets, &df, documents_before, threshold);
-    let mut scratch = Scratch::new();
+    let block_count = queries.len().div_ceil(QUERY_BLOCK_SIZE);
+    let worker_count = thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+        .min(MAX_THREADS)
+        .min(block_count.max(1));
+    let next_block = AtomicUsize::new(0);
+    let (sender, receiver) = mpsc::channel();
 
-    let mut output = Vec::new();
-    for query in &queries {
-        match query {
-            Query::Bool { terms, ops } => {
-                let mut result = terms
-                    .first()
-                    .copied()
-                    .map(Accumulator::Term)
-                    .unwrap_or(Accumulator::List(0));
-                for (index, &op) in ops.iter().enumerate() {
-                    if let Some(&rhs) = terms.get(index + 1) {
-                        result =
-                            apply_operator(result, rhs, op, &postings, &mut scratch, threshold);
+    thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let sender = sender.clone();
+            let queries = &queries;
+            let document_starts = &document_starts;
+            let postings = &postings;
+            let vocabulary = &vocabulary;
+            let next_block = &next_block;
+            scope.spawn(move || {
+                let mut scratch = Scratch::new();
+                loop {
+                    let block = next_block.fetch_add(1, Ordering::Relaxed);
+                    if block >= block_count {
+                        break;
+                    }
+                    let start = block * QUERY_BLOCK_SIZE;
+                    let end = (start + QUERY_BLOCK_SIZE).min(queries.len());
+                    let mut output = Vec::new();
+                    for query in &queries[start..end] {
+                        evaluate_query(
+                            &mut output,
+                            query,
+                            docs,
+                            document_starts,
+                            postings,
+                            vocabulary,
+                            &classes,
+                            &mut scratch,
+                            threshold,
+                        );
+                    }
+                    if sender.send((block, output)).is_err() {
+                        break;
                     }
                 }
-                let view = accumulator_view(result, &postings, &scratch);
-                append_view_result(&mut output, view, documents_before);
-            }
-            Query::Phrase(phrase) => {
-                let mut distinct = phrase.clone();
-                distinct.sort_unstable();
-                distinct.dedup();
-                distinct.sort_by_key(|&id| postings.set(id).df());
-                let mut candidates = Vec::new();
-                if let Some(&seed) = distinct.first() {
-                    match postings.view(seed) {
-                        SetView::List(ids) => candidates.extend_from_slice(ids),
-                        SetView::Bits(words) => {
-                            for (word_index, &word) in words.iter().enumerate() {
-                                let mut remaining = word;
-                                while remaining != 0 {
-                                    let id = word_index * 64 + remaining.trailing_zeros() as usize;
-                                    if id < documents_before {
-                                        candidates.push(id as u32);
-                                    }
-                                    remaining &= remaining - 1;
-                                }
-                            }
-                        }
-                    }
-                }
-                let mut matches = Vec::new();
-                for doc_id in candidates {
-                    if distinct
-                        .iter()
-                        .skip(1)
-                        .any(|&term_id| !postings.contains(term_id, doc_id))
-                    {
-                        continue;
-                    }
-                    let index = doc_id as usize;
-                    let start = document_starts[index];
-                    let mut end = document_starts[index + 1];
-                    if end > start && docs[end - 1] == b'\n' {
-                        end -= 1;
-                    }
-                    let line = &docs[start..end];
-                    let text_start = line
-                        .iter()
-                        .position(|&byte| byte == b'\t')
-                        .map(|tab| start + tab + 1)
-                        .unwrap_or(end);
-                    if phrase_matches(&docs[text_start..end], phrase, &vocabulary, classes) {
-                        matches.push(doc_id);
-                    }
-                }
-                append_result(&mut output, &matches);
-            }
+            });
         }
+        drop(sender);
+    });
+
+    // Workers finish blocks in arbitrary order; index them before writing so
+    // thread scheduling never changes the result byte order.
+    let mut blocks: Vec<Option<Vec<u8>>> =
+        std::iter::repeat_with(|| None).take(block_count).collect();
+    for (block, output) in receiver {
+        blocks[block] = Some(output);
     }
 
     fs::create_dir_all("/out")?;
     let mut file = fs::File::create("/out/results.txt")?;
-    file.write_all(&output)?;
+    for output in blocks.into_iter().flatten() {
+        file.write_all(&output)?;
+    }
     file.flush()?;
     drop(file);
-    Ok(())
+    std::process::exit(0)
 }
 
 fn main() -> io::Result<()> {
