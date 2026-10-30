@@ -5,4 +5,4 @@ Every step from the reference to your final version, each with the live-board ru
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 32.05 | 228 | 0 |
-| 1 | | | | | |
+| 1 | Rust single-threaded baseline (v0) [local: 6.01 s check.py, ~40 MB peak memory] | pending | | | |
