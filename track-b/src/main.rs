@@ -2,7 +2,7 @@ use std::ffi::c_void;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::OnceLock;
 use std::thread;
@@ -239,11 +239,13 @@ fn scan_chunk_write(
     vocabulary: &Vocabulary,
     classes: &[u8; 256],
     global_doc_start: u32,
-    term_bases: &[usize],
-    postings: &[AtomicU32],
+    term_bases: &[u32],
+    term_refs: &[TermRef],
+    sparse: &[AtomicU32],
+    bitsets: &[AtomicU64],
 ) {
     let mut last_seen = vec![u32::MAX; vocabulary.len()];
-    let mut cursors = vec![0usize; vocabulary.len()];
+    let mut cursors = vec![0u32; vocabulary.len()];
     let mut position = 0usize;
     let mut local_doc = 0u32;
 
@@ -261,9 +263,17 @@ fn scan_chunk_write(
                         let index = id as usize;
                         if last_seen[index] != local_doc {
                             last_seen[index] = local_doc;
-                            let slot = term_bases[index] + cursors[index];
-                            cursors[index] += 1;
-                            postings[slot].store(global_doc_start + local_doc, Ordering::Relaxed);
+                            let reference = term_refs[index];
+                            if reference.is_dense() {
+                                let doc_id = global_doc_start + local_doc;
+                                let slot = reference.start as usize + (doc_id as usize / 64);
+                                bitsets[slot].fetch_or(1u64 << (doc_id % 64), Ordering::Relaxed);
+                            } else {
+                                let slot = term_bases[index] + cursors[index];
+                                cursors[index] += 1;
+                                sparse[slot as usize]
+                                    .store(global_doc_start + local_doc, Ordering::Relaxed);
+                            }
                         }
                     }
                 }
@@ -325,10 +335,12 @@ fn write_chunks(
     bytes: &[u8],
     ranges: &[(usize, usize)],
     doc_bases: &[u32],
-    term_bases: &[Vec<usize>],
+    term_bases: &[Vec<u32>],
+    term_refs: &[TermRef],
     vocabulary: &Vocabulary,
     classes: &[u8; 256],
-    postings: &[AtomicU32],
+    sparse: &[AtomicU32],
+    bitsets: &[AtomicU64],
 ) -> io::Result<()> {
     thread::scope(|scope| {
         let mut handles = Vec::with_capacity(ranges.len());
@@ -338,7 +350,9 @@ fn write_chunks(
             let base = &term_bases[index];
             let doc_base = doc_bases[index];
             handles.push(scope.spawn(move || {
-                scan_chunk_write(slice, vocabulary, classes, doc_base, base, postings)
+                scan_chunk_write(
+                    slice, vocabulary, classes, doc_base, base, term_refs, sparse, bitsets,
+                )
             }));
         }
         for handle in handles {
@@ -350,26 +364,25 @@ fn write_chunks(
     })
 }
 
-enum TermSet {
-    Empty,
-    List { ids: Vec<u32>, df: usize },
-    Bits { words: Vec<u64>, df: usize },
+const DENSE_TAG: u32 = 1 << 31;
+
+#[derive(Clone, Copy)]
+struct TermRef {
+    start: u32,
+    tagged_len: u32,
 }
 
-impl TermSet {
-    fn view(&self) -> SetView<'_> {
-        match self {
-            Self::Empty => SetView::List(&[]),
-            Self::List { ids, .. } => SetView::List(ids),
-            Self::Bits { words, .. } => SetView::Bits(words),
-        }
+impl TermRef {
+    fn is_dense(self) -> bool {
+        self.tagged_len & DENSE_TAG != 0
     }
 
-    fn df(&self) -> usize {
-        match self {
-            Self::Empty => 0,
-            Self::List { df, .. } | Self::Bits { df, .. } => *df,
-        }
+    fn len(self) -> usize {
+        (self.tagged_len & !DENSE_TAG) as usize
+    }
+
+    fn df(self) -> usize {
+        self.len()
     }
 }
 
@@ -405,50 +418,44 @@ impl SetView<'_> {
 }
 
 struct PostingIndex {
-    sets: Vec<TermSet>,
+    sparse: Vec<u32>,
+    bitsets: Vec<u64>,
+    sets: Vec<TermRef>,
     doc_count: usize,
 }
 
 impl PostingIndex {
-    fn from_flat(
-        ids: Vec<u32>,
-        offsets: &[usize],
-        df: &[u32],
+    fn from_arenas(
+        sparse: Vec<u32>,
+        bitsets: Vec<u64>,
+        sets: Vec<TermRef>,
         doc_count: usize,
-        threshold: usize,
     ) -> Self {
-        let mut sets = Vec::with_capacity(df.len());
-        let word_count = doc_count.div_ceil(64);
-        for term in 0..df.len() {
-            let frequency = df[term] as usize;
-            if frequency == 0 {
-                sets.push(TermSet::Empty);
-            } else if frequency >= threshold {
-                let mut words = vec![0u64; word_count];
-                for &doc_id in &ids[offsets[term]..offsets[term + 1]] {
-                    let index = doc_id as usize;
-                    words[index / 64] |= 1u64 << (index % 64);
-                }
-                sets.push(TermSet::Bits {
-                    words,
-                    df: frequency,
-                });
-            } else {
-                sets.push(TermSet::List {
-                    ids: ids[offsets[term]..offsets[term + 1]].to_vec(),
-                    df: frequency,
-                });
-            }
+        Self {
+            sparse,
+            bitsets,
+            sets,
+            doc_count,
         }
-        Self { sets, doc_count }
     }
 
-    fn set(&self, term_id: u32) -> &TermSet {
-        &self.sets[term_id as usize]
+    fn reference(&self, term_id: u32) -> TermRef {
+        self.sets[term_id as usize]
+    }
+
+    fn df(&self, term_id: u32) -> usize {
+        self.reference(term_id).df()
     }
 
     fn view(&self, term_id: u32) -> SetView<'_> {
-        self.set(term_id).view()
+        let reference = self.reference(term_id);
+        let start = reference.start as usize;
+        if reference.is_dense() {
+            let words = self.doc_count.div_ceil(64);
+            SetView::Bits(&self.bitsets[start..start + words])
+        } else {
+            SetView::List(&self.sparse[start..start + reference.len()])
+        }
     }
 
     fn contains(&self, term_id: u32, doc_id: u32) -> bool {
@@ -887,7 +894,7 @@ fn evaluate_query(
             let mut distinct = phrase.clone();
             distinct.sort_unstable();
             distinct.dedup();
-            distinct.sort_by_key(|&id| postings.set(id).df());
+            distinct.sort_by_key(|&id| postings.df(id));
             let mut candidates = Vec::new();
             if let Some(&seed) = distinct.first() {
                 match postings.view(seed) {
@@ -954,15 +961,15 @@ fn run(docs: &[u8]) -> io::Result<()> {
     let mut thread_doc_bases = Vec::with_capacity(chunk_counts.len());
     let mut thread_term_bases = Vec::with_capacity(chunk_counts.len());
     let mut documents_before = 0usize;
-    let mut per_term_before = vec![0usize; vocabulary.len()];
+    let mut per_term_before = vec![0u32; vocabulary.len()];
 
     for chunk in &chunk_counts {
         thread_doc_bases.push(documents_before as u32);
-        let mut bases = vec![0usize; vocabulary.len()];
+        let mut bases = vec![0u32; vocabulary.len()];
         for term in 0..vocabulary.len() {
             df[term] += chunk.df[term];
             bases[term] = per_term_before[term];
-            per_term_before[term] += chunk.df[term] as usize;
+            per_term_before[term] += chunk.df[term];
         }
         thread_term_bases.push(bases);
         documents_before += chunk.starts.len();
@@ -970,40 +977,76 @@ fn run(docs: &[u8]) -> io::Result<()> {
     }
     document_starts.push(docs.len());
 
-    let mut offsets = Vec::with_capacity(vocabulary.len() + 1);
-    offsets.push(0usize);
-    for &frequency in &df {
-        let next = offsets.last().copied().unwrap_or(0) + frequency as usize;
-        offsets.push(next);
+    let threshold = (documents_before / 32).max(1);
+    let word_count = documents_before.div_ceil(64) as u32;
+    let mut term_refs = vec![
+        TermRef {
+            start: 0,
+            tagged_len: 0
+        };
+        vocabulary.len()
+    ];
+    let mut sparse_total = 0u32;
+    let mut bitset_total = 0u32;
+
+    // Replace each total df with that term's sparse arena start. Dense terms
+    // receive a separate bitset range; per-thread prefixes are added below.
+    for term in 0..vocabulary.len() {
+        let frequency = df[term];
+        if frequency as usize >= threshold {
+            term_refs[term] = TermRef {
+                start: bitset_total,
+                tagged_len: DENSE_TAG | frequency,
+            };
+            bitset_total += word_count;
+            df[term] = 0;
+        } else {
+            term_refs[term] = TermRef {
+                start: sparse_total,
+                tagged_len: frequency,
+            };
+            df[term] = sparse_total;
+            sparse_total += frequency;
+        }
     }
     for bases in &mut thread_term_bases {
         for term in 0..vocabulary.len() {
-            bases[term] += offsets[term];
+            if !term_refs[term].is_dense() {
+                bases[term] += term_refs[term].start;
+            }
         }
     }
+    // Pass-one per-thread counts are no longer needed; only line starts and
+    // the u32 pass-two bases remain.
+    drop(chunk_counts);
+    drop(per_term_before);
 
-    // The first-pass counts assign each thread a disjoint segment of each
-    // term's sorted posting range; atomics make those parallel stores safe.
-    let atomic_ids: Vec<AtomicU32> = (0..*offsets.last().unwrap_or(&0))
-        .map(|_| AtomicU32::new(0))
-        .collect();
+    let sparse_atomic: Vec<AtomicU32> = (0..sparse_total).map(|_| AtomicU32::new(0)).collect();
+    let bitset_atomic: Vec<AtomicU64> = (0..bitset_total).map(|_| AtomicU64::new(0)).collect();
     write_chunks(
         docs,
         &ranges,
         &thread_doc_bases,
         &thread_term_bases,
+        &term_refs,
         &vocabulary,
         classes,
-        &atomic_ids,
+        &sparse_atomic,
+        &bitset_atomic,
     )?;
-    let ids = atomic_ids
-        .iter()
-        .map(|value| value.load(Ordering::Relaxed))
+
+    // Consume the atomic arenas into ordinary vectors; no second per-term
+    // posting copy or per-term heap allocation is made.
+    let sparse: Vec<u32> = sparse_atomic
+        .into_iter()
+        .map(AtomicU32::into_inner)
         .collect();
-    // A set at or above N/32 uses a bitset. Scratch copies can change this
-    // threshold expression to force either representation during the gate.
-    let threshold = (documents_before / 32).max(1);
-    let postings = PostingIndex::from_flat(ids, &offsets, &df, documents_before, threshold);
+    let bitsets: Vec<u64> = bitset_atomic
+        .into_iter()
+        .map(AtomicU64::into_inner)
+        .collect();
+    let postings = PostingIndex::from_arenas(sparse, bitsets, term_refs, documents_before);
+
     let block_count = queries.len().div_ceil(QUERY_BLOCK_SIZE);
     let worker_count = thread::available_parallelism()
         .map(|count| count.get())
