@@ -4,7 +4,7 @@ The contract and exact output format are in the [Track B specification](https://
 
 ## Approach
 
-The current b/v2 implementation builds on the board-measured v1 baseline. It parses query terms into a deterministic open-addressed vocabulary, maps /data/docs.txt read-only and scans line-aligned chunks in parallel twice. Pass one counts document frequencies and records document boundaries; pass two fills flat posting arenas. The corpus is never copied to a heap buffer.
+The current implementation builds on the board-measured v1 baseline; the V2 board result is recorded below. It parses query terms into a deterministic open-addressed vocabulary, maps /data/docs.txt read-only and scans line-aligned chunks in parallel twice. Pass one counts document frequencies and records document boundaries; pass two fills flat posting arenas. The corpus is never copied to a heap buffer.
 
 A shared byte scanner handles both passes. A compile-time 256-entry table maps ASCII letters and digits, while all other bytes are separators. Short terms use packed keys; longer keys are confirmed against the stored term bytes, and a bitmap filters most vocabulary misses before probing. Tokens longer than 32 bytes still occupy a phrase position but cannot match query terms.
 
@@ -18,9 +18,9 @@ The memory map avoids copying the corpus. Parallel line-aligned scanning shares 
 
 ## Measurements
 
-The supplied v1 board result is run 832e2c8: 1.408 s, 278 MB, 1,033 source lines, K 6.643748 and 41.121 points.
+The supplied v1 board result is run 832e2c8: 1.408 s, 278 MB, 1,033 source lines, K 6.643748 and 41.121 points. The supplied V2 board result is 0.970 s, 103 MB, 1,172 source lines, K 9.585 and 49.450 points; its run ID was not provided.
 
-The kept local V2 result is Stage 3: hyperfine (2 warmups, 10 runs) measured 1.858 s +/- 0.178 s on full. The memory watcher reported RssAnon 87,336 kB, VmHWM 337,308 kB and RssFile 249,972 kB. Calibrated scc --by-file src/main.rs Dockerfile reports 1,172 code lines (1,165 Rust plus 7 Dockerfile). The local-only K estimate is 7.156; no V2 board measurement is claimed.
+The kept local V2 result is Stage 3: hyperfine (2 warmups, 10 runs) measured 1.858 s +/- 0.178 s on full. The memory watcher reported RssAnon 87,336 kB, VmHWM 337,308 kB and RssFile 249,972 kB. Calibrated scc --by-file src/main.rs Dockerfile reports 1,172 code lines (1,165 Rust plus 7 Dockerfile). The local-only Stage 3 K estimate was 7.156; the V2 board result above is separate from that local estimate.
 
 Stage 4a packed sparse postings and reduced RssAnon to 64,940 kB, but its paired full run was slower than the acceptance limit, so that experiment was reverted.
 

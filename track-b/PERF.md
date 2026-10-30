@@ -7,6 +7,7 @@ Board measurements and local estimates are labeled separately. Local memory is p
 | 0 | Reference, unchanged | Reference axes | - | 56.35 | 2,200 | 91 | - | - | Organizer reference |
 | v0 | Query-term inverted index; BOOL merges; phrase verification | Board | 40ad00c | 13.5 | 400 | 308 | 2.397181 | 18.985 | Supplied board result |
 | v1 | Read-only mmap; parallel two-pass scan; hybrid lists/bitsets; ordered parallel query blocks | Board | 832e2c8 | 1.408 | 278 | 1033 | 6.643748 | 41.121 | Supplied board result |
+| v2 | Fused scan; compact vocabulary; phrase-key verification and rarest-term seeding | Board | not supplied | 0.970 | 103 | 1172 | 9.585 | 49.450 | Supplied board result |
 | V2 M1 | Flat sparse and dense arenas; no per-term posting vectors | LOCAL: 2.693 +/- 0.155 s; RssAnon 87.65 MB; VmHWM 337.63 MB | pending | 2.693 | 87.65 | 1068 | - | - | Kept; full gate and tiny fuzz passed |
 | V2 T1 | Fused byte scan; compact vocabulary; key prefilter | LOCAL: 1.993 +/- 0.028 s; RssAnon 86.60 MB; VmHWM 336.58 MB | pending | 1.993 | 86.60 | 1167 | - | - | Kept; full gate and tiny fuzz passed |
 | V2 Stage 3 | Phrase key verifier; rarest seed; candidate iteration without copies | LOCAL: 1.858 +/- 0.178 s; RssAnon 87.34 MB; VmHWM 337.31 MB | pending | 1.858 | 87.34 | 1172 | 7.156 | - | Kept; local K estimate only |
