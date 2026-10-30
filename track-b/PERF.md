@@ -1,8 +1,10 @@
 # Track B: performance log
 
-Every step from the reference to your final version, each with the live-board run ID that measured it. Judges check that the run IDs exist and that each change moved the way you say it did.
+Board measurements for the current baseline and the unchanged reference.
 
-| Step | Change | Run ID | T (s) | M (MB) | Points |
-|---|---|---|---|---|---|
-| 0 | The reference, unchanged | | 56.35 | 2,200 | 0 |
-| 1 | | | | | |
+| Step | Change | Result | Board run ID | T (s) | M (MB) | Source lines | K | Points | Verdict / note |
+|---|---|---|---|---:|---:|---:|---:|---:|---|
+| 0 | Reference, unchanged | — | — | 56.35 | 2,200 | — | — | 0 | Baseline from the existing log |
+| 1 | B v0: query-term inverted index; BOOL merges; phrase candidate verification | Board measurement | 40ad00c | 13.5 | 400 | 308 | 2.397181 | 18.985 | Current baseline |
+
+Commit was not included in the supplied board stats.

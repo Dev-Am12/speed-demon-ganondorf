@@ -1,4 +1,5 @@
 .out/
 data/
 
-ROLE_C_TASKS.mdtarget/
+ROLE_C_TASKS.md
+target/
