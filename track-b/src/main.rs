@@ -2,12 +2,10 @@ use std::ffi::c_void;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::OnceLock;
 use std::thread;
 
-const EMPTY_ID: u32 = u32::MAX;
 const MAX_TERM_LEN: usize = 32;
 const MAX_THREADS: usize = 12;
 const QUERY_BLOCK_SIZE: usize = 256;
@@ -37,37 +35,61 @@ enum Query {
     Phrase(Vec<u32>),
 }
 
-// The open-addressing slots contain only ids; term bytes live once in this
-// compact vocabulary and are compared after a hash collision.
 struct Vocabulary {
-    slots: Vec<u32>,
-    terms: Vec<Vec<u8>>,
+    keys: Vec<u64>,
+    ids: Vec<u32>,
+    term_bytes: Vec<u8>,
+    offsets: Vec<u32>,
+    maybe_bits: Vec<u64>,
 }
 
 impl Vocabulary {
     fn new() -> Self {
         Self {
-            slots: vec![EMPTY_ID; 8],
-            terms: Vec::new(),
+            keys: vec![0; 8],
+            ids: vec![0; 8],
+            term_bytes: Vec::new(),
+            offsets: vec![0],
+            maybe_bits: vec![0; 1 << 14],
         }
     }
 
     fn len(&self) -> usize {
-        self.terms.len()
+        self.offsets.len() - 1
+    }
+
+    fn term(&self, id: u32) -> &[u8] {
+        let index = id as usize;
+        &self.term_bytes[self.offsets[index] as usize..self.offsets[index + 1] as usize]
+    }
+
+    fn maybe_present(&self, key: u64) -> bool {
+        let bit = slot_hash(key) as usize & ((1 << 20) - 1);
+        self.maybe_bits[bit / 64] & (1u64 << (bit % 64)) != 0
+    }
+
+    fn mark_maybe(&mut self, key: u64) {
+        let bit = slot_hash(key) as usize & ((1 << 20) - 1);
+        self.maybe_bits[bit / 64] |= 1u64 << (bit % 64);
     }
 
     fn get(&self, term: &[u8]) -> Option<u32> {
         if term.is_empty() || term.len() > MAX_TERM_LEN {
             return None;
         }
-        let mask = self.slots.len() - 1;
-        let mut slot = (hash_term(term) as usize) & mask;
+        let key = term_key(term);
+        if !self.maybe_present(key) {
+            return None;
+        }
+        let mask = self.keys.len() - 1;
+        let mut slot = slot_hash(key) as usize & mask;
         loop {
-            let id = self.slots[slot];
-            if id == EMPTY_ID {
+            let candidate = self.keys[slot];
+            if candidate == 0 {
                 return None;
             }
-            if self.terms[id as usize].as_slice() == term {
+            let id = self.ids[slot];
+            if candidate == key && self.term(id) == term {
                 return Some(id);
             }
             slot = (slot + 1) & mask;
@@ -78,37 +100,62 @@ impl Vocabulary {
         if let Some(id) = self.get(term) {
             return id;
         }
-        if self.terms.len().saturating_add(1) > self.slots.len() / 2 {
+        if self.len() + 1 > self.keys.len() / 2 {
             self.grow();
         }
-        let id = self.terms.len() as u32;
-        self.terms.push(term.to_vec());
-        self.insert_existing(id);
+        let id = self.len() as u32;
+        let key = term_key(term);
+        self.term_bytes.extend_from_slice(term);
+        self.offsets.push(self.term_bytes.len() as u32);
+        self.mark_maybe(key);
+        self.insert_existing(key, id);
         id
     }
 
     fn grow(&mut self) {
-        let new_capacity = self.slots.len() * 2;
-        let old_slots = std::mem::replace(&mut self.slots, vec![EMPTY_ID; new_capacity]);
-        for id in old_slots {
-            if id != EMPTY_ID {
-                self.insert_existing(id);
+        let new_capacity = self.keys.len() * 2;
+        let old_keys = std::mem::replace(&mut self.keys, vec![0; new_capacity]);
+        let old_ids = std::mem::replace(&mut self.ids, vec![0; new_capacity]);
+        for (key, id) in old_keys.into_iter().zip(old_ids) {
+            if key != 0 {
+                self.insert_existing(key, id);
             }
         }
     }
 
-    fn insert_existing(&mut self, id: u32) {
-        let mask = self.slots.len() - 1;
-        let mut slot = (hash_term(&self.terms[id as usize]) as usize) & mask;
-        while self.slots[slot] != EMPTY_ID {
+    fn insert_existing(&mut self, key: u64, id: u32) {
+        let mask = self.keys.len() - 1;
+        let mut slot = slot_hash(key) as usize & mask;
+        while self.keys[slot] != 0 {
             slot = (slot + 1) & mask;
         }
-        self.slots[slot] = id;
+        self.keys[slot] = key;
+        self.ids[slot] = id;
     }
 }
 
-// Process up to four 8-byte words per term; the only zero padding is the
-// final partial word, avoiding a 32-byte clear for each token.
+// Short terms are exact little-endian bytes. Long terms carry a hash marker;
+// stored bytes confirm equality after any hash collision.
+fn term_key(term: &[u8]) -> u64 {
+    if term.len() <= 8 {
+        let mut key = 0u64;
+        for (index, &byte) in term.iter().enumerate() {
+            key |= (byte as u64) << (index * 8);
+        }
+        key
+    } else {
+        hash_term(term) | (1u64 << 63)
+    }
+}
+
+fn slot_hash(key: u64) -> u64 {
+    let mut value = key ^ (key >> 30);
+    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
 fn hash_term(term: &[u8]) -> u64 {
     let mut hash = 0x9e37_79b9_7f4a_7c15u64 ^ term.len() as u64;
     for chunk in term.chunks(8) {
@@ -129,40 +176,55 @@ fn hash_term(term: &[u8]) -> u64 {
     hash ^ (hash >> 33)
 }
 
-// Class 0 is a separator, 1 is a lowercase letter or digit, and 2 is an
-// uppercase ASCII letter that needs only its ASCII lowercase bit set.
-static BYTE_CLASS: OnceLock<[u8; 256]> = OnceLock::new();
-
-fn byte_classes() -> &'static [u8; 256] {
-    BYTE_CLASS.get_or_init(|| {
-        let mut classes = [0u8; 256];
-        for byte in b'a'..=b'z' {
-            classes[byte as usize] = 1;
-        }
-        for byte in b'A'..=b'Z' {
-            classes[byte as usize] = 2;
-        }
-        for byte in b'0'..=b'9' {
-            classes[byte as usize] = 1;
-        }
-        classes
-    })
+const fn make_byte_map() -> [u8; 256] {
+    let mut map = [0u8; 256];
+    let mut byte = b'a';
+    while byte <= b'z' {
+        map[byte as usize] = byte;
+        byte += 1;
+    }
+    byte = b'A';
+    while byte <= b'Z' {
+        map[byte as usize] = byte | 0x20;
+        byte += 1;
+    }
+    byte = b'0';
+    while byte <= b'9' {
+        map[byte as usize] = byte;
+        byte += 1;
+    }
+    map
 }
 
-// Shared by both scans and phrase verification. It never truncates an
-// overlong run and lets a verifier stop as soon as its phrase is found.
-fn tokenize<F>(text: &[u8], classes: &[u8; 256], mut visit: F)
+const BYTE_MAP: [u8; 256] = make_byte_map();
+
+fn finish_token<F>(
+    token: &[u8; MAX_TERM_LEN],
+    length: &mut usize,
+    doc_id: u32,
+    vocabulary: &Vocabulary,
+    hit: &mut F,
+) where
+    F: FnMut(u32, u32),
+{
+    if *length != 0 && *length <= MAX_TERM_LEN {
+        if let Some(id) = vocabulary.get(&token[..*length]) {
+            hit(id, doc_id);
+        }
+    }
+    *length = 0;
+}
+
+fn tokenize<F>(text: &[u8], map: &[u8; 256], mut visit: F)
 where
     F: FnMut(Option<&[u8]>) -> bool,
 {
     let mut token = [0u8; MAX_TERM_LEN];
     let mut length = 0usize;
     for &byte in text {
-        let class = classes[byte as usize];
-        if class != 0 {
-            if length < MAX_TERM_LEN {
-                token[length] = if class == 2 { byte | 0x20 } else { byte };
-            }
+        let mapped = map[byte as usize];
+        if mapped != 0 {
+            token[length & (MAX_TERM_LEN - 1)] = mapped;
             length += 1;
         } else if length != 0 {
             let keep_going = if length <= MAX_TERM_LEN {
@@ -185,97 +247,151 @@ where
     }
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TermState {
+    last_seen: u32,
+    value: u32,
+}
+
 struct ChunkCount {
-    df: Vec<u32>,
+    states: Vec<TermState>,
     starts: Vec<usize>,
+    documents: u32,
+}
+
+// The same byte loop is used for counting and posting writes. It recognizes
+// only text after the first TAB, and emits a hit at the current local document.
+fn scan_chunk<F>(
+    bytes: &[u8],
+    absolute_start: usize,
+    vocabulary: &Vocabulary,
+    map: &[u8; 256],
+    mut starts: Option<&mut Vec<usize>>,
+    mut hit: F,
+) -> u32
+where
+    F: FnMut(u32, u32),
+{
+    if !bytes.is_empty() {
+        if let Some(starts) = starts.as_deref_mut() {
+            starts.push(absolute_start);
+        }
+    }
+    let mut token = [0u8; MAX_TERM_LEN];
+    let mut length = 0usize;
+    let mut in_id = true;
+    let mut local_doc = 0u32;
+    let mut documents = 0u32;
+
+    for (position, &byte) in bytes.iter().enumerate() {
+        if byte == b'\n' {
+            if !in_id {
+                finish_token(&token, &mut length, local_doc, vocabulary, &mut hit);
+            }
+            local_doc += 1;
+            documents += 1;
+            in_id = true;
+            length = 0;
+            if position + 1 < bytes.len() {
+                if let Some(starts) = starts.as_deref_mut() {
+                    starts.push(absolute_start + position + 1);
+                }
+            }
+        } else if in_id {
+            if byte == b'\t' {
+                in_id = false;
+                length = 0;
+            }
+        } else {
+            let mapped = map[byte as usize];
+            if mapped != 0 {
+                token[length & (MAX_TERM_LEN - 1)] = mapped;
+                length += 1;
+            } else if length != 0 {
+                finish_token(&token, &mut length, local_doc, vocabulary, &mut hit);
+            }
+        }
+    }
+
+    if !in_id {
+        finish_token(&token, &mut length, local_doc, vocabulary, &mut hit);
+    }
+    if !bytes.is_empty() && bytes[bytes.len() - 1] != b'\n' {
+        documents += 1;
+    }
+    documents
 }
 
 fn scan_chunk_count(
     bytes: &[u8],
     absolute_start: usize,
     vocabulary: &Vocabulary,
-    classes: &[u8; 256],
+    map: &[u8; 256],
 ) -> ChunkCount {
-    let mut df = vec![0u32; vocabulary.len()];
-    let mut last_seen = vec![u32::MAX; vocabulary.len()];
+    let mut states = vec![
+        TermState {
+            last_seen: u32::MAX,
+            value: 0
+        };
+        vocabulary.len()
+    ];
     let mut starts = Vec::new();
-    let mut position = 0usize;
-    let mut local_doc = 0u32;
-
-    while position < bytes.len() {
-        starts.push(absolute_start + position);
-        let line_end = bytes[position..]
-            .iter()
-            .position(|&byte| byte == b'\n')
-            .map(|offset| position + offset)
-            .unwrap_or(bytes.len());
-        let line = &bytes[position..line_end];
-        if let Some(tab) = line.iter().position(|&byte| byte == b'\t') {
-            tokenize(&line[tab + 1..], classes, |token| {
-                if let Some(term) = token {
-                    if let Some(id) = vocabulary.get(term) {
-                        let index = id as usize;
-                        if last_seen[index] != local_doc {
-                            last_seen[index] = local_doc;
-                            df[index] += 1;
-                        }
-                    }
-                }
-                true
-            });
-        }
-        local_doc += 1;
-        if line_end == bytes.len() {
-            break;
-        }
-        position = line_end + 1;
+    let documents = scan_chunk(
+        bytes,
+        absolute_start,
+        vocabulary,
+        map,
+        Some(&mut starts),
+        |id, local_doc| {
+            let state = &mut states[id as usize];
+            if state.last_seen != local_doc {
+                state.last_seen = local_doc;
+                state.value += 1;
+            }
+        },
+    );
+    ChunkCount {
+        states,
+        starts,
+        documents,
     }
-
-    ChunkCount { df, starts }
 }
 
 fn scan_chunk_write(
     bytes: &[u8],
     vocabulary: &Vocabulary,
-    classes: &[u8; 256],
+    map: &[u8; 256],
     global_doc_start: u32,
-    term_bases: &[usize],
-    postings: &[AtomicU32],
+    term_bases: &[u32],
+    term_refs: &[TermRef],
+    sparse: &[AtomicU32],
+    bitsets: &[AtomicU64],
 ) {
-    let mut last_seen = vec![u32::MAX; vocabulary.len()];
-    let mut cursors = vec![0usize; vocabulary.len()];
-    let mut position = 0usize;
-    let mut local_doc = 0u32;
-
-    while position < bytes.len() {
-        let line_end = bytes[position..]
-            .iter()
-            .position(|&byte| byte == b'\n')
-            .map(|offset| position + offset)
-            .unwrap_or(bytes.len());
-        let line = &bytes[position..line_end];
-        if let Some(tab) = line.iter().position(|&byte| byte == b'\t') {
-            tokenize(&line[tab + 1..], classes, |token| {
-                if let Some(term) = token {
-                    if let Some(id) = vocabulary.get(term) {
-                        let index = id as usize;
-                        if last_seen[index] != local_doc {
-                            last_seen[index] = local_doc;
-                            let slot = term_bases[index] + cursors[index];
-                            cursors[index] += 1;
-                            postings[slot].store(global_doc_start + local_doc, Ordering::Relaxed);
-                        }
-                    }
-                }
-                true
-            });
+    let mut states = vec![
+        TermState {
+            last_seen: u32::MAX,
+            value: 0
+        };
+        vocabulary.len()
+    ];
+    scan_chunk(bytes, 0, vocabulary, map, None, |id, local_doc| {
+        let index = id as usize;
+        let state = &mut states[index];
+        if state.last_seen != local_doc {
+            state.last_seen = local_doc;
+            let reference = term_refs[index];
+            if reference.is_dense() {
+                let doc_id = global_doc_start + local_doc;
+                let slot = reference.start as usize + (doc_id as usize / 64);
+                bitsets[slot].fetch_or(1u64 << (doc_id % 64), Ordering::Relaxed);
+            } else {
+                let slot = term_bases[index] + state.value;
+                state.value += 1;
+                sparse[slot as usize].store(global_doc_start + local_doc, Ordering::Relaxed);
+            }
         }
-        local_doc += 1;
-        if line_end == bytes.len() {
-            break;
-        }
-        position = line_end + 1;
-    }
+    });
 }
 
 fn line_chunks(bytes: &[u8], count: usize) -> Vec<(usize, usize)> {
@@ -302,13 +418,13 @@ fn count_chunks(
     bytes: &[u8],
     ranges: &[(usize, usize)],
     vocabulary: &Vocabulary,
-    classes: &[u8; 256],
+    map: &[u8; 256],
 ) -> io::Result<Vec<ChunkCount>> {
     thread::scope(|scope| {
         let mut handles = Vec::with_capacity(ranges.len());
         for &(start, end) in ranges {
             let slice = &bytes[start..end];
-            handles.push(scope.spawn(move || scan_chunk_count(slice, start, vocabulary, classes)));
+            handles.push(scope.spawn(move || scan_chunk_count(slice, start, vocabulary, map)));
         }
         let mut results = Vec::with_capacity(handles.len());
         for handle in handles {
@@ -325,10 +441,12 @@ fn write_chunks(
     bytes: &[u8],
     ranges: &[(usize, usize)],
     doc_bases: &[u32],
-    term_bases: &[Vec<usize>],
+    term_bases: &[Vec<u32>],
+    term_refs: &[TermRef],
     vocabulary: &Vocabulary,
-    classes: &[u8; 256],
-    postings: &[AtomicU32],
+    map: &[u8; 256],
+    sparse: &[AtomicU32],
+    bitsets: &[AtomicU64],
 ) -> io::Result<()> {
     thread::scope(|scope| {
         let mut handles = Vec::with_capacity(ranges.len());
@@ -338,7 +456,9 @@ fn write_chunks(
             let base = &term_bases[index];
             let doc_base = doc_bases[index];
             handles.push(scope.spawn(move || {
-                scan_chunk_write(slice, vocabulary, classes, doc_base, base, postings)
+                scan_chunk_write(
+                    slice, vocabulary, map, doc_base, base, term_refs, sparse, bitsets,
+                )
             }));
         }
         for handle in handles {
@@ -350,26 +470,25 @@ fn write_chunks(
     })
 }
 
-enum TermSet {
-    Empty,
-    List { ids: Vec<u32>, df: usize },
-    Bits { words: Vec<u64>, df: usize },
+const DENSE_TAG: u32 = 1 << 31;
+
+#[derive(Clone, Copy)]
+struct TermRef {
+    start: u32,
+    tagged_len: u32,
 }
 
-impl TermSet {
-    fn view(&self) -> SetView<'_> {
-        match self {
-            Self::Empty => SetView::List(&[]),
-            Self::List { ids, .. } => SetView::List(ids),
-            Self::Bits { words, .. } => SetView::Bits(words),
-        }
+impl TermRef {
+    fn is_dense(self) -> bool {
+        self.tagged_len & DENSE_TAG != 0
     }
 
-    fn df(&self) -> usize {
-        match self {
-            Self::Empty => 0,
-            Self::List { df, .. } | Self::Bits { df, .. } => *df,
-        }
+    fn len(self) -> usize {
+        (self.tagged_len & !DENSE_TAG) as usize
+    }
+
+    fn df(self) -> usize {
+        self.len()
     }
 }
 
@@ -405,50 +524,44 @@ impl SetView<'_> {
 }
 
 struct PostingIndex {
-    sets: Vec<TermSet>,
+    sparse: Vec<u32>,
+    bitsets: Vec<u64>,
+    sets: Vec<TermRef>,
     doc_count: usize,
 }
 
 impl PostingIndex {
-    fn from_flat(
-        ids: Vec<u32>,
-        offsets: &[usize],
-        df: &[u32],
+    fn from_arenas(
+        sparse: Vec<u32>,
+        bitsets: Vec<u64>,
+        sets: Vec<TermRef>,
         doc_count: usize,
-        threshold: usize,
     ) -> Self {
-        let mut sets = Vec::with_capacity(df.len());
-        let word_count = doc_count.div_ceil(64);
-        for term in 0..df.len() {
-            let frequency = df[term] as usize;
-            if frequency == 0 {
-                sets.push(TermSet::Empty);
-            } else if frequency >= threshold {
-                let mut words = vec![0u64; word_count];
-                for &doc_id in &ids[offsets[term]..offsets[term + 1]] {
-                    let index = doc_id as usize;
-                    words[index / 64] |= 1u64 << (index % 64);
-                }
-                sets.push(TermSet::Bits {
-                    words,
-                    df: frequency,
-                });
-            } else {
-                sets.push(TermSet::List {
-                    ids: ids[offsets[term]..offsets[term + 1]].to_vec(),
-                    df: frequency,
-                });
-            }
+        Self {
+            sparse,
+            bitsets,
+            sets,
+            doc_count,
         }
-        Self { sets, doc_count }
     }
 
-    fn set(&self, term_id: u32) -> &TermSet {
-        &self.sets[term_id as usize]
+    fn reference(&self, term_id: u32) -> TermRef {
+        self.sets[term_id as usize]
+    }
+
+    fn df(&self, term_id: u32) -> usize {
+        self.reference(term_id).df()
     }
 
     fn view(&self, term_id: u32) -> SetView<'_> {
-        self.set(term_id).view()
+        let reference = self.reference(term_id);
+        let start = reference.start as usize;
+        if reference.is_dense() {
+            let words = self.doc_count.div_ceil(64);
+            SetView::Bits(&self.bitsets[start..start + words])
+        } else {
+            SetView::List(&self.sparse[start..start + reference.len()])
+        }
     }
 
     fn contains(&self, term_id: u32, doc_id: u32) -> bool {
@@ -534,45 +647,34 @@ fn remove_from_bits(view: SetView<'_>, out: &mut [u64]) {
 }
 
 fn apply_to_bits(left: SetView<'_>, right: SetView<'_>, op: Op, out: &mut [u64]) {
-    out.fill(0);
     match op {
-        Op::And => match (left, right) {
-            (SetView::Bits(a), SetView::Bits(b)) => {
+        Op::And => {
+            if let (SetView::Bits(a), SetView::Bits(b)) = (left, right) {
                 for (index, dst) in out.iter_mut().enumerate() {
                     *dst = a[index] & b[index];
                 }
             }
-            (SetView::List(ids), bits) | (bits, SetView::List(ids)) => {
-                for &id in ids {
-                    if bits.contains(id) {
-                        let index = id as usize;
-                        out[index / 64] |= 1u64 << (index % 64);
-                    }
-                }
-            }
-        },
+        }
         Op::Or => {
+            out.fill(0);
             add_to_bits(left, out);
             add_to_bits(right, out);
         }
         Op::Not => {
+            out.fill(0);
             add_to_bits(left, out);
             remove_from_bits(right, out);
         }
     }
 }
 
-fn apply_to_list(
-    left: SetView<'_>,
-    right: SetView<'_>,
-    op: Op,
-    doc_count: usize,
-    out: &mut Vec<u32>,
-) {
+// result_is_bits excludes bitset/bitset AND and every bitset OR/list difference
+// that would produce a bitset, so only these list-producing cases remain.
+fn apply_to_list(left: SetView<'_>, right: SetView<'_>, op: Op, out: &mut Vec<u32>) {
     out.clear();
     match op {
-        Op::And => match (left, right) {
-            (SetView::List(a), SetView::List(b)) => {
+        Op::And => {
+            if let (SetView::List(a), SetView::List(b)) = (left, right) {
                 let (mut i, mut j) = (0usize, 0usize);
                 while i < a.len() && j < b.len() {
                     match a[i].cmp(&b[j]) {
@@ -585,20 +687,12 @@ fn apply_to_list(
                         }
                     }
                 }
-            }
-            (SetView::List(ids), bits) | (bits, SetView::List(ids)) => {
+            } else if let (SetView::List(ids), bits) | (bits, SetView::List(ids)) = (left, right) {
                 out.extend(ids.iter().copied().filter(|&id| bits.contains(id)));
             }
-            (SetView::Bits(_), SetView::Bits(_)) => {
-                for id in 0..doc_count as u32 {
-                    if left.contains(id) && right.contains(id) {
-                        out.push(id);
-                    }
-                }
-            }
-        },
-        Op::Or => match (left, right) {
-            (SetView::List(a), SetView::List(b)) => {
+        }
+        Op::Or => {
+            if let (SetView::List(a), SetView::List(b)) = (left, right) {
                 let (mut i, mut j) = (0usize, 0usize);
                 while i < a.len() && j < b.len() {
                     match a[i].cmp(&b[j]) {
@@ -620,24 +714,12 @@ fn apply_to_list(
                 out.extend_from_slice(&a[i..]);
                 out.extend_from_slice(&b[j..]);
             }
-            _ => {
-                for id in 0..doc_count as u32 {
-                    if left.contains(id) || right.contains(id) {
-                        out.push(id);
-                    }
-                }
+        }
+        Op::Not => {
+            if let SetView::List(ids) = left {
+                out.extend(ids.iter().copied().filter(|&id| !right.contains(id)));
             }
-        },
-        Op::Not => match left {
-            SetView::List(ids) => out.extend(ids.iter().copied().filter(|&id| !right.contains(id))),
-            SetView::Bits(_) => {
-                for id in 0..doc_count as u32 {
-                    if left.contains(id) && !right.contains(id) {
-                        out.push(id);
-                    }
-                }
-            }
-        },
+        }
     }
 }
 
@@ -679,13 +761,7 @@ fn apply_operator(
             Accumulator::Bits(slot)
         }
         (Accumulator::Term(id), false) => {
-            apply_to_list(
-                postings.view(id),
-                right,
-                op,
-                postings.doc_count,
-                &mut scratch.lists[0],
-            );
+            apply_to_list(postings.view(id), right, op, &mut scratch.lists[0]);
             Accumulator::List(0)
         }
         (Accumulator::List(source), false) => {
@@ -696,18 +772,12 @@ fn apply_operator(
             } else {
                 (&second[0][..], &mut first[0])
             };
-            apply_to_list(SetView::List(left), right, op, postings.doc_count, out);
+            apply_to_list(SetView::List(left), right, op, out);
             Accumulator::List(slot)
         }
         (Accumulator::Bits(source), false) => {
             let Scratch { lists, bits } = scratch;
-            apply_to_list(
-                SetView::Bits(&bits[source]),
-                right,
-                op,
-                postings.doc_count,
-                &mut lists[0],
-            );
+            apply_to_list(SetView::Bits(&bits[source]), right, op, &mut lists[0]);
             Accumulator::List(0)
         }
     }
@@ -758,23 +828,33 @@ fn append_view_result(out: &mut Vec<u8>, view: SetView<'_>, doc_count: usize) {
 fn phrase_matches(
     text: &[u8],
     phrase: &[u32],
+    phrase_keys: &[u64],
     vocabulary: &Vocabulary,
-    classes: &[u8; 256],
+    map: &[u8; 256],
 ) -> bool {
     let width = phrase.len();
-    let mut ring = [u32::MAX; 8];
+    let mut ring = [0u8; 8];
     let mut position = 0usize;
     let mut matched = false;
-    tokenize(text, classes, |token| {
-        let id = token
-            .and_then(|term| vocabulary.get(term))
-            .unwrap_or(u32::MAX);
-        ring[position % width] = id;
+    tokenize(text, map, |token| {
+        let mut positions = 0u8;
+        if let Some(token) = token {
+            let key = term_key(token);
+            if key == phrase_keys[0] && token == vocabulary.term(phrase[0]) {
+                positions |= 1;
+            }
+            for offset in 1..width {
+                if key == phrase_keys[offset] && token == vocabulary.term(phrase[offset]) {
+                    positions |= 1 << offset;
+                }
+            }
+        }
+        ring[position % width] = positions;
         if position + 1 >= width {
             let first = (position + 1 - width) % width;
             let mut equal = true;
             for offset in 0..width {
-                if ring[(first + offset) % width] != phrase[offset] {
+                if ring[(first + offset) % width] & (1 << offset) == 0 {
                     equal = false;
                     break;
                 }
@@ -788,6 +868,37 @@ fn phrase_matches(
         true
     });
     matched
+}
+
+fn phrase_candidate_matches(
+    doc_id: u32,
+    docs: &[u8],
+    document_starts: &[usize],
+    postings: &PostingIndex,
+    phrase: &[u32],
+    order: &[usize],
+    phrase_keys: &[u64],
+    vocabulary: &Vocabulary,
+    map: &[u8; 256],
+) -> bool {
+    for &position in order.iter().skip(1) {
+        if !postings.contains(phrase[position], doc_id) {
+            return false;
+        }
+    }
+    let index = doc_id as usize;
+    let start = document_starts[index];
+    let mut end = document_starts[index + 1];
+    if end > start && docs[end - 1] == b'\n' {
+        end -= 1;
+    }
+    let line = &docs[start..end];
+    let text_start = line
+        .iter()
+        .position(|&byte| byte == b'\t')
+        .map(|tab| start + tab + 1)
+        .unwrap_or(end);
+    phrase_matches(&docs[text_start..end], phrase, phrase_keys, vocabulary, map)
 }
 
 fn push_number(out: &mut Vec<u8>, mut value: u64) {
@@ -864,7 +975,7 @@ fn evaluate_query(
     document_starts: &[usize],
     postings: &PostingIndex,
     vocabulary: &Vocabulary,
-    classes: &[u8; 256],
+    map: &[u8; 256],
     scratch: &mut Scratch,
     threshold: usize,
 ) {
@@ -884,51 +995,56 @@ fn evaluate_query(
             append_view_result(output, view, postings.doc_count);
         }
         Query::Phrase(phrase) => {
-            let mut distinct = phrase.clone();
-            distinct.sort_unstable();
-            distinct.dedup();
-            distinct.sort_by_key(|&id| postings.set(id).df());
-            let mut candidates = Vec::new();
-            if let Some(&seed) = distinct.first() {
-                match postings.view(seed) {
-                    SetView::List(ids) => candidates.extend_from_slice(ids),
-                    SetView::Bits(words) => {
-                        for (word_index, &word) in words.iter().enumerate() {
-                            let mut remaining = word;
-                            while remaining != 0 {
-                                let id = word_index * 64 + remaining.trailing_zeros() as usize;
-                                if id < postings.doc_count {
-                                    candidates.push(id as u32);
-                                }
-                                remaining &= remaining - 1;
-                            }
+            let mut order = [0usize; 8];
+            let mut phrase_keys = [0u64; 8];
+            for position in 0..phrase.len() {
+                order[position] = position;
+                phrase_keys[position] = term_key(vocabulary.term(phrase[position]));
+            }
+            order[..phrase.len()].sort_unstable_by_key(|&position| postings.df(phrase[position]));
+            let seed = phrase[order[0]];
+            let mut matches = Vec::new();
+            match postings.view(seed) {
+                SetView::List(ids) => {
+                    for &doc_id in ids {
+                        if phrase_candidate_matches(
+                            doc_id,
+                            docs,
+                            document_starts,
+                            postings,
+                            phrase,
+                            &order[..phrase.len()],
+                            &phrase_keys[..phrase.len()],
+                            vocabulary,
+                            map,
+                        ) {
+                            matches.push(doc_id);
                         }
                     }
                 }
-            }
-            let mut matches = Vec::new();
-            for doc_id in candidates {
-                if distinct
-                    .iter()
-                    .skip(1)
-                    .any(|&term_id| !postings.contains(term_id, doc_id))
-                {
-                    continue;
-                }
-                let index = doc_id as usize;
-                let start = document_starts[index];
-                let mut end = document_starts[index + 1];
-                if end > start && docs[end - 1] == b'\n' {
-                    end -= 1;
-                }
-                let line = &docs[start..end];
-                let text_start = line
-                    .iter()
-                    .position(|&byte| byte == b'\t')
-                    .map(|tab| start + tab + 1)
-                    .unwrap_or(end);
-                if phrase_matches(&docs[text_start..end], phrase, vocabulary, classes) {
-                    matches.push(doc_id);
+                SetView::Bits(words) => {
+                    for (word_index, &word) in words.iter().enumerate() {
+                        let mut remaining = word;
+                        while remaining != 0 {
+                            let doc_id = word_index * 64 + remaining.trailing_zeros() as usize;
+                            if doc_id < postings.doc_count
+                                && phrase_candidate_matches(
+                                    doc_id as u32,
+                                    docs,
+                                    document_starts,
+                                    postings,
+                                    phrase,
+                                    &order[..phrase.len()],
+                                    &phrase_keys[..phrase.len()],
+                                    vocabulary,
+                                    map,
+                                )
+                            {
+                                matches.push(doc_id as u32);
+                            }
+                            remaining &= remaining - 1;
+                        }
+                    }
                 }
             }
             append_result(output, &matches);
@@ -940,7 +1056,7 @@ fn run(docs: &[u8]) -> io::Result<()> {
     let query_bytes = fs::read("/data/queries.txt")?;
     let mut vocabulary = Vocabulary::new();
     let queries = parse_queries(&query_bytes, &mut vocabulary);
-    let classes = byte_classes();
+    let map = &BYTE_MAP;
     let thread_count = thread::available_parallelism()
         .map(|count| count.get())
         .unwrap_or(1)
@@ -948,62 +1064,99 @@ fn run(docs: &[u8]) -> io::Result<()> {
         .max(1);
     let ranges = line_chunks(docs, thread_count);
 
-    let chunk_counts = count_chunks(docs, &ranges, &vocabulary, classes)?;
+    let chunk_counts = count_chunks(docs, &ranges, &vocabulary, map)?;
     let mut df = vec![0u32; vocabulary.len()];
     let mut document_starts = Vec::new();
     let mut thread_doc_bases = Vec::with_capacity(chunk_counts.len());
     let mut thread_term_bases = Vec::with_capacity(chunk_counts.len());
     let mut documents_before = 0usize;
-    let mut per_term_before = vec![0usize; vocabulary.len()];
+    let mut per_term_before = vec![0u32; vocabulary.len()];
 
     for chunk in &chunk_counts {
         thread_doc_bases.push(documents_before as u32);
-        let mut bases = vec![0usize; vocabulary.len()];
+        let mut bases = vec![0u32; vocabulary.len()];
         for term in 0..vocabulary.len() {
-            df[term] += chunk.df[term];
+            let frequency = chunk.states[term].value;
+            df[term] += frequency;
             bases[term] = per_term_before[term];
-            per_term_before[term] += chunk.df[term] as usize;
+            per_term_before[term] += frequency;
         }
         thread_term_bases.push(bases);
-        documents_before += chunk.starts.len();
+        documents_before += chunk.documents as usize;
         document_starts.extend_from_slice(&chunk.starts);
     }
     document_starts.push(docs.len());
 
-    let mut offsets = Vec::with_capacity(vocabulary.len() + 1);
-    offsets.push(0usize);
-    for &frequency in &df {
-        let next = offsets.last().copied().unwrap_or(0) + frequency as usize;
-        offsets.push(next);
+    let threshold = (documents_before / 32).max(1);
+    let word_count = documents_before.div_ceil(64) as u32;
+    let mut term_refs = vec![
+        TermRef {
+            start: 0,
+            tagged_len: 0
+        };
+        vocabulary.len()
+    ];
+    let mut sparse_total = 0u32;
+    let mut bitset_total = 0u32;
+
+    // Replace each total df with that term's sparse arena start. Dense terms
+    // receive a separate bitset range; per-thread prefixes are added below.
+    for term in 0..vocabulary.len() {
+        let frequency = df[term];
+        if frequency as usize >= threshold {
+            term_refs[term] = TermRef {
+                start: bitset_total,
+                tagged_len: DENSE_TAG | frequency,
+            };
+            bitset_total += word_count;
+            df[term] = 0;
+        } else {
+            term_refs[term] = TermRef {
+                start: sparse_total,
+                tagged_len: frequency,
+            };
+            df[term] = sparse_total;
+            sparse_total += frequency;
+        }
     }
     for bases in &mut thread_term_bases {
         for term in 0..vocabulary.len() {
-            bases[term] += offsets[term];
+            if !term_refs[term].is_dense() {
+                bases[term] += term_refs[term].start;
+            }
         }
     }
+    // Pass-one per-thread counts are no longer needed; only line starts and
+    // the u32 pass-two bases remain.
+    drop(chunk_counts);
+    drop(per_term_before);
 
-    // The first-pass counts assign each thread a disjoint segment of each
-    // term's sorted posting range; atomics make those parallel stores safe.
-    let atomic_ids: Vec<AtomicU32> = (0..*offsets.last().unwrap_or(&0))
-        .map(|_| AtomicU32::new(0))
-        .collect();
+    let sparse_atomic: Vec<AtomicU32> = (0..sparse_total).map(|_| AtomicU32::new(0)).collect();
+    let bitset_atomic: Vec<AtomicU64> = (0..bitset_total).map(|_| AtomicU64::new(0)).collect();
     write_chunks(
         docs,
         &ranges,
         &thread_doc_bases,
         &thread_term_bases,
+        &term_refs,
         &vocabulary,
-        classes,
-        &atomic_ids,
+        map,
+        &sparse_atomic,
+        &bitset_atomic,
     )?;
-    let ids = atomic_ids
-        .iter()
-        .map(|value| value.load(Ordering::Relaxed))
+
+    // Consume the atomic arenas into ordinary vectors; no second per-term
+    // posting copy or per-term heap allocation is made.
+    let sparse: Vec<u32> = sparse_atomic
+        .into_iter()
+        .map(AtomicU32::into_inner)
         .collect();
-    // A set at or above N/32 uses a bitset. Scratch copies can change this
-    // threshold expression to force either representation during the gate.
-    let threshold = (documents_before / 32).max(1);
-    let postings = PostingIndex::from_flat(ids, &offsets, &df, documents_before, threshold);
+    let bitsets: Vec<u64> = bitset_atomic
+        .into_iter()
+        .map(AtomicU64::into_inner)
+        .collect();
+    let postings = PostingIndex::from_arenas(sparse, bitsets, term_refs, documents_before);
+
     let block_count = queries.len().div_ceil(QUERY_BLOCK_SIZE);
     let worker_count = thread::available_parallelism()
         .map(|count| count.get())
@@ -1039,7 +1192,7 @@ fn run(docs: &[u8]) -> io::Result<()> {
                             document_starts,
                             postings,
                             vocabulary,
-                            &classes,
+                            &map,
                             &mut scratch,
                             threshold,
                         );
