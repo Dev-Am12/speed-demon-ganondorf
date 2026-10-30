@@ -348,73 +348,409 @@ fn write_chunks(
     })
 }
 
+enum TermSet {
+    Empty,
+    List { ids: Vec<u32>, df: usize },
+    Bits { words: Vec<u64>, df: usize },
+}
+
+impl TermSet {
+    fn view(&self) -> SetView<'_> {
+        match self {
+            Self::Empty => SetView::List(&[]),
+            Self::List { ids, .. } => SetView::List(ids),
+            Self::Bits { words, .. } => SetView::Bits(words),
+        }
+    }
+
+    fn df(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::List { df, .. } | Self::Bits { df, .. } => *df,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SetView<'a> {
+    List(&'a [u32]),
+    Bits(&'a [u64]),
+}
+
+impl SetView<'_> {
+    fn contains(self, id: u32) -> bool {
+        match self {
+            Self::List(ids) => ids.binary_search(&id).is_ok(),
+            Self::Bits(words) => {
+                let index = id as usize;
+                words
+                    .get(index / 64)
+                    .is_some_and(|word| word & (1u64 << (index % 64)) != 0)
+            }
+        }
+    }
+
+    fn is_bits(self) -> bool {
+        matches!(self, Self::Bits(_))
+    }
+
+    fn count(self) -> usize {
+        match self {
+            Self::List(ids) => ids.len(),
+            Self::Bits(words) => words.iter().map(|word| word.count_ones() as usize).sum(),
+        }
+    }
+}
+
 struct PostingIndex {
-    ids: Vec<u32>,
-    offsets: Vec<usize>,
+    sets: Vec<TermSet>,
+    doc_count: usize,
 }
 
 impl PostingIndex {
-    fn list(&self, term_id: u32) -> &[u32] {
-        let index = term_id as usize;
-        &self.ids[self.offsets[index]..self.offsets[index + 1]]
+    fn from_flat(
+        ids: Vec<u32>,
+        offsets: &[usize],
+        df: &[u32],
+        doc_count: usize,
+        threshold: usize,
+    ) -> Self {
+        let mut sets = Vec::with_capacity(df.len());
+        let word_count = doc_count.div_ceil(64);
+        for term in 0..df.len() {
+            let frequency = df[term] as usize;
+            if frequency == 0 {
+                sets.push(TermSet::Empty);
+            } else if frequency >= threshold {
+                let mut words = vec![0u64; word_count];
+                for &doc_id in &ids[offsets[term]..offsets[term + 1]] {
+                    let index = doc_id as usize;
+                    words[index / 64] |= 1u64 << (index % 64);
+                }
+                sets.push(TermSet::Bits {
+                    words,
+                    df: frequency,
+                });
+            } else {
+                sets.push(TermSet::List {
+                    ids: ids[offsets[term]..offsets[term + 1]].to_vec(),
+                    df: frequency,
+                });
+            }
+        }
+        Self { sets, doc_count }
+    }
+
+    fn set(&self, term_id: u32) -> &TermSet {
+        &self.sets[term_id as usize]
+    }
+
+    fn view(&self, term_id: u32) -> SetView<'_> {
+        self.set(term_id).view()
+    }
+
+    fn contains(&self, term_id: u32, doc_id: u32) -> bool {
+        self.view(term_id).contains(doc_id)
     }
 }
 
-fn intersect(left: &[u32], right: &[u32]) -> Vec<u32> {
-    let mut out = Vec::with_capacity(left.len().min(right.len()));
-    let (mut i, mut j) = (0usize, 0usize);
-    while i < left.len() && j < right.len() {
-        match left[i].cmp(&right[j]) {
-            std::cmp::Ordering::Less => i += 1,
-            std::cmp::Ordering::Greater => j += 1,
-            std::cmp::Ordering::Equal => {
-                out.push(left[i]);
-                i += 1;
-                j += 1;
-            }
-        }
-    }
-    out
+#[derive(Clone, Copy)]
+enum Accumulator {
+    Term(u32),
+    List(usize),
+    Bits(usize),
 }
 
-fn union(left: &[u32], right: &[u32]) -> Vec<u32> {
-    let mut out = Vec::with_capacity(left.len().saturating_add(right.len()));
-    let (mut i, mut j) = (0usize, 0usize);
-    while i < left.len() && j < right.len() {
-        match left[i].cmp(&right[j]) {
-            std::cmp::Ordering::Less => {
-                out.push(left[i]);
-                i += 1;
-            }
-            std::cmp::Ordering::Greater => {
-                out.push(right[j]);
-                j += 1;
-            }
-            std::cmp::Ordering::Equal => {
-                out.push(left[i]);
-                i += 1;
-                j += 1;
-            }
-        }
-    }
-    out.extend_from_slice(&left[i..]);
-    out.extend_from_slice(&right[j..]);
-    out
+struct Scratch {
+    lists: [Vec<u32>; 2],
+    bits: [Vec<u64>; 2],
 }
 
-fn difference(left: &[u32], right: &[u32]) -> Vec<u32> {
-    let mut out = Vec::with_capacity(left.len());
-    let (mut i, mut j) = (0usize, 0usize);
-    while i < left.len() {
-        while j < right.len() && right[j] < left[i] {
-            j += 1;
+impl Scratch {
+    fn new() -> Self {
+        Self {
+            lists: std::array::from_fn(|_| Vec::new()),
+            bits: std::array::from_fn(|_| Vec::new()),
         }
-        if j == right.len() || right[j] != left[i] {
-            out.push(left[i]);
-        }
-        i += 1;
     }
-    out
+}
+
+fn accumulator_view<'a>(
+    accumulator: Accumulator,
+    postings: &'a PostingIndex,
+    scratch: &'a Scratch,
+) -> SetView<'a> {
+    match accumulator {
+        Accumulator::Term(id) => postings.view(id),
+        Accumulator::List(slot) => SetView::List(&scratch.lists[slot]),
+        Accumulator::Bits(slot) => SetView::Bits(&scratch.bits[slot]),
+    }
+}
+
+fn result_is_bits(left: SetView<'_>, right: SetView<'_>, op: Op, threshold: usize) -> bool {
+    match op {
+        Op::And => left.is_bits() && right.is_bits(),
+        Op::Or => {
+            left.is_bits()
+                || right.is_bits()
+                || left.count().saturating_add(right.count()) >= threshold
+        }
+        Op::Not => left.is_bits(),
+    }
+}
+
+fn add_to_bits(view: SetView<'_>, out: &mut [u64]) {
+    match view {
+        SetView::List(ids) => {
+            for &id in ids {
+                let index = id as usize;
+                out[index / 64] |= 1u64 << (index % 64);
+            }
+        }
+        SetView::Bits(words) => {
+            for (dst, &src) in out.iter_mut().zip(words) {
+                *dst |= src;
+            }
+        }
+    }
+}
+
+fn remove_from_bits(view: SetView<'_>, out: &mut [u64]) {
+    match view {
+        SetView::List(ids) => {
+            for &id in ids {
+                let index = id as usize;
+                out[index / 64] &= !(1u64 << (index % 64));
+            }
+        }
+        SetView::Bits(words) => {
+            for (dst, &src) in out.iter_mut().zip(words) {
+                *dst &= !src;
+            }
+        }
+    }
+}
+
+fn apply_to_bits(left: SetView<'_>, right: SetView<'_>, op: Op, out: &mut [u64]) {
+    out.fill(0);
+    match op {
+        Op::And => match (left, right) {
+            (SetView::Bits(a), SetView::Bits(b)) => {
+                for (index, dst) in out.iter_mut().enumerate() {
+                    *dst = a[index] & b[index];
+                }
+            }
+            (SetView::List(ids), bits) | (bits, SetView::List(ids)) => {
+                for &id in ids {
+                    if bits.contains(id) {
+                        let index = id as usize;
+                        out[index / 64] |= 1u64 << (index % 64);
+                    }
+                }
+            }
+        },
+        Op::Or => {
+            add_to_bits(left, out);
+            add_to_bits(right, out);
+        }
+        Op::Not => {
+            add_to_bits(left, out);
+            remove_from_bits(right, out);
+        }
+    }
+}
+
+fn apply_to_list(
+    left: SetView<'_>,
+    right: SetView<'_>,
+    op: Op,
+    doc_count: usize,
+    out: &mut Vec<u32>,
+) {
+    out.clear();
+    match op {
+        Op::And => match (left, right) {
+            (SetView::List(a), SetView::List(b)) => {
+                let (mut i, mut j) = (0usize, 0usize);
+                while i < a.len() && j < b.len() {
+                    match a[i].cmp(&b[j]) {
+                        std::cmp::Ordering::Less => i += 1,
+                        std::cmp::Ordering::Greater => j += 1,
+                        std::cmp::Ordering::Equal => {
+                            out.push(a[i]);
+                            i += 1;
+                            j += 1;
+                        }
+                    }
+                }
+            }
+            (SetView::List(ids), bits) | (bits, SetView::List(ids)) => {
+                out.extend(ids.iter().copied().filter(|&id| bits.contains(id)));
+            }
+            (SetView::Bits(_), SetView::Bits(_)) => {
+                for id in 0..doc_count as u32 {
+                    if left.contains(id) && right.contains(id) {
+                        out.push(id);
+                    }
+                }
+            }
+        },
+        Op::Or => match (left, right) {
+            (SetView::List(a), SetView::List(b)) => {
+                let (mut i, mut j) = (0usize, 0usize);
+                while i < a.len() && j < b.len() {
+                    match a[i].cmp(&b[j]) {
+                        std::cmp::Ordering::Less => {
+                            out.push(a[i]);
+                            i += 1;
+                        }
+                        std::cmp::Ordering::Greater => {
+                            out.push(b[j]);
+                            j += 1;
+                        }
+                        std::cmp::Ordering::Equal => {
+                            out.push(a[i]);
+                            i += 1;
+                            j += 1;
+                        }
+                    }
+                }
+                out.extend_from_slice(&a[i..]);
+                out.extend_from_slice(&b[j..]);
+            }
+            _ => {
+                for id in 0..doc_count as u32 {
+                    if left.contains(id) || right.contains(id) {
+                        out.push(id);
+                    }
+                }
+            }
+        },
+        Op::Not => match left {
+            SetView::List(ids) => out.extend(ids.iter().copied().filter(|&id| !right.contains(id))),
+            SetView::Bits(_) => {
+                for id in 0..doc_count as u32 {
+                    if left.contains(id) && !right.contains(id) {
+                        out.push(id);
+                    }
+                }
+            }
+        },
+    }
+}
+
+fn apply_operator(
+    accumulator: Accumulator,
+    rhs_id: u32,
+    op: Op,
+    postings: &PostingIndex,
+    scratch: &mut Scratch,
+    threshold: usize,
+) -> Accumulator {
+    let right = postings.view(rhs_id);
+    let left_view = accumulator_view(accumulator, postings, scratch);
+    let output_bits = result_is_bits(left_view, right, op, threshold);
+    let word_count = postings.doc_count.div_ceil(64);
+
+    match (accumulator, output_bits) {
+        (Accumulator::Term(id), true) => {
+            scratch.bits[0].resize(word_count, 0);
+            apply_to_bits(postings.view(id), right, op, &mut scratch.bits[0]);
+            Accumulator::Bits(0)
+        }
+        (Accumulator::List(source), true) => {
+            let Scratch { lists, bits } = scratch;
+            bits[0].resize(word_count, 0);
+            apply_to_bits(SetView::List(&lists[source]), right, op, &mut bits[0]);
+            Accumulator::Bits(0)
+        }
+        (Accumulator::Bits(source), true) => {
+            let slot = 1 - source;
+            let (first, second) = scratch.bits.split_at_mut(1);
+            let (left, out) = if source == 0 {
+                (&first[0][..], &mut second[0])
+            } else {
+                (&second[0][..], &mut first[0])
+            };
+            out.resize(word_count, 0);
+            apply_to_bits(SetView::Bits(left), right, op, out);
+            Accumulator::Bits(slot)
+        }
+        (Accumulator::Term(id), false) => {
+            apply_to_list(
+                postings.view(id),
+                right,
+                op,
+                postings.doc_count,
+                &mut scratch.lists[0],
+            );
+            Accumulator::List(0)
+        }
+        (Accumulator::List(source), false) => {
+            let slot = 1 - source;
+            let (first, second) = scratch.lists.split_at_mut(1);
+            let (left, out) = if source == 0 {
+                (&first[0][..], &mut second[0])
+            } else {
+                (&second[0][..], &mut first[0])
+            };
+            apply_to_list(SetView::List(left), right, op, postings.doc_count, out);
+            Accumulator::List(slot)
+        }
+        (Accumulator::Bits(source), false) => {
+            let Scratch { lists, bits } = scratch;
+            apply_to_list(
+                SetView::Bits(&bits[source]),
+                right,
+                op,
+                postings.doc_count,
+                &mut lists[0],
+            );
+            Accumulator::List(0)
+        }
+    }
+}
+
+fn append_view_result(out: &mut Vec<u8>, view: SetView<'_>, doc_count: usize) {
+    let mut sum = 0u64;
+    let mut first = [0u32; 10];
+    let mut first_count = 0usize;
+    let count = view.count();
+    match view {
+        SetView::List(ids) => {
+            for &id in ids {
+                sum += id as u64;
+                if first_count < first.len() {
+                    first[first_count] = id;
+                    first_count += 1;
+                }
+            }
+        }
+        SetView::Bits(words) => {
+            for (word_index, &word) in words.iter().enumerate() {
+                let mut remaining = word;
+                while remaining != 0 {
+                    let id = word_index * 64 + remaining.trailing_zeros() as usize;
+                    if id < doc_count {
+                        sum += id as u64;
+                        if first_count < first.len() {
+                            first[first_count] = id as u32;
+                            first_count += 1;
+                        }
+                    }
+                    remaining &= remaining - 1;
+                }
+            }
+        }
+    }
+    push_number(out, count as u64);
+    out.push(b' ');
+    push_number(out, sum);
+    for &id in &first[..first_count] {
+        out.push(b' ');
+        push_number(out, id as u64);
+    }
+    out.push(b'\n');
 }
 
 fn phrase_matches(
@@ -583,7 +919,11 @@ fn run(docs: &[u8]) -> io::Result<()> {
         .iter()
         .map(|value| value.load(Ordering::Relaxed))
         .collect();
-    let postings = PostingIndex { ids, offsets };
+    // A set at or above N/32 uses a bitset. Scratch copies can change this
+    // threshold expression to force either representation during the gate.
+    let threshold = (documents_before / 32).max(1);
+    let postings = PostingIndex::from_flat(ids, &offsets, &df, documents_before, threshold);
+    let mut scratch = Scratch::new();
 
     let mut output = Vec::new();
     for query in &queries {
@@ -591,38 +931,50 @@ fn run(docs: &[u8]) -> io::Result<()> {
             Query::Bool { terms, ops } => {
                 let mut result = terms
                     .first()
-                    .map(|&id| postings.list(id).to_vec())
-                    .unwrap_or_default();
-                for (index, op) in ops.iter().enumerate() {
-                    let rhs = terms
-                        .get(index + 1)
-                        .map(|&id| postings.list(id))
-                        .unwrap_or(&[]);
-                    result = match op {
-                        Op::And => intersect(&result, rhs),
-                        Op::Or => union(&result, rhs),
-                        Op::Not => difference(&result, rhs),
-                    };
+                    .copied()
+                    .map(Accumulator::Term)
+                    .unwrap_or(Accumulator::List(0));
+                for (index, &op) in ops.iter().enumerate() {
+                    if let Some(&rhs) = terms.get(index + 1) {
+                        result =
+                            apply_operator(result, rhs, op, &postings, &mut scratch, threshold);
+                    }
                 }
-                append_result(&mut output, &result);
+                let view = accumulator_view(result, &postings, &scratch);
+                append_view_result(&mut output, view, documents_before);
             }
             Query::Phrase(phrase) => {
                 let mut distinct = phrase.clone();
                 distinct.sort_unstable();
                 distinct.dedup();
-                distinct.sort_by_key(|&id| postings.list(id).len());
-                let mut candidates = distinct
-                    .first()
-                    .map(|&id| postings.list(id).to_vec())
-                    .unwrap_or_default();
-                for &term_id in distinct.iter().skip(1) {
-                    candidates = intersect(&candidates, postings.list(term_id));
-                    if candidates.is_empty() {
-                        break;
+                distinct.sort_by_key(|&id| postings.set(id).df());
+                let mut candidates = Vec::new();
+                if let Some(&seed) = distinct.first() {
+                    match postings.view(seed) {
+                        SetView::List(ids) => candidates.extend_from_slice(ids),
+                        SetView::Bits(words) => {
+                            for (word_index, &word) in words.iter().enumerate() {
+                                let mut remaining = word;
+                                while remaining != 0 {
+                                    let id = word_index * 64 + remaining.trailing_zeros() as usize;
+                                    if id < documents_before {
+                                        candidates.push(id as u32);
+                                    }
+                                    remaining &= remaining - 1;
+                                }
+                            }
+                        }
                     }
                 }
                 let mut matches = Vec::new();
                 for doc_id in candidates {
+                    if distinct
+                        .iter()
+                        .skip(1)
+                        .any(|&term_id| !postings.contains(term_id, doc_id))
+                    {
+                        continue;
+                    }
                     let index = doc_id as usize;
                     let start = document_starts[index];
                     let mut end = document_starts[index + 1];
