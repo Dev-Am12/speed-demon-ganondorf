@@ -647,45 +647,34 @@ fn remove_from_bits(view: SetView<'_>, out: &mut [u64]) {
 }
 
 fn apply_to_bits(left: SetView<'_>, right: SetView<'_>, op: Op, out: &mut [u64]) {
-    out.fill(0);
     match op {
-        Op::And => match (left, right) {
-            (SetView::Bits(a), SetView::Bits(b)) => {
+        Op::And => {
+            if let (SetView::Bits(a), SetView::Bits(b)) = (left, right) {
                 for (index, dst) in out.iter_mut().enumerate() {
                     *dst = a[index] & b[index];
                 }
             }
-            (SetView::List(ids), bits) | (bits, SetView::List(ids)) => {
-                for &id in ids {
-                    if bits.contains(id) {
-                        let index = id as usize;
-                        out[index / 64] |= 1u64 << (index % 64);
-                    }
-                }
-            }
-        },
+        }
         Op::Or => {
+            out.fill(0);
             add_to_bits(left, out);
             add_to_bits(right, out);
         }
         Op::Not => {
+            out.fill(0);
             add_to_bits(left, out);
             remove_from_bits(right, out);
         }
     }
 }
 
-fn apply_to_list(
-    left: SetView<'_>,
-    right: SetView<'_>,
-    op: Op,
-    doc_count: usize,
-    out: &mut Vec<u32>,
-) {
+// result_is_bits excludes bitset/bitset AND and every bitset OR/list difference
+// that would produce a bitset, so only these list-producing cases remain.
+fn apply_to_list(left: SetView<'_>, right: SetView<'_>, op: Op, out: &mut Vec<u32>) {
     out.clear();
     match op {
-        Op::And => match (left, right) {
-            (SetView::List(a), SetView::List(b)) => {
+        Op::And => {
+            if let (SetView::List(a), SetView::List(b)) = (left, right) {
                 let (mut i, mut j) = (0usize, 0usize);
                 while i < a.len() && j < b.len() {
                     match a[i].cmp(&b[j]) {
@@ -698,20 +687,12 @@ fn apply_to_list(
                         }
                     }
                 }
-            }
-            (SetView::List(ids), bits) | (bits, SetView::List(ids)) => {
+            } else if let (SetView::List(ids), bits) | (bits, SetView::List(ids)) = (left, right) {
                 out.extend(ids.iter().copied().filter(|&id| bits.contains(id)));
             }
-            (SetView::Bits(_), SetView::Bits(_)) => {
-                for id in 0..doc_count as u32 {
-                    if left.contains(id) && right.contains(id) {
-                        out.push(id);
-                    }
-                }
-            }
-        },
-        Op::Or => match (left, right) {
-            (SetView::List(a), SetView::List(b)) => {
+        }
+        Op::Or => {
+            if let (SetView::List(a), SetView::List(b)) = (left, right) {
                 let (mut i, mut j) = (0usize, 0usize);
                 while i < a.len() && j < b.len() {
                     match a[i].cmp(&b[j]) {
@@ -733,24 +714,12 @@ fn apply_to_list(
                 out.extend_from_slice(&a[i..]);
                 out.extend_from_slice(&b[j..]);
             }
-            _ => {
-                for id in 0..doc_count as u32 {
-                    if left.contains(id) || right.contains(id) {
-                        out.push(id);
-                    }
-                }
+        }
+        Op::Not => {
+            if let SetView::List(ids) = left {
+                out.extend(ids.iter().copied().filter(|&id| !right.contains(id)));
             }
-        },
-        Op::Not => match left {
-            SetView::List(ids) => out.extend(ids.iter().copied().filter(|&id| !right.contains(id))),
-            SetView::Bits(_) => {
-                for id in 0..doc_count as u32 {
-                    if left.contains(id) && !right.contains(id) {
-                        out.push(id);
-                    }
-                }
-            }
-        },
+        }
     }
 }
 
@@ -792,13 +761,7 @@ fn apply_operator(
             Accumulator::Bits(slot)
         }
         (Accumulator::Term(id), false) => {
-            apply_to_list(
-                postings.view(id),
-                right,
-                op,
-                postings.doc_count,
-                &mut scratch.lists[0],
-            );
+            apply_to_list(postings.view(id), right, op, &mut scratch.lists[0]);
             Accumulator::List(0)
         }
         (Accumulator::List(source), false) => {
@@ -809,18 +772,12 @@ fn apply_operator(
             } else {
                 (&second[0][..], &mut first[0])
             };
-            apply_to_list(SetView::List(left), right, op, postings.doc_count, out);
+            apply_to_list(SetView::List(left), right, op, out);
             Accumulator::List(slot)
         }
         (Accumulator::Bits(source), false) => {
             let Scratch { lists, bits } = scratch;
-            apply_to_list(
-                SetView::Bits(&bits[source]),
-                right,
-                op,
-                postings.doc_count,
-                &mut lists[0],
-            );
+            apply_to_list(SetView::Bits(&bits[source]), right, op, &mut lists[0]);
             Accumulator::List(0)
         }
     }
@@ -868,21 +825,36 @@ fn append_view_result(out: &mut Vec<u8>, view: SetView<'_>, doc_count: usize) {
     out.push(b'\n');
 }
 
-fn phrase_matches(text: &[u8], phrase: &[u32], vocabulary: &Vocabulary, map: &[u8; 256]) -> bool {
+fn phrase_matches(
+    text: &[u8],
+    phrase: &[u32],
+    phrase_keys: &[u64],
+    vocabulary: &Vocabulary,
+    map: &[u8; 256],
+) -> bool {
     let width = phrase.len();
-    let mut ring = [u32::MAX; 8];
+    let mut ring = [0u8; 8];
     let mut position = 0usize;
     let mut matched = false;
     tokenize(text, map, |token| {
-        let id = token
-            .and_then(|term| vocabulary.get(term))
-            .unwrap_or(u32::MAX);
-        ring[position % width] = id;
+        let mut positions = 0u8;
+        if let Some(token) = token {
+            let key = term_key(token);
+            if key == phrase_keys[0] && token == vocabulary.term(phrase[0]) {
+                positions |= 1;
+            }
+            for offset in 1..width {
+                if key == phrase_keys[offset] && token == vocabulary.term(phrase[offset]) {
+                    positions |= 1 << offset;
+                }
+            }
+        }
+        ring[position % width] = positions;
         if position + 1 >= width {
             let first = (position + 1 - width) % width;
             let mut equal = true;
             for offset in 0..width {
-                if ring[(first + offset) % width] != phrase[offset] {
+                if ring[(first + offset) % width] & (1 << offset) == 0 {
                     equal = false;
                     break;
                 }
@@ -896,6 +868,37 @@ fn phrase_matches(text: &[u8], phrase: &[u32], vocabulary: &Vocabulary, map: &[u
         true
     });
     matched
+}
+
+fn phrase_candidate_matches(
+    doc_id: u32,
+    docs: &[u8],
+    document_starts: &[usize],
+    postings: &PostingIndex,
+    phrase: &[u32],
+    order: &[usize],
+    phrase_keys: &[u64],
+    vocabulary: &Vocabulary,
+    map: &[u8; 256],
+) -> bool {
+    for &position in order.iter().skip(1) {
+        if !postings.contains(phrase[position], doc_id) {
+            return false;
+        }
+    }
+    let index = doc_id as usize;
+    let start = document_starts[index];
+    let mut end = document_starts[index + 1];
+    if end > start && docs[end - 1] == b'\n' {
+        end -= 1;
+    }
+    let line = &docs[start..end];
+    let text_start = line
+        .iter()
+        .position(|&byte| byte == b'\t')
+        .map(|tab| start + tab + 1)
+        .unwrap_or(end);
+    phrase_matches(&docs[text_start..end], phrase, phrase_keys, vocabulary, map)
 }
 
 fn push_number(out: &mut Vec<u8>, mut value: u64) {
@@ -992,51 +995,56 @@ fn evaluate_query(
             append_view_result(output, view, postings.doc_count);
         }
         Query::Phrase(phrase) => {
-            let mut distinct = phrase.clone();
-            distinct.sort_unstable();
-            distinct.dedup();
-            distinct.sort_by_key(|&id| postings.df(id));
-            let mut candidates = Vec::new();
-            if let Some(&seed) = distinct.first() {
-                match postings.view(seed) {
-                    SetView::List(ids) => candidates.extend_from_slice(ids),
-                    SetView::Bits(words) => {
-                        for (word_index, &word) in words.iter().enumerate() {
-                            let mut remaining = word;
-                            while remaining != 0 {
-                                let id = word_index * 64 + remaining.trailing_zeros() as usize;
-                                if id < postings.doc_count {
-                                    candidates.push(id as u32);
-                                }
-                                remaining &= remaining - 1;
-                            }
+            let mut order = [0usize; 8];
+            let mut phrase_keys = [0u64; 8];
+            for position in 0..phrase.len() {
+                order[position] = position;
+                phrase_keys[position] = term_key(vocabulary.term(phrase[position]));
+            }
+            order[..phrase.len()].sort_unstable_by_key(|&position| postings.df(phrase[position]));
+            let seed = phrase[order[0]];
+            let mut matches = Vec::new();
+            match postings.view(seed) {
+                SetView::List(ids) => {
+                    for &doc_id in ids {
+                        if phrase_candidate_matches(
+                            doc_id,
+                            docs,
+                            document_starts,
+                            postings,
+                            phrase,
+                            &order[..phrase.len()],
+                            &phrase_keys[..phrase.len()],
+                            vocabulary,
+                            map,
+                        ) {
+                            matches.push(doc_id);
                         }
                     }
                 }
-            }
-            let mut matches = Vec::new();
-            for doc_id in candidates {
-                if distinct
-                    .iter()
-                    .skip(1)
-                    .any(|&term_id| !postings.contains(term_id, doc_id))
-                {
-                    continue;
-                }
-                let index = doc_id as usize;
-                let start = document_starts[index];
-                let mut end = document_starts[index + 1];
-                if end > start && docs[end - 1] == b'\n' {
-                    end -= 1;
-                }
-                let line = &docs[start..end];
-                let text_start = line
-                    .iter()
-                    .position(|&byte| byte == b'\t')
-                    .map(|tab| start + tab + 1)
-                    .unwrap_or(end);
-                if phrase_matches(&docs[text_start..end], phrase, vocabulary, map) {
-                    matches.push(doc_id);
+                SetView::Bits(words) => {
+                    for (word_index, &word) in words.iter().enumerate() {
+                        let mut remaining = word;
+                        while remaining != 0 {
+                            let doc_id = word_index * 64 + remaining.trailing_zeros() as usize;
+                            if doc_id < postings.doc_count
+                                && phrase_candidate_matches(
+                                    doc_id as u32,
+                                    docs,
+                                    document_starts,
+                                    postings,
+                                    phrase,
+                                    &order[..phrase.len()],
+                                    &phrase_keys[..phrase.len()],
+                                    vocabulary,
+                                    map,
+                                )
+                            {
+                                matches.push(doc_id as u32);
+                            }
+                            remaining &= remaining - 1;
+                        }
+                    }
                 }
             }
             append_result(output, &matches);
