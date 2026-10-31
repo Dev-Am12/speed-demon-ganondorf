@@ -1,76 +1,68 @@
-# Track B — Index (v5 candidate)
+# Track B — Index (v6 verification candidate)
 
-The frozen contract and byte-exact output format are defined by the [organizer's Track B specification](https://github.com/hackathon-raptors/speed-demon-2026/blob/main/specs/b-index.md). The specification is authoritative over this README.
+Track B answers 50,000 Boolean and exact-phrase queries over a 250,000-document corpus. The frozen organizer specification is authoritative: [specs/b-index.md](https://github.com/hackathon-raptors/speed-demon-2026/blob/main/specs/b-index.md).
 
-## Contract-critical behaviour
+> **Status: verification candidate only.** This source has not been compiled or run through the organizer gate in the artifact environment. The latest user-supplied board result is for commit `4d1311a`; the uploaded ZIP has a different root commit (`080c956`). Reconcile the candidate against the exact `4d1311a` source before replacing any file. Do not push this file until the full correctness gate and same-session benchmark pass.
 
-- The program reads `/data/docs.txt` and `/data/queries.txt`, then writes only `/out/results.txt`.
-- Tokens are ASCII letters and digits, case-folded to lowercase. Every other byte is a separator; stopwords are retained.
-- BOOL operators are applied strictly left-to-right. `NOT` means set difference from the current result; it is not unary negation.
-- PHRASE means adjacent tokens in exact order. Punctuation, whitespace, sentence boundaries and non-ASCII bytes do not create token positions; phrases never cross document boundaries.
-- Each document contributes at most once per query. Output is one line per query, in query-file order: exact match count, exact sum of document IDs, then up to the ten smallest IDs in ascending order.
+## Input and output contract
 
-## v5 candidate design
+- Read `/data/docs.txt` and `/data/queries.txt`.
+- Write only `/out/results.txt`; do not print diagnostics to stdout or stderr.
+- There are 250,000 lines in `docs.txt`, each `document_id TAB text LF`. Document IDs are dense and ascending.
+- `queries.txt` contains 31,000 BOOL queries and 19,000 PHRASE queries. Duplicate query lines remain separate outputs.
+- The token alphabet is ASCII `[a-z0-9]`. Only ASCII uppercase letters are lowercased. Every other byte—including every byte >= `0x80`—is a separator. No Unicode case folding, stemming or stopword removal is performed.
+- BOOL uses binary `AND`, `OR`, `NOT` operations **strictly left-to-right**, without precedence. `NOT` means current-result set difference.
+- PHRASE matches adjacent token positions in exact order. Separators are invisible, but documents are hard boundaries. Repeated words must repeat.
+- Each document counts once per query. Output lines preserve query order and contain exact count, exact `u64` sum of matching IDs, and the ten smallest matching IDs in ascending order (or all IDs when fewer than ten). An empty result is `0 0`.
+- Output is ASCII with LF line endings and a final LF.
 
-The implementation is standard-library-only Rust. It maps the corpus read-only, interns the terms used by the query file in a compact open-addressed vocabulary, and creates line-aligned shards. Shard count starts at the worker count and increases only when a shard would exceed the `u16` local-document-ID limit.
+## Implementation outline
 
-Index construction has two corpus passes:
+The candidate uses Rust standard library only and a read-only POSIX memory map for the corpus.
 
-1. **Pass 1:** each worker records each document's text span and computes per-shard document frequencies for query terms. The global step selects the terms that need postings and derives query plans once.
-2. **Pass 2:** each shard is owned by one worker. Sparse postings are filled into exact-size `u16` arenas; dense terms use local bitsets. Terms unused by any query path are skipped.
+1. Parse the queries first and intern the query vocabulary. The source uses `u32` term IDs and a compact open-addressed lookup table. Query vocabulary reduction is allowed by the specification.
+2. Split the corpus into line-aligned shards. Local document IDs fit in `u16`; shard count is increased if required by the local-ID limit.
+3. Pass 1 records document text spans and per-shard document frequencies for query terms. It does not retain the full document text in the heap.
+4. Build adaptive posting representations: sorted sparse `u16` lists for lower-frequency terms and dense bitsets for higher-frequency terms. Terms not needed by query evaluation are skipped.
+5. Pass 2 fills the exact postings and selectively records byte offsets for rare phrase-seed occurrences.
+6. Plan phrase queries around the rarest term. Candidate occurrences are checked using the same byte tokenizer and exact adjacent-token semantics. Unanchored repeated-word phrases use an exact Shift-And fallback.
+7. Evaluate BOOL terms in strict left-to-right order. Reordering is restricted to safe contiguous AND-only runs; it never crosses an OR or NOT boundary. List intersections use merge for moderate size ratios and scalar galloping for highly skewed lists.
+8. Fold each shard's exact count, sum and first ten IDs in document order, then write results once.
 
-### Boolean queries
+## v6 changes under review
 
-BOOL evaluation retains the specification's left-to-right semantics. The planner sorts operands only within a contiguous AND chain where that reordering is algebraically safe. At the start of a query, the whole initial AND chain can be sorted; after an OR or NOT boundary, its first operand is kept in place and only later operands in the AND chain may be reordered. OR/NOT boundaries are never crossed.
+- Fix the mutable binding for the query vector before the in-place query planner iterates with `&mut queries`.
+- Track whether an intermediate BOOL result is empty. Skip binary operations while the accumulator remains empty until the next OR, which resets the accumulator to the right-hand set.
+- Apply exact empty-right identities for AND, OR and NOT.
+- Handle sparse-left / dense-right NOT as a sparse list difference rather than silently producing an empty list.
+- Use a one-multiply initial bucket hash for vocabulary lookup. Full key equality remains mandatory; the hash change affects placement only. It is a performance hypothesis and must be compared against the previous hash on the same full dataset.
 
-Set representation is adaptive per shard: sparse sorted `u16` lists, dense bitsets, or reusable scratch lists/bitsets. List intersections use a merge for moderately sized ratios and a monotone galloping lower-bound search for highly skewed lists. The latter is a scalar implementation, not the SIMD algorithm from the cited literature.
+These changes do not change query parsing, tokenisation, matching semantics, output format or the permitted dependency set. No result is hard-coded by seed or query.
 
-### Phrase queries
+## Verification gate
 
-The frozen seed-1 query set has 19,000 phrase queries. The spec records that 18,658 contain an anchor with document frequency at most `N/1,000`, 250 contain an absent term, and 92 repeat phrases have neither. v5 uses that workload property without hard-coding any expected answers:
-
-- For a phrase whose rarest term has `df <= N/1,000`, Pass 2 stores the byte offsets of that term's token occurrences in packed `(term, shard-document, byte-offset)` events.
-- At query time, the rare seed's events enumerate candidate documents. The next-rarest distinct term's document posting list is a second filter when one exists.
-- The verifier starts at each seed occurrence, walks back by the seed's position in the phrase, and checks the phrase forward using the same byte tokenizer. It examines only candidate occurrences, not the entire document from byte zero.
-- If the selected seed does not meet the rare-anchor threshold, v5 retains its document posting list and uses the exact whole-document Shift-And verifier. This covers the generated repeat phrases without an anchor, as well as scales/seeds where the threshold does not select a rare term.
-- If the selected seed is absent, its positional range is empty and the query correctly returns no matches.
-
-The positional event index is selective rather than a full positional index: only terms selected as rare phrase seeds have occurrence offsets stored. This trades a compact extra index for less phrase-query replay.
-
-### Results and determinism
-
-Each query is evaluated on shards in document order. Shard-local IDs are translated to global IDs while accumulating count, sum, and the first ten hits. Shards are contiguous and ordered, so each shard's hits append in ascending global-ID order. Output formatting is integer-only and ends each query line with LF.
-
-The only unsafe operations are the read-only POSIX `mmap` boundary and two locally documented unchecked reads (vocabulary slot and byte map). No runtime crates are added; the dependency count remains zero.
-
-## Verification status — do not skip
-
-**This file is a v5 candidate, not a verified release.** The provided environment did not contain `rustc`, `cargo`, `rustfmt`, or Docker, so this exact Rust source could not be compiled, run against the reference, or measured here. Python property checks were run for the galloping lower-bound, anchor backtracking, phrase verifier, and Shift-And fallback, but those checks do not replace compiling the Rust binary or running the organizer's reference gate.
-
-Before merging or pushing, run at minimum:
+Run from the repository root using the event's Rust 1.99.1 toolchain:
 
 ```bash
-cd ~/speed-demon
-cargo build --manifest-path track-b/Cargo.toml --release --offline
+rustc --version
 cargo fmt --manifest-path track-b/Cargo.toml -- --check
-fixtures/b_gate.sh track-b/target/release/solution
+cargo build --manifest-path track-b/Cargo.toml --release --offline
+fixtures/b_gate.sh track-b/target/release/solution --no-full
 fixtures/b_fuzz.sh track-b/target/release/solution 2 40 tiny
 fixtures/b_fuzz.sh track-b/target/release/solution 2 6 sample
+fixtures/b_gate.sh track-b/target/release/solution
 ```
 
-`b_gate.sh` covers the spec example, committed hostile cases, generated large cases (when present), tiny/sample/full hashes, repeated deterministic runs, and thread-count independence. Do not push a failing candidate. The full gate and your own final rerun must pass before any live-board run.
+The full output hash for the official seed-1 full dataset must be:
 
-## Performance status
+```text
+f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927
+```
 
-The latest user-supplied board result is commit `a3f64b1`: `T=0.631 s`, `M=57 MB`, `S=1,294`, `K=13.162834`, speed score `55.967`, rank 39. The uploaded repository snapshot has root commit `080c956`; the context notes explicitly say the exact source that produced B commit `a3f64b1` has not been identified. Therefore, do not assume the source in this ZIP is byte-for-byte the board-tested implementation.
+The committed gate also checks the specification example, hostile cases, large synthetic cases when generated, determinism across repeated runs, and thread masks 1/2/6/12 (CPU lists `0`, `0-1`, `0-5`, `0-11`). Re-run all checks after every source edit and after the final `rustfmt` pass. A single mismatch, failed build, unexpected output, nondeterminism or thread-mask failure is a hard stop.
 
-v5 has no local Rust timing, memory measurement, `scc` count, or board result yet. No speedup is claimed. See [PERF.md](PERF.md) for the historical measurements, research rationale, and acceptance gates.
+## Performance and scoring
 
-## Research that shaped the candidate
+The latest team-supplied board result for Track B is commit `4d1311a`: `T=0.592 s`, `M=66 MB`, `S=1,014`, `K=13.702564`, machine score `56.840`. The last supplied fifth-place leaderboard K was `24.997261`; at unchanged memory/source factors, this would require about `0.178 s`. The last supplied first-place K was `35.047382`, equivalent to about `0.0905 s` at unchanged other factors. These are score-equation calculations, not forecasts; the candidate has no board result.
 
-- Sorted inverted-index postings are a standard representation; intersection cost is sensitive to list-length skew. Sanders and Transier compare intersection algorithms across widely varying posting-list ratios. Lemire, Boytsov and Kurz describe SIMD galloping for this operation and report up to a 2× improvement for their conjunctive-query benchmarks. v5 adopts the algorithmic idea of galloping for high-skew scalar intersections; it does **not** claim their SIMD result.
-- Adaptive bitmap representations are established for set-heavy workloads. Roaring bitmaps are a prominent compressed alternative. This implementation keeps its dependency-free local choice of sorted `u16` arrays for sparse sets and direct bitsets for dense sets; a Roaring dependency is not automatically a win here because the direct-dependency axis is penalized.
-- Positional inverted indexes answer phrase queries by retaining term positions and checking offsets. The KIT thesis by Transier describes document-level postings and positional structures, as well as phrase-query planning and alternatives for short documents. v5 stores positions only for rare phrase seeds rather than building a complete positional index for every query term.
-- WAND/Block-Max WAND is not used: this task does not ask for top-k ranked retrieval. It requires exact counts, exact sums and the first ten document IDs for **every** query, so a score-bound pruning algorithm cannot discard potentially matching documents.
-
-References are linked in [PERF.md](PERF.md).
+Track B's clock includes reading, indexing, querying and writing. `T` dominates the remaining opportunity: memory is capped at a 50× ratio and source/dependency ratios cannot pay. Keep zero runtime dependencies. See [PERF.md](PERF.md) for the formula, source-derived dataset facts, research references, experiment order, current evidence and caveats.

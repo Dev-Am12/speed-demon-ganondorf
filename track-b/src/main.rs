@@ -81,8 +81,14 @@ struct Vocab {
 }
 
 impl Vocab {
+    #[inline(always)]
     fn home(k: (u64, u64), mask: usize) -> usize {
-        mix64(k.0 ^ k.1.rotate_left(29)) as usize & mask
+        // One-multiply avalanche for table placement. Full key equality is still checked
+        // on every probe, so this changes collision distribution, never token identity.
+        let mut x = k.0 ^ k.1.rotate_left(29);
+        x ^= x >> 30;
+        x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        (x ^ (x >> 27)) as usize & mask
     }
 
     fn place(slots: &mut [u32], keys: &[(u64, u64)], id: u32) {
@@ -654,8 +660,22 @@ struct Scratch {
 #[derive(Clone, Copy)]
 enum Cur {
     Term(u32),
-    List,
-    Bits,
+    List(bool), // whether the current scratch list is non-empty
+    Bits(bool), // whether the current scratch bitset is non-empty
+}
+
+#[inline(always)]
+fn term_nonempty(sh: &Shard, term: u32) -> bool {
+    let len = sh.refs[term as usize].len;
+    len != SKIP && (if len & DENSE != 0 { len & !DENSE != 0 } else { len != 0 })
+}
+
+#[inline(always)]
+fn cur_nonempty(cur: Cur, sh: &Shard) -> bool {
+    match cur {
+        Cur::Term(t) => term_nonempty(sh, t),
+        Cur::List(nonempty) | Cur::Bits(nonempty) => nonempty,
+    }
 }
 
 fn mark(view: SetView<'_>, out: &mut [u64], set: bool) {
@@ -720,11 +740,13 @@ fn merge(a: &[u16], b: &[u16], out: &mut Vec<u16>, union: bool) {
 /// One left-to-right BOOL step: (current result) op (term rhs), inside one shard.
 fn step(cur: Cur, rhs: u32, op: Op, sh: &Shard, sc: &mut Scratch) -> Cur {
     let words = sh.words();
+    let left_nonempty = cur_nonempty(cur, sh);
+    let right_nonempty = term_nonempty(sh, rhs);
     let right = sh.view(rhs);
     let left = match cur {
         Cur::Term(t) => sh.view(t),
-        Cur::List => SetView::List(&sc.cl),
-        Cur::Bits => SetView::Bits(&sc.cb[..words]),
+        Cur::List(_) => SetView::List(&sc.cl),
+        Cur::Bits(_) => SetView::Bits(&sc.cb[..words]),
     };
     let bits = match op {
         Op::And => left.is_bits() && right.is_bits(),
@@ -735,20 +757,33 @@ fn step(cur: Cur, rhs: u32, op: Op, sh: &Shard, sc: &mut Scratch) -> Cur {
     };
     if bits {
         let t = &mut sc.tb[..words];
+        // Track emptiness while producing the result. This lets eval skip the rest of an
+        // AND/NOT run on an empty accumulator without rescanning a dense bitset.
+        let mut nonempty = matches!(op, Op::Or) && (left_nonempty || right_nonempty);
         match (op, left, right) {
             (Op::And, SetView::Bits(a), SetView::Bits(b)) => {
                 for ((d, &x), &y) in t.iter_mut().zip(a).zip(b) {
                     *d = x & y;
+                    nonempty |= *d != 0;
+                }
+            }
+            (Op::Not, SetView::Bits(a), SetView::Bits(b)) => {
+                for ((d, &x), &y) in t.iter_mut().zip(a).zip(b) {
+                    *d = x & !y;
+                    nonempty |= *d != 0;
                 }
             }
             _ => {
                 t.fill(0);
                 mark(left, t, true);
                 mark(right, t, matches!(op, Op::Or));
+                if matches!(op, Op::Not) {
+                    nonempty = t.iter().any(|&word| word != 0);
+                }
             }
         }
         std::mem::swap(&mut sc.cb, &mut sc.tb);
-        return Cur::Bits;
+        return Cur::Bits(nonempty);
     }
     let out = &mut sc.tl;
     out.clear();
@@ -786,24 +821,61 @@ fn step(cur: Cur, rhs: u32, op: Op, sh: &Shard, sc: &mut Scratch) -> Cur {
             }
         }
         (_, SetView::List(a)) => out.extend(a.iter().copied().filter(|&x| !right.contains(x))),
+        // NOT with a sparse left operand and dense right operand returns a subset
+        // of the sparse left list. Keep this mixed-representation case exact.
+        (_, SetView::Bits(_)) => {
+            if let SetView::List(a) = left {
+                out.extend(a.iter().copied().filter(|&x| !right.contains(x)));
+            }
+        }
         _ => {}
     }
+    let nonempty = !out.is_empty();
     std::mem::swap(&mut sc.cl, &mut sc.tl);
-    Cur::List
+    Cur::List(nonempty)
 }
 
 /// Evaluates one query on one shard and folds the result into `a`.
 fn eval(q: &Query, plans: &[PhrasePlan], docs: &[u8], sh: &Shard, sc: &mut Scratch, a: &mut Acc10) {
     match q {
         Query::Bool { terms, ops, len } => {
+            let m = *len as usize;
             let mut cur = Cur::Term(terms[0]);
-            for i in 1..*len as usize {
-                cur = step(cur, terms[i], ops[i - 1], sh, sc);
+            let mut i = 1usize;
+            while i < m {
+                if !cur_nonempty(cur, sh) {
+                    // Empty AND/NOT results remain empty. The first subsequent OR can
+                    // restart directly from its right-hand term: empty OR S(t) == S(t).
+                    while i < m && !matches!(ops[i - 1], Op::Or) {
+                        i += 1;
+                    }
+                    if i == m {
+                        break;
+                    }
+                    cur = Cur::Term(terms[i]);
+                    i += 1;
+                } else {
+                    let rhs = terms[i];
+                    let op = ops[i - 1];
+                    if !term_nonempty(sh, rhs) {
+                        // Algebraic identities avoid scanning a potentially large current
+                        // set when the right-hand posting is empty. BOOL terms are all
+                        // retained by the index planner, so this is an exact emptiness test.
+                        if matches!(op, Op::And) {
+                            sc.cl.clear();
+                            cur = Cur::List(false);
+                        }
+                        // x OR ∅ = x and x NOT ∅ = x.
+                    } else {
+                        cur = step(cur, rhs, op, sh, sc);
+                    }
+                    i += 1;
+                }
             }
             let view = match cur {
                 Cur::Term(t) => sh.view(t),
-                Cur::List => SetView::List(&sc.cl),
-                Cur::Bits => SetView::Bits(&sc.cb[..sh.words()]),
+                Cur::List(_) => SetView::List(&sc.cl),
+                Cur::Bits(_) => SetView::Bits(&sc.cb[..sh.words()]),
             };
             a.add(view, sh.base);
         }
