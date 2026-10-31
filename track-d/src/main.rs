@@ -26,7 +26,7 @@ fn parse_u32_field(line: &[u8], pos: &mut usize) -> u32 {
 /// Run single-source Dijkstra search from s to t using forward CSR graph.
 /// Spec §3: Returns shortest directed distance in u64, or -1 if unreachable.
 fn shortest_path(
-    offsets: &[usize],
+    offsets: &[u32],
     targets: &[u32],
     weights: &[u32],
     s: u32,
@@ -64,8 +64,8 @@ fn shortest_path(
 
         // Relax outgoing edges from node u using CSR slices
         // Safe indices: u and u + 1 within bounds of offsets array of size n + 1
-        let start = offsets[u as usize];
-        let end = offsets[u as usize + 1];
+        let start = offsets[u as usize] as usize;
+        let end = offsets[u as usize + 1] as usize;
 
         for i in start..end {
             // Safe indices: i < m guaranteed by CSR construction
@@ -138,8 +138,8 @@ fn main() {
     let n = parse_u32_field(&line_buf, &mut pos) as usize;
     let m = parse_u32_field(&line_buf, &mut pos) as usize;
 
-    // Pass 1: count outgoing degree per node into CSR offsets array of size n + 1
-    let mut offsets = vec![0usize; n + 1];
+    // Pass 1: count outgoing degree per node into compact u32 CSR offsets array of size n + 1 (saves ~7 MB vs usize)
+    let mut offsets = vec![0u32; n + 1];
 
     for _ in 0..m {
         line_buf.clear();
@@ -192,7 +192,7 @@ fn main() {
         let w = parse_u32_field(&line_buf, &mut p);
 
         // Safe index: u < n guaranteed; slot < m guaranteed by degree prefix sums
-        let slot = cur_offsets[u];
+        let slot = cur_offsets[u] as usize;
         cur_offsets[u] += 1;
         targets[slot] = v;
         weights[slot] = w;
