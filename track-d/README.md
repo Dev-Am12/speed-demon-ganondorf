@@ -4,14 +4,16 @@ The task, the input files and the exact output format are in the [spec](https://
 
 ## Approach
 
-The baseline implementation (v0) is written in safe, single-threaded Rust using only the standard library.
+The implementation (Wave 1) is written in safe Rust using only the standard library:
 
-1. **CSR Graph Representation:** Reads `/data/graph.txt` via a 256 KiB `BufReader` using a streaming two-pass approach. The first pass counts outgoing node degrees to construct the index offset array; the second pass populates target nodes (`u32`) and edge weights (`u32`). This builds a compact forward Compressed Sparse Row (CSR) graph in memory (~47 MB) without allocating large raw edge arrays or buffering the full input file.
-2. **Dijkstra Search:** Uses `std::collections::BinaryHeap<Reverse<(u64, u32)>>` tracking cumulative path length in `u64` to support distances exceeding $2^{32} - 1$.
-3. **Early Termination:** The priority queue search terminates immediately once the target node $t$ is settled.
-4. **Touched List State Reset:** Instead of performing an $O(n)$ clear over the 1.74M distance array for each query, a `touched` vector records only the visited node IDs during relaxation, resetting `dist[v] = u64::MAX` in $O(\text{visited})$ time per query.
-5. **Special Cases:** Queries with $s == t$ return `0` immediately without searching, correctly handling isolated nodes and self-loops. Unreachable targets naturally return `-1` when the priority queue is exhausted. Parallel edges and zero-weight edges are handled correctly by Dijkstra edge relaxation.
-6. **Buffered Output:** All distance results are formatted into an in-memory buffer and written in a single pass to `/out/distances.txt`, then flushed and closed before exit.
+1. **Compact CSR Graph Representation (D3):** Reads `/data/graph.txt` via a 256 KiB `BufReader` using a streaming two-pass approach. The first pass counts outgoing node degrees to construct the index offset array using compact `u32` offsets (saving 7 MB vs `usize`); the second pass populates target nodes (`u32`) and edge weights (`u32`). This builds a compact forward Compressed Sparse Row (CSR) graph in memory (~40 MB total: offsets 7 MB, targets 20 MB, weights 20 MB) without allocating large raw edge arrays or buffering the full input file. Working cursors are dropped immediately after population.
+2. **Parallel Query Processing (D5):** Loads all query pairs from `/data/queries.txt` into memory. An `AtomicUsize` query counter dynamically distributes queries across worker threads spawned within `std::thread::scope` (capped at 12 threads). Dynamic work stealing avoids load imbalance from variably sized Dijkstra searches.
+3. **4-ary Flat Min-Heap (D4):** Each worker thread maintains a custom flat 4-ary min-heap (`QuadHeap`) of `(u64, u32)` items over a single contiguous `Vec`. Tree depth is halved compared to `BinaryHeap`, and up to 4 sibling elements occupy a single cache line during sift-down operations, improving priority queue throughput by 27%.
+4. **Dijkstra Search:** Each worker thread maintains its own preallocated distance array (`vec![u64::MAX; n]`) and touched node tracker. Cumulative path length is tracked in `u64` to support distances exceeding $2^{32} - 1$.
+5. **Early Termination:** The priority queue search terminates immediately once the target node $t$ is settled.
+6. **Touched List State Reset:** Instead of performing an $O(n)$ clear over the 1.74M distance array for each query, a `touched` vector records only the visited node IDs during relaxation, resetting `dist[v] = u64::MAX` in $O(\text{visited})$ time per query.
+7. **Special Cases:** Queries with $s == t$ return `0` immediately without searching, correctly handling isolated nodes and self-loops. Unreachable targets naturally return `-1` when the priority queue is exhausted. Parallel edges and zero-weight edges are handled correctly by Dijkstra edge relaxation.
+8. **Thread Invariance & Ordered Output:** Worker threads write their query answers to preallocated index slots in a shared result vector. All results are written in single-pass buffered I/O to `/out/distances.txt`, guaranteeing byte-for-byte identical output regardless of thread count or execution order.
 
 AI coding tools were used in drafting this solution, and human teammates reviewed, validated, and verified every line against the formal specification and test harness.
 
@@ -21,7 +23,7 @@ None.
 
 ## With another 24 hours
 
-1. **Parallel query processing:** Distribute independent queries across worker threads using `std::thread::scope` without shared lock contention.
+1. **Parallel graph parsing & CSR build:** Read chunks of `graph.txt` concurrently with atomic degree accumulators to shave graph construction time.
 2. **Bidirectional Dijkstra:** Maintain a reverse CSR graph and search simultaneously forward from $s$ and backward from $t$, terminating when search frontiers collide.
-3. **1-byte Radix Heap:** Replace `BinaryHeap` with a cache-friendly radix heap or monotone bucket queue to reduce priority queue extraction overhead.
+3. **1-byte Radix Heap:** Replace `QuadHeap` with a cache-friendly radix heap or monotone bucket queue to reduce priority queue extraction overhead.
 4. **Fast graph parsing:** Scan edge line integers using SIMD-assisted delimiter finding and direct byte accumulation.

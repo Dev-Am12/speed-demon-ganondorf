@@ -1,11 +1,79 @@
-// Track D (Traverse): single-threaded baseline (v0) in safe standard-library Rust.
+// Track D (Traverse): parallelized solution (v1) in safe standard-library Rust.
 // Implements the shortest path contract defined in specs/d-traverse.md.
-// No threads, no unsafe, no SIMD, no mmap, no custom hashers, no renumbering, no bidirectional search (GR-P2, PLAN §6, §7.3, §11).
+// No unsafe, no SIMD, no mmap, no custom hashers, no renumbering, no bidirectional search (GR-P2..P10, PLAN §6, §7.3, §11).
 
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// 4-ary flat min-heap of (u64, u32) priority items.
+/// Spec §3 & PLAN §7.3: shallower tree depth (log4 vs log2) and cache-line aligned child scanning.
+struct QuadHeap {
+    data: Vec<(u64, u32)>,
+}
+
+impl QuadHeap {
+    fn with_capacity(cap: usize) -> Self {
+        Self {
+            data: Vec::with_capacity(cap),
+        }
+    }
+
+    fn push(&mut self, item: (u64, u32)) {
+        let mut idx = self.data.len();
+        self.data.push(item);
+        // Sift up: parent is (idx - 1) / 4
+        while idx > 0 {
+            let parent = (idx - 1) >> 2;
+            // Safe index: parent < idx guaranteed by bit shift
+            if self.data[idx].0 < self.data[parent].0 {
+                self.data.swap(idx, parent);
+                idx = parent;
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn pop(&mut self) -> Option<(u64, u32)> {
+        if self.data.is_empty() {
+            return None;
+        }
+        let top = self.data.swap_remove(0);
+        if !self.data.is_empty() {
+            let mut idx = 0;
+            let len = self.data.len();
+            loop {
+                let first_child = (idx << 2) + 1;
+                if first_child >= len {
+                    break;
+                }
+                // Scan up to 4 contiguous children in a single cache line
+                let mut best_child = first_child;
+                let mut best_cost = self.data[first_child].0;
+                let last_child = (first_child + 4).min(len);
+                for c in (first_child + 1)..last_child {
+                    // Safe index: c < last_child <= len guaranteed by min(len)
+                    if self.data[c].0 < best_cost {
+                        best_cost = self.data[c].0;
+                        best_child = c;
+                    }
+                }
+                if best_cost < self.data[idx].0 {
+                    self.data.swap(idx, best_child);
+                    idx = best_child;
+                } else {
+                    break;
+                }
+            }
+        }
+        Some(top)
+    }
+
+    fn clear(&mut self) {
+        self.data.clear();
+    }
+}
 
 /// Parse the next unsigned decimal integer from line bytes starting at pos.
 fn parse_u32_field(line: &[u8], pos: &mut usize) -> u32 {
@@ -25,14 +93,14 @@ fn parse_u32_field(line: &[u8], pos: &mut usize) -> u32 {
 /// Run single-source Dijkstra search from s to t using forward CSR graph.
 /// Spec §3: Returns shortest directed distance in u64, or -1 if unreachable.
 fn shortest_path(
-    offsets: &[usize],
+    offsets: &[u32],
     targets: &[u32],
     weights: &[u32],
     s: u32,
     t: u32,
     dist: &mut [u64],
     touched: &mut Vec<u32>,
-    heap: &mut BinaryHeap<Reverse<(u64, u32)>>,
+    heap: &mut QuadHeap,
 ) -> i64 {
     // Spec §3: d(s, s) = 0 for every node, including isolated nodes and nodes with self-loops
     if s == t {
@@ -44,11 +112,11 @@ fn shortest_path(
     dist[s as usize] = 0;
     touched.push(s);
     // Heap tracks (cost, node); cost is u64 per Spec §3 (exceeds 2^32), node is u32
-    heap.push(Reverse((0, s)));
+    heap.push((0, s));
 
     let mut answer: i64 = -1;
 
-    while let Some(Reverse((d, u))) = heap.pop() {
+    while let Some((d, u)) = heap.pop() {
         // Safe index: u < n guaranteed by edge target bounds
         if d > dist[u as usize] {
             // Stale heap entry: u was already settled via a shorter path
@@ -63,8 +131,8 @@ fn shortest_path(
 
         // Relax outgoing edges from node u using CSR slices
         // Safe indices: u and u + 1 within bounds of offsets array of size n + 1
-        let start = offsets[u as usize];
-        let end = offsets[u as usize + 1];
+        let start = offsets[u as usize] as usize;
+        let end = offsets[u as usize + 1] as usize;
 
         for i in start..end {
             // Safe indices: i < m guaranteed by CSR construction
@@ -79,7 +147,7 @@ fn shortest_path(
                     touched.push(v);
                 }
                 dist[v as usize] = next_d;
-                heap.push(Reverse((next_d, v)));
+                heap.push((next_d, v));
             }
         }
     }
@@ -137,8 +205,8 @@ fn main() {
     let n = parse_u32_field(&line_buf, &mut pos) as usize;
     let m = parse_u32_field(&line_buf, &mut pos) as usize;
 
-    // Pass 1: count outgoing degree per node into CSR offsets array of size n + 1
-    let mut offsets = vec![0usize; n + 1];
+    // Pass 1: count outgoing degree per node into compact u32 CSR offsets array of size n + 1 (saves ~7 MB vs usize)
+    let mut offsets = vec![0u32; n + 1];
 
     for _ in 0..m {
         line_buf.clear();
@@ -191,17 +259,12 @@ fn main() {
         let w = parse_u32_field(&line_buf, &mut p);
 
         // Safe index: u < n guaranteed; slot < m guaranteed by degree prefix sums
-        let slot = cur_offsets[u];
+        let slot = cur_offsets[u] as usize;
         cur_offsets[u] += 1;
         targets[slot] = v;
         weights[slot] = w;
     }
     drop(cur_offsets);
-
-    // Pre-allocate query state buffers to eliminate per-query allocation
-    let mut dist = vec![u64::MAX; n];
-    let mut touched = Vec::with_capacity(16 * 1024);
-    let mut heap = BinaryHeap::with_capacity(16 * 1024);
 
     // Open queries file
     let qfile = match File::open(&queries_path) {
@@ -212,11 +275,9 @@ fn main() {
         }
     };
     let mut qreader = BufReader::with_capacity(64 * 1024, qfile);
+    let mut queries = Vec::with_capacity(2048);
 
-    // In-memory output buffer for single atomic write (PLAN §6 item 3)
-    let mut out_buf = Vec::with_capacity(32 * 1024);
-
-    // Process queries sequentially in input order (Spec §4)
+    // Read all query pairs into memory before parallel search
     loop {
         line_buf.clear();
         let bytes_read = qreader
@@ -232,19 +293,73 @@ fn main() {
         let mut p = 0;
         let s = parse_u32_field(&line_buf, &mut p);
         let t = parse_u32_field(&line_buf, &mut p);
+        queries.push((s, t));
+    }
 
-        let ans = shortest_path(
-            &offsets,
-            &targets,
-            &weights,
-            s,
-            t,
-            &mut dist,
-            &mut touched,
-            &mut heap,
-        );
+    let total_queries = queries.len();
+    let mut results = vec![-1i64; total_queries];
 
-        // Write answer followed by LF (Spec §4: decimal integer or -1)
+    if total_queries > 0 {
+        // At most 12 threads per competition rules; configurable via THREADS env var
+        let default_threads = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(1)
+            .min(12);
+        let num_threads = std::env::var("THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default_threads)
+            .clamp(1, 12);
+
+        let query_counter = AtomicUsize::new(0);
+
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(num_threads);
+            for _ in 0..num_threads {
+                handles.push(scope.spawn(|| {
+                    // Pre-allocate thread-local query state buffers
+                    let mut dist = vec![u64::MAX; n];
+                    let mut touched = Vec::with_capacity(16 * 1024);
+                    let mut heap = QuadHeap::with_capacity(16 * 1024);
+                    let mut local_results = Vec::with_capacity(total_queries / num_threads + 16);
+
+                    loop {
+                        let idx = query_counter.fetch_add(1, Ordering::Relaxed);
+                        if idx >= total_queries {
+                            break;
+                        }
+                        // Safe index: idx < total_queries verified by atomic loop check
+                        let (s, t) = queries[idx];
+                        let ans = shortest_path(
+                            &offsets,
+                            &targets,
+                            &weights,
+                            s,
+                            t,
+                            &mut dist,
+                            &mut touched,
+                            &mut heap,
+                        );
+                        local_results.push((idx, ans));
+                    }
+                    local_results
+                }));
+            }
+
+            for handle in handles {
+                // Collect results from worker threads and assign to output order
+                for (idx, ans) in handle.join().expect("worker thread panicked") {
+                    // Safe index: idx < results.len() guaranteed by query index bounds
+                    results[idx] = ans;
+                }
+            }
+        });
+    }
+
+    // In-memory output buffer for single atomic write (PLAN §6 item 3)
+    let mut out_buf = Vec::with_capacity(32 * 1024);
+    for ans in results {
+        // Format decimal integer distance or -1 followed by LF (Spec §4)
         writeln!(out_buf, "{}", ans).expect("writing to in-memory Vec<u8> cannot fail");
     }
 
