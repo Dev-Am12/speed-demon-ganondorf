@@ -149,7 +149,7 @@ impl DistTable {
     }
 
     #[inline(always)]
-    fn set(&mut self, node: u32, dist: u64) {
+    fn find_or_insert(&mut self, node: u32) -> usize {
         if self.count * 10 >= self.keys.len() * 7 {
             self.grow();
         }
@@ -157,15 +157,13 @@ impl DistTable {
         loop {
             let k = self.keys[idx];
             if k == node {
-                self.vals[idx] = dist;
-                return;
+                return idx;
             }
             if k == u32::MAX {
                 self.keys[idx] = node;
-                self.vals[idx] = dist;
                 self.touched.push(idx);
                 self.count += 1;
-                return;
+                return idx;
             }
             idx = (idx + 1) & self.mask;
         }
@@ -221,7 +219,8 @@ fn shortest_path(
         return -1;
     }
 
-    dist_table.set(s, 0);
+    let s_slot = dist_table.find_or_insert(s);
+    dist_table.vals[s_slot] = 0;
     heap.push((0, s));
 
     let mut answer: i64 = -1;
@@ -245,10 +244,10 @@ fn shortest_path(
             let v = (packed & 0xFFFF_FFFF) as u32;
             let w = (packed >> 32) as u64;
             let next_d = d + w;
-            let v_d = dist_table.get(v);
 
-            if next_d < v_d {
-                dist_table.set(v, next_d);
+            let slot = dist_table.find_or_insert(v);
+            if next_d < dist_table.vals[slot] {
+                dist_table.vals[slot] = next_d;
                 heap.push((next_d, v));
             }
         }
@@ -307,6 +306,9 @@ fn main() {
     for w in 1..workers {
         let mut pos = data_start + data_len * w / workers;
         while let Ok(n) = file.read_at(&mut snap_buf[..1024.min(file_len - pos)], pos as u64) {
+            if n == 0 {
+                break;
+            }
             if let Some(i) = snap_buf[..n].iter().position(|&b| b == b'\n') {
                 pos += i + 1;
                 break;
@@ -337,7 +339,9 @@ fn main() {
                 let mut cur = start;
                 while cur < end {
                     let to_read = (CHUNK_SIZE - carried).min(end - cur);
-                    let n = f.read_at(&mut buf[carried..carried + to_read], cur as u64).unwrap();
+                    let n = f
+                        .read_at(&mut buf[carried..carried + to_read], cur as u64)
+                        .unwrap();
                     if n == 0 {
                         break;
                     }
@@ -356,7 +360,8 @@ fn main() {
                         let v = parse_u32(&buf, &mut pos);
                         let _w = parse_u32(&buf, &mut pos);
                         out_deg[u as usize].fetch_add(1, Ordering::Relaxed);
-                        has_in[(v as usize) >> 6].fetch_or(1 << ((v as usize) & 63), Ordering::Relaxed);
+                        has_in[(v as usize) >> 6]
+                            .fetch_or(1 << ((v as usize) & 63), Ordering::Relaxed);
                         while pos <= last_nl && buf[pos] != b'\n' {
                             pos += 1;
                         }
@@ -403,7 +408,9 @@ fn main() {
                 let mut cur = start;
                 while cur < end {
                     let to_read = (CHUNK_SIZE - carried).min(end - cur);
-                    let n = f.read_at(&mut buf[carried..carried + to_read], cur as u64).unwrap();
+                    let n = f
+                        .read_at(&mut buf[carried..carried + to_read], cur as u64)
+                        .unwrap();
                     if n == 0 {
                         break;
                     }
@@ -422,7 +429,8 @@ fn main() {
                         let v = parse_u32(&buf, &mut pos);
                         let w = parse_u32(&buf, &mut pos);
                         let slot = cur_slots[u as usize].fetch_add(1, Ordering::Relaxed);
-                        edg[slot as usize].store(((w as u64) << 32) | (v as u64), Ordering::Relaxed);
+                        edg[slot as usize]
+                            .store(((w as u64) << 32) | (v as u64), Ordering::Relaxed);
                         while pos <= last_nl && buf[pos] != b'\n' {
                             pos += 1;
                         }
