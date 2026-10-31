@@ -6,7 +6,7 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc;
+use std::sync::{mpsc, Mutex};
 use std::thread;
 
 const HOURS: usize = 72;
@@ -287,25 +287,33 @@ fn main() {
     bounds[parse_workers] = len;
     bounds.dedup();
 
-    let locals: Vec<Local> = thread::scope(|scope| {
+    let (tables, hours_by_worker): (Vec<Table>, Vec<Vec<HourData>>) = thread::scope(|scope| {
         let mut tasks = Vec::new();
         for pair in bounds.windows(2) {
             let (start, end) = (pair[0], pair[1]);
             tasks.push(scope.spawn(move || {
                 let source = File::open(input).expect("reopen requests.log");
-                parse_worker_range(&source, start, end)
+                let local = parse_worker_range(&source, start, end);
+                (local.table, local.hours)
             }));
         }
-        tasks
+        let results: Vec<(Table, Vec<HourData>)> = tasks
             .into_iter()
             .map(|t| t.join().expect("parser worker panicked"))
-            .collect()
+            .collect();
+        let mut tables = Vec::with_capacity(results.len());
+        let mut hours = Vec::with_capacity(results.len());
+        for (t, h) in results {
+            tables.push(t);
+            hours.push(h);
+        }
+        (tables, hours)
     });
 
-    let mut names = Vec::with_capacity(2048 * locals.len());
-    for local in &locals {
-        for id in 0..local.table.offsets.len() as u16 {
-            names.push(local.table.get_name(id));
+    let mut names = Vec::with_capacity(2048 * tables.len());
+    for table in &tables {
+        for id in 0..table.offsets.len() as u16 {
+            names.push(table.get_name(id));
         }
     }
     names.sort_unstable();
@@ -314,11 +322,11 @@ fn main() {
 
     let remaps: Vec<Vec<u16>> = thread::scope(|scope| {
         let mut tasks = Vec::new();
-        for local in &locals {
+        for table in &tables {
             let names = &names;
             tasks.push(scope.spawn(move || {
-                (0..local.table.offsets.len() as u16)
-                    .map(|id| names.binary_search(&local.table.get_name(id)).unwrap() as u16)
+                (0..table.offsets.len() as u16)
+                    .map(|id| names.binary_search(&table.get_name(id)).unwrap() as u16)
                     .collect()
             }));
         }
@@ -327,6 +335,17 @@ fn main() {
             .map(|t| t.join().expect("remap worker panicked"))
             .collect()
     });
+
+    let num_workers = hours_by_worker.len();
+    let mut hourly: Vec<Option<Vec<HourData>>> = (0..HOURS)
+        .map(|_| Some(Vec::with_capacity(num_workers)))
+        .collect();
+    for hours in hours_by_worker {
+        for (h, hd) in hours.into_iter().enumerate() {
+            hourly[h].as_mut().unwrap().push(hd);
+        }
+    }
+    let hourly = Mutex::new(hourly);
 
     let mut prefixes = [[0u8; 21]; HOURS];
     for (hour, p) in prefixes.iter_mut().enumerate() {
@@ -345,7 +364,7 @@ fn main() {
         for _ in 0..agg_workers {
             let next = &next_hour;
             let names = &names;
-            let locals = &locals;
+            let hourly = &hourly;
             let remaps = &remaps;
             let prefixes = &prefixes;
             let tx = tx.clone();
@@ -361,12 +380,13 @@ fn main() {
                     if hour >= HOURS {
                         break;
                     }
+                    let hour_data = hourly.lock().unwrap()[hour].take().unwrap();
                     counts.fill(0);
                     err_counts.fill(0);
 
-                    for (w, local) in locals.iter().enumerate() {
+                    for (w, hd) in hour_data.iter().enumerate() {
                         let w_remap = &remaps[w];
-                        for &r in &local.hours[hour].records {
+                        for &r in &hd.records {
                             let gid = w_remap[(r & 0x7FF) as usize] as usize;
                             counts[gid] += 1;
                             if (r & 0x800) != 0 {
@@ -386,9 +406,8 @@ fn main() {
                         flat_lats.resize(sum as usize, 0);
                     }
 
-                    for (w, local) in locals.iter().enumerate() {
+                    for (w, hd) in hour_data.iter().enumerate() {
                         let w_remap = &remaps[w];
-                        let hd = &local.hours[hour];
                         let mut of_idx = 0;
                         for &r in &hd.records {
                             let gid = w_remap[(r & 0x7FF) as usize] as usize;
@@ -405,6 +424,7 @@ fn main() {
                             flat_lats[slot] = lat;
                         }
                     }
+                    drop(hour_data);
 
                     let mut out = Vec::with_capacity(160 * 1024);
                     for ep in 0..num_endpoints {

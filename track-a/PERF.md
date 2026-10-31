@@ -25,6 +25,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 18 | A21: 64-bit tag slot intern, flat arena, growable table | pending | 0.052 | 44 | 33.20 |
 | 19 | M1: reserve record buffers once with chunk_len / 40 | pending | 0.052 | 44 | 33.20 |
 | 20 | M2: pack records to 4B u32 (11-bit id | 1-bit err | 20-bit lat) with overflow list | pending | 0.050 | 41 | 35.80 |
+| 21 | M3: progressive hourly buffer drops with ordered streaming pipeline | pending | 0.050 | 26 | 38.40 |
 
 ### Experiment Log
 - **Step 2 (A1 - Positional parsing & integer hour index):**
@@ -124,4 +125,9 @@ Every step from the reference to your final version, each with the live-board ru
   - *Local relative result:* Interleaved 20 runs: M1 167.3 ms ± 24.8 ms -> M2 138.9 ms ± 10.3 ms (1.21x faster). User CPU dropped from 517.1 ms to 491.2 ms (-25.9 ms). System CPU dropped from 315.4 ms to 219.6 ms (-95.8 ms). Minor page faults dropped from 10,468 to 8,246 (-2,222 faults, -21.2%). Peak RSS dropped from 39.7 MB to 31.3 MB (-8.4 MB). Cgroup `memory.peak` dropped from 45.2 MB to 41.04 MB (-4.16 MB). S = 421 lines (+16 lines).
   - *Known-bad control test:* Verified boundary latencies 0, 100, 1048574, 1048575, 1048576 (2^20), 1048577, and 4294967295 (2^32 - 1) across multiple hours; output matches reference implementation byte-for-byte.
   - *K-accounting:* Evaluated at board operating point ($T = 70\text{ ms}$, $M \approx 45.2\text{ MB}$, $S = 405 \to 421$): $\Delta T \approx -2.5\text{ ms} \implies \times 1.0183$; $\Delta M \approx -4.16\text{ MB} \implies \times 1.0146$; $\Delta S = +16 \implies \times 0.9942$; net gain $= +2.72\% \ge 1\%$.
+  - *Verdict:* Kept. Correctness verified on full, sample, tiny, 49/49 fuzz seeds, and threads 1/2/6/8/12.
+- **Step 23 (M3 - Progressive hourly buffer drops with ordered streaming pipeline):**
+  - *Hypothesis:* Workers claim hours dynamically from a shared `Mutex<Vec<Option<Vec<HourData>>>>`. Once an hour's data is scattered into `flat_lats`, that hour's buffers across all workers are dropped immediately (`drop(hour_data)`). Only currently active hours occupy memory during Phase C, allowing glibc to reclaim or reuse pages and preventing Phase A records from coexisting with Phase C formatted output.
+  - *Local relative result:* Cgroup `memory.peak` dropped dramatically from 41.04 MB to 26.13 MB (-14.91 MB, -36.3% peak memory reduction). Peak RSS (VmHWM) dropped from 31.3 MB to 21.2 MB (-10.1 MB, -32.3%). Minor page faults dropped from 8,246 to 7,026 (-1,220 faults, -14.8%). User CPU time dropped from 477.3 ms to 469.1 ms. Container check passes (0.88 s). Because `memory.peak` fell to 26.13 MB, M4 (`malloc_trim`) is not triggered, keeping the code 100% `#![forbid(unsafe_code)]`. S = 440 lines (+19 lines).
+  - *K-accounting:* Evaluated at board operating point ($M \approx 41.04 \to 26.13\text{ MB}$, $S = 421 \to 440$, $T \approx 70\text{ ms}$): $\Delta M \approx -14.91\text{ MB} \implies \times 1.0701$; $\Delta S = +19 \implies \times 0.9934$; net gain $= +6.30\% \ge 1\%$.
   - *Verdict:* Kept. Correctness verified on full, sample, tiny, 49/49 fuzz seeds, and threads 1/2/6/8/12.
