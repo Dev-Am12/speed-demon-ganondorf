@@ -153,7 +153,7 @@ fn is_record_end(b: &[u8], nl: usize) -> bool {
     p >= 2 && b[p - 1] == b',' && b[p - 2].is_ascii_digit() && b.get(nxt).is_some_and(u8::is_ascii_digit)
 }
 
-#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt,pclmul")]
+#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt,pclmulqdq")]
 unsafe fn parse_chunk(
     bytes: &[u8],
     region_map: &[u8],
@@ -167,6 +167,7 @@ unsafe fn parse_chunk(
         a.amount_max = i64::MIN;
     }
     let mut ubuf = vec![0u8; 512];
+    let mut tail = [0u8; 64];
     let (mut d_pos, mut d_q) = ([0u32; 320], [0u32; 320]);
     let (mut n_delims, mut prev_in_quote, mut q_prefix, mut rec_start, mut blk_start) =
         (0usize, 0u64, 0u32, 0usize, 0usize);
@@ -179,7 +180,7 @@ unsafe fn parse_chunk(
         let (ptr, valid) = if rem >= 64 {
             (unsafe { bytes.as_ptr().add(blk_start) }, !0u64)
         } else {
-            let mut tail = [0u8; 64];
+            tail.fill(0);
             tail[..rem].copy_from_slice(&bytes[blk_start..]);
             (tail.as_ptr(), (1u64 << rem) - 1)
         };
@@ -327,7 +328,7 @@ fn main() -> io::Result<()> {
             .windows(2)
             .filter(|w| w[0] < w[1])
             .map(|w| {
-                // SAFETY: x86-64-v3 + pclmul is available on the target CPU.
+                // SAFETY: x86-64-v3 + pclmulqdq is available on the target CPU.
                 s.spawn(|| unsafe { parse_chunk(&body[w[0]..w[1]], &region_map, num_countries, keys, masks) })
             })
             .collect();

@@ -873,7 +873,7 @@ fn run(docs: &[u8]) -> io::Result<()> {
         slots: vec![u32::MAX; 16],
         keys: Vec::new(),
     };
-    let (queries, mut plans) = parse_queries(&qb, &mut vocab);
+    let (mut queries, mut plans) = parse_queries(&qb, &mut vocab);
     drop(qb);
     let v = vocab.keys.len();
     let threads = thread::available_parallelism()
