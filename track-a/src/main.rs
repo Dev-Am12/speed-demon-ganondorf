@@ -103,8 +103,8 @@ impl Table {
 }
 
 struct HourData {
-    lats: Vec<u32>,
-    id_errs: Vec<u16>,
+    records: Vec<u32>,
+    overflow: Vec<(u32, u32)>,
 }
 
 struct Local {
@@ -148,7 +148,7 @@ fn parse_line(buf: &[u8], pos: usize, local: &mut Local) -> usize {
     }
     let ep_start = i + 1;
     let ep_end = find_space_swar(buf, ep_start);
-    let err = (buf[ep_end + 1] == b'5') as u16;
+    let err = (buf[ep_end + 1] == b'5') as u32;
     let mut latency = 0u32;
     i = ep_end + 5;
     while buf[i] != b'\n' {
@@ -157,9 +157,18 @@ fn parse_line(buf: &[u8], pos: usize, local: &mut Local) -> usize {
     }
     let id = local.table.intern(&buf[ep_start..ep_end]);
     let hd = &mut local.hours[hour];
-    hd.lats.push(latency);
-    // Spec §2: catalogue has exactly 1,842 endpoints (<= 32,767); fits in 15 bits, bit 15 is 5xx flag.
-    hd.id_errs.push((id & 0x7FFF) | (err << 15));
+    let (packed_lat, is_overflow) = if latency >= 0xFFFFF {
+        (0xFFFFF, true)
+    } else {
+        (latency, false)
+    };
+    if is_overflow {
+        hd.overflow.push((hd.records.len() as u32, latency));
+    }
+    // Spec §2: Catalogue has exactly 1,842 endpoints (<= 2047); fits in 11 bits.
+    // Bit 11 is 5xx error flag. Bits 12..31 (20 bits) store packed latency or 0xFFFFF overflow sentinel.
+    hd.records
+        .push((id as u32 & 0x7FF) | (err << 11) | (packed_lat << 12));
     i + 1
 }
 
@@ -171,8 +180,8 @@ fn parse_worker_range(file: &File, mut start: usize, end: usize) -> Local {
         table: Table::new(),
         hours: (0..HOURS)
             .map(|_| HourData {
-                lats: Vec::with_capacity(cap),
-                id_errs: Vec::with_capacity(cap),
+                records: Vec::with_capacity(cap),
+                overflow: Vec::new(),
             })
             .collect(),
     };
@@ -357,10 +366,10 @@ fn main() {
 
                     for (w, local) in locals.iter().enumerate() {
                         let w_remap = &remaps[w];
-                        for &r in &local.hours[hour].id_errs {
-                            let gid = w_remap[(r & 0x7FFF) as usize] as usize;
+                        for &r in &local.hours[hour].records {
+                            let gid = w_remap[(r & 0x7FF) as usize] as usize;
                             counts[gid] += 1;
-                            if (r & 0x8000) != 0 {
+                            if (r & 0x800) != 0 {
                                 err_counts[gid] += 1;
                             }
                         }
@@ -380,12 +389,20 @@ fn main() {
                     for (w, local) in locals.iter().enumerate() {
                         let w_remap = &remaps[w];
                         let hd = &local.hours[hour];
-                        for i in 0..hd.lats.len() {
-                            let r = hd.id_errs[i];
-                            let gid = w_remap[(r & 0x7FFF) as usize] as usize;
+                        let mut of_idx = 0;
+                        for &r in &hd.records {
+                            let gid = w_remap[(r & 0x7FF) as usize] as usize;
                             let slot = cursors[gid] as usize;
                             cursors[gid] += 1;
-                            flat_lats[slot] = hd.lats[i];
+                            let lat = r >> 12;
+                            let lat = if lat == 0xFFFFF {
+                                let full = hd.overflow[of_idx].1;
+                                of_idx += 1;
+                                full
+                            } else {
+                                lat
+                            };
+                            flat_lats[slot] = lat;
                         }
                     }
 

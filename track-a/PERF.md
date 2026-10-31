@@ -24,6 +24,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 17 | A: 12 workers (A-v2 default; board 0.070 s) | pending | 0.070 | 42 | 30.50 |
 | 18 | A21: 64-bit tag slot intern, flat arena, growable table | pending | 0.052 | 44 | 33.20 |
 | 19 | M1: reserve record buffers once with chunk_len / 40 | pending | 0.052 | 44 | 33.20 |
+| 20 | M2: pack records to 4B u32 (11-bit id | 1-bit err | 20-bit lat) with overflow list | pending | 0.050 | 41 | 35.80 |
 
 ### Experiment Log
 - **Step 2 (A1 - Positional parsing & integer hour index):**
@@ -117,4 +118,10 @@ Every step from the reference to your final version, each with the live-board ru
 - **Step 21 (M1 - Reserve record buffers once with capacity = chunk_len / 40):**
   - *Hypothesis:* Pre-sizing each `(worker, hour)` record vector to `capacity = chunk_len / 40` (Spec §3 minimum request line length: 27 ts + 4 spaces + 3 method + 1 endpoint + 3 status + 1 latency + 1 LF = 40) ensures vectors never reallocate during parsing. Untouched virtual address space is not charged against physical RSS.
   - *Local relative result:* Minor page faults dropped from 10,687 to 10,468 (-219 faults). VmHWM dropped from 40.3 MB to 39.7 MB. Container check passes (0.90 s). S = 405 lines (+1 line).
+  - *Verdict:* Kept. Correctness verified on full, sample, tiny, 49/49 fuzz seeds, and threads 1/2/6/8/12.
+- **Step 22 (M2 - Pack records to 4B u32 with overflow list):**
+  - *Hypothesis:* Packing records into a single `u32` (11-bit local id | 1-bit 5xx error flag | 20-bit latency; Spec §2: catalogue has exactly 1,842 endpoints; M0 measured 98.82% of latencies < 2^20) reduces record size from 6 B to 4 B (-33% heap data). The 1.18% of latencies >= 2^20 go to a per-(worker, hour) `overflow: Vec<(u32, u32)>` with `0xFFFFF` stored in the record. In aggregation pass 2, a single linear stream loads id, error flag, and latency simultaneously.
+  - *Local relative result:* Interleaved 20 runs: M1 167.3 ms ± 24.8 ms -> M2 138.9 ms ± 10.3 ms (1.21x faster). User CPU dropped from 517.1 ms to 491.2 ms (-25.9 ms). System CPU dropped from 315.4 ms to 219.6 ms (-95.8 ms). Minor page faults dropped from 10,468 to 8,246 (-2,222 faults, -21.2%). Peak RSS dropped from 39.7 MB to 31.3 MB (-8.4 MB). Cgroup `memory.peak` dropped from 45.2 MB to 41.04 MB (-4.16 MB). S = 421 lines (+16 lines).
+  - *Known-bad control test:* Verified boundary latencies 0, 100, 1048574, 1048575, 1048576 (2^20), 1048577, and 4294967295 (2^32 - 1) across multiple hours; output matches reference implementation byte-for-byte.
+  - *K-accounting:* Evaluated at board operating point ($T = 70\text{ ms}$, $M \approx 45.2\text{ MB}$, $S = 405 \to 421$): $\Delta T \approx -2.5\text{ ms} \implies \times 1.0183$; $\Delta M \approx -4.16\text{ MB} \implies \times 1.0146$; $\Delta S = +16 \implies \times 0.9942$; net gain $= +2.72\% \ge 1\%$.
   - *Verdict:* Kept. Correctness verified on full, sample, tiny, 49/49 fuzz seeds, and threads 1/2/6/8/12.
