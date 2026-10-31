@@ -11,8 +11,8 @@ use std::thread;
 
 const HOURS: usize = 72;
 const CHUNK_SIZE: usize = 64 * 1024;
-const PARSE_WORKERS: usize = 6;
-const AGG_WORKERS: usize = 6;
+const PARSE_WORKERS: usize = 12;
+const AGG_WORKERS: usize = 12;
 const DATES: [&str; 4] = ["2026-10-30", "2026-10-31", "2026-11-01", "2026-11-02"];
 
 struct Table {

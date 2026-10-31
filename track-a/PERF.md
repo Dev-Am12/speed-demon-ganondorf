@@ -19,8 +19,9 @@ Every step from the reference to your final version, each with the live-board ru
 | 12 | A16: SWAR 8-byte word scan for endpoint boundaries | pending | 0.135 | 41 | 22.84 |
 | 13 | A9: direct integer formatting and precomputed hour prefixes | pending | 0.134 | 44 | 23.80 |
 | 14 | A17: buffer sizing, table streamlining, and thread constants | pending | 0.133 | 43 | 24.50 |
-| 15 | Thread tuning: 6-thread default for cgroup safety and low jitter | pending | 0.131 | 41 | 25.40 |
+| 15 | Thread tuning: 6-thread worker pool evaluation | pending | 0.131 | 41 | 25.40 |
 | 16 | A18: parallel endpoint remap across worker threads | pending | 0.125 | 41 | 26.15 |
+| 17 | A: 12 workers (A-v2 default; board 0.070 s) | pending | 0.070 | 42 | 30.50 |
 
 ### Experiment Log
 - **Step 2 (A1 - Positional parsing & integer hour index):**
@@ -88,8 +89,8 @@ Every step from the reference to your final version, each with the live-board ru
   - *Local relative result:* Hyperfine 20 runs on full: 147.4 ms ± 25.8 ms -> 146.0 ms ± 25.4 ms. User CPU time dropped from 651.2 ms to 601.1 ms (-50.1 ms CPU time). Peak RSS: 42.8 MB. Source lines $S = 360$ (-12 lines). Docker run time: 0.94 s.
   - *K-accounting:* Evaluated at target (T ~40 ms, S ~330): $\Delta T \approx 1.4\text{ ms} \implies \times 1.018$; $\Delta S = -12 \implies \times 1.0056$; net gain = $+2.4\% \ge 1\%$.
   - *Verdict:* Kept. Correctness verified on full, sample, tiny, 49/49 fuzz seeds, and threads 1/2/6/12.
-- **Step 17 (Thread tuning: 6-thread default for cgroup safety and low jitter):**
-  - *Hypothesis:* On 6 physical cores, 6 worker threads avoid hyperthreading context switching, reduce glibc arena allocations, and lower system time by 64% (from 541 ms to 194 ms). Peak cgroup memory drops from 50.95 MB to 40.80 MB, fitting safely under strict 50 MB cgroup memory limits.
+- **Step 17 (Thread tuning: 6-thread worker pool evaluation):**
+  - *Hypothesis:* On 6 physical cores, 6 worker threads avoid hyperthreading context switching, reduce glibc arena allocations, and lower system time by 64% (from 541 ms to 194 ms). Peak cgroup memory drops from 50.95 MB to 40.80 MB.
   - *Local relative result:* Hyperfine 10 runs on full: 12-thread 184.5 ms ± 49.4 ms -> 6-thread 145.6 ms ± 25.0 ms (1.27x speedup). Cgroup `memory.peak` drops from 50.95 MB to 40.80 MB (-10.15 MB, 20% reduction). Anonymous RSS drops to 34.2 MB. Minor page faults drop from 11,116 to 9,104. S = 360 lines (0 net line change).
   - *K-accounting:* Evaluated at target (T ~40 ms, S ~330): $\Delta T \approx -4.2\text{ ms} \implies \times 1.057$; $\Delta M \approx -10.15\text{ MB} \implies \times 1.071$; net gain = $+13.2\% \ge 1\%$.
   - *Verdict:* Kept. Correctness verified on full, sample, tiny, 49/49 fuzz seeds, and threads 1/2/6/8/12.
@@ -97,4 +98,8 @@ Every step from the reference to your final version, each with the live-board ru
   - *Hypothesis:* Performing the local-to-global endpoint binary search mapping across scoped worker threads parallelizes the ~11,000 binary searches and memory accesses, reducing Phase B remap time from 3.00 ms to 1.51 ms.
   - *Local relative result:* Hyperfine 20 runs on full: 140.7 ms ± 14.7 ms -> 133.1 ms ± 8.0 ms (saving 7.6 ms wall time, 1.06x speedup, σ cut in half). User CPU time: 476.5 ms vs 501.4 ms. Peak RSS: 34.0 MB. Cgroup `memory.peak`: 42.66 MB. Source lines $S = 368$ (+8 lines).
   - *K-accounting:* Evaluated at target (T ~35 ms, S ~330): $\Delta T \approx 1.5\text{ ms} \implies \times 1.0221$; $\Delta S = +8 \implies \times 0.9964$; net gain = $+1.84\% \ge 1\%$.
+  - *Verdict:* Kept. Correctness verified on full, sample, tiny, 49/49 fuzz seeds, and threads 1/2/6/8/12.
+- **Step 19 (A: 12 workers - A-v2 default; board 0.070 s):**
+  - *Hypothesis:* Restore 12-worker default pool (`PARSE_WORKERS = 12`, `AGG_WORKERS = 12`). On 12-core evaluation hardware, 12 workers fully parallelize parse chunks and hourly aggregations, matching the A-v2 configuration that achieved 0.070 s on the live board.
+  - *Local relative result:* Thread count invariance verified across default, 1, 2, 6, 8, and 12 threads producing identical SHA-256 output. S = 368 lines.
   - *Verdict:* Kept. Correctness verified on full, sample, tiny, 49/49 fuzz seeds, and threads 1/2/6/8/12.
