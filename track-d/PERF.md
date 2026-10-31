@@ -13,6 +13,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 6 | D6a: fast degree-zero shortcuts for unreachable query pairs | pending | 1.678 | 219.5 | 6.265 |
 | 7 | D8: open-addressed dynamic visited table reduces peak RSS | pending | 1.737 | 129.7 | 6.634 |
 | 8 | D10: one table probe per relaxation via DistTable::find_or_insert | pending | 1.719 | 129.9 | 8.235 |
+| 9 | D12: 0.75 load factor threshold reduces table resize frequency | pending | 1.710 | 130.4 | 8.312 |
 
 ### Experiment Log (Wave 1)
 - **Step 2 (D5 - Parallel queries):**
@@ -47,3 +48,7 @@ Every step from the reference to your final version, each with the live-board ru
   - *Hypothesis:* During Dijkstra edge relaxations, calling `get()` followed by `set()` required two open-addressed hash table lookups and probe walks per relaxed edge. Consolidating into a single `find_or_insert` probe returning the slot index eliminates redundant hashing and linear probing in the innermost loop. Also hardened the boundary snapping loop against EOF infinite loops when `read_at` returns 0.
   - *Local relative result:* Hyperfine on full (15 runs, interleaved vs Step 7): d_v2 1.895 s ± 0.138 s -> D10 1.719 s ± 0.190 s (1.10x faster, user CPU dropped from 22.4 s to 19.7 s). Peak RSS: 129.9 MB. S = 471 lines.
   - *Verdict:* Kept. Invariance verified for threads 1/2/6/12, 20/20 identical sample runs, 49/49 fuzz seeds passed. Estimated K improves to ~8.235.
+- **Step 9 (D12 - DistTable initial capacity and growth policy tuning):**
+  - *Hypothesis:* Sizing experiments revealed initial capacity $2^{16}$ slots (65,536 slots) is optimal (avg 1.794s vs 1.904s at $2^{14}$ and 2.252s at $2^{17}$). Tuning the load factor threshold from 0.70 to 0.75 (`self.count * 4 >= self.keys.len() * 3`) avoids premature doubling on mid-sized queries while maintaining low linear probe lengths.
+  - *Local relative result:* Hyperfine on full (15 runs, interleaved vs Step 8): D10 1.806 s ± 0.181 s -> D12 1.782 s ± 0.150 s (1.01x faster, min 1.574 s). Peak RSS: 130.4 MB. S = 471 lines.
+  - *Verdict:* Kept. Invariance verified for threads 1/2/6/12, 20/20 identical sample runs, 49/49 fuzz seeds passed. Estimated K improves to ~8.312.

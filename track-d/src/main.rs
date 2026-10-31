@@ -150,7 +150,7 @@ impl DistTable {
 
     #[inline(always)]
     fn find_or_insert(&mut self, node: u32) -> usize {
-        if self.count * 10 >= self.keys.len() * 7 {
+        if self.count * 4 >= self.keys.len() * 3 {
             self.grow();
         }
         let mut idx = self.hash(node);
