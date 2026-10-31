@@ -74,6 +74,113 @@ impl QuadHeap {
     }
 }
 
+/// Open-addressed hash table for visited nodes: key = node (u32), val = dist (u64).
+/// Empty slot indicated by key == u32::MAX.
+struct DistTable {
+    keys: Vec<u32>,
+    vals: Vec<u64>,
+    shift: u32,
+    mask: usize,
+    count: usize,
+    touched: Vec<usize>,
+}
+
+impl DistTable {
+    fn with_power(pow: u32) -> Self {
+        let cap = 1usize << pow;
+        Self {
+            keys: vec![u32::MAX; cap],
+            vals: vec![u64::MAX; cap],
+            shift: 64 - pow,
+            mask: cap - 1,
+            count: 0,
+            touched: Vec::with_capacity(cap / 2),
+        }
+    }
+
+    #[inline(always)]
+    fn hash(&self, node: u32) -> usize {
+        let h = (node as u64).wrapping_mul(0x9E3779B97F4A7C15);
+        (h >> self.shift) as usize & self.mask
+    }
+
+    fn grow(&mut self) {
+        let new_pow = (64 - self.shift) + 1;
+        let new_cap = 1usize << new_pow;
+        let mut new_keys = vec![u32::MAX; new_cap];
+        let mut new_vals = vec![u64::MAX; new_cap];
+        let new_shift = 64 - new_pow;
+        let new_mask = new_cap - 1;
+        let mut new_touched = Vec::with_capacity(self.count * 2);
+
+        for &slot in &self.touched {
+            let k = self.keys[slot];
+            let v = self.vals[slot];
+            let h = (k as u64).wrapping_mul(0x9E3779B97F4A7C15);
+            let mut idx = (h >> new_shift) as usize & new_mask;
+            while new_keys[idx] != u32::MAX {
+                idx = (idx + 1) & new_mask;
+            }
+            new_keys[idx] = k;
+            new_vals[idx] = v;
+            new_touched.push(idx);
+        }
+
+        self.keys = new_keys;
+        self.vals = new_vals;
+        self.shift = new_shift;
+        self.mask = new_mask;
+        self.touched = new_touched;
+    }
+
+    #[inline(always)]
+    fn get(&self, node: u32) -> u64 {
+        let mut idx = self.hash(node);
+        loop {
+            let k = self.keys[idx];
+            if k == node {
+                return self.vals[idx];
+            }
+            if k == u32::MAX {
+                return u64::MAX;
+            }
+            idx = (idx + 1) & self.mask;
+        }
+    }
+
+    #[inline(always)]
+    fn set(&mut self, node: u32, dist: u64) {
+        if self.count * 10 >= self.keys.len() * 7 {
+            self.grow();
+        }
+        let mut idx = self.hash(node);
+        loop {
+            let k = self.keys[idx];
+            if k == node {
+                self.vals[idx] = dist;
+                return;
+            }
+            if k == u32::MAX {
+                self.keys[idx] = node;
+                self.vals[idx] = dist;
+                self.touched.push(idx);
+                self.count += 1;
+                return;
+            }
+            idx = (idx + 1) & self.mask;
+        }
+    }
+
+    fn clear(&mut self) {
+        for &slot in &self.touched {
+            self.keys[slot] = u32::MAX;
+            self.vals[slot] = u64::MAX;
+        }
+        self.touched.clear();
+        self.count = 0;
+    }
+}
+
 /// Parse unsigned decimal integer from byte buffer.
 #[inline(always)]
 fn parse_u32(buf: &[u8], pos: &mut usize) -> u32 {
@@ -96,8 +203,7 @@ fn shortest_path(
     has_incoming: &[u64],
     s: u32,
     t: u32,
-    dist: &mut [u64],
-    touched: &mut Vec<u32>,
+    dist_table: &mut DistTable,
     heap: &mut QuadHeap,
 ) -> i64 {
     if s == t {
@@ -115,14 +221,14 @@ fn shortest_path(
         return -1;
     }
 
-    dist[s as usize] = 0;
-    touched.push(s);
+    dist_table.set(s, 0);
     heap.push((0, s));
 
     let mut answer: i64 = -1;
 
     while let Some((d, u)) = heap.pop() {
-        if d > dist[u as usize] {
+        let cur_d = dist_table.get(u);
+        if d > cur_d {
             continue;
         }
 
@@ -139,21 +245,16 @@ fn shortest_path(
             let v = (packed & 0xFFFF_FFFF) as u32;
             let w = (packed >> 32) as u64;
             let next_d = d + w;
+            let v_d = dist_table.get(v);
 
-            if next_d < dist[v as usize] {
-                if dist[v as usize] == u64::MAX {
-                    touched.push(v);
-                }
-                dist[v as usize] = next_d;
+            if next_d < v_d {
+                dist_table.set(v, next_d);
                 heap.push((next_d, v));
             }
         }
     }
 
-    for &node in touched.iter() {
-        dist[node as usize] = u64::MAX;
-    }
-    touched.clear();
+    dist_table.clear();
     heap.clear();
 
     answer
@@ -375,8 +476,7 @@ fn main() {
             let mut handles = Vec::with_capacity(num_threads);
             for _ in 0..num_threads {
                 handles.push(scope.spawn(|| {
-                    let mut dist = vec![u64::MAX; n];
-                    let mut touched = Vec::with_capacity(16 * 1024);
+                    let mut dist_table = DistTable::with_power(16);
                     let mut heap = QuadHeap::with_capacity(16 * 1024);
                     let mut local_results = Vec::with_capacity(total_queries / num_threads + 16);
 
@@ -392,8 +492,7 @@ fn main() {
                             &has_incoming_bits,
                             s,
                             t,
-                            &mut dist,
-                            &mut touched,
+                            &mut dist_table,
                             &mut heap,
                         );
                         local_results.push((idx, ans));

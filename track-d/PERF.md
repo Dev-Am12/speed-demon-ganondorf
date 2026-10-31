@@ -11,6 +11,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 4 | D4: flat 4-ary QuadHeap replaces BinaryHeap | pending | 3.214 | 227 | 5.567 |
 | 5 | D1+D2+D9: parallel line-snapped parse and atomic packed CSR build | pending | 2.801 | 222 | 5.691 |
 | 6 | D6a: fast degree-zero shortcuts for unreachable query pairs | pending | 1.678 | 219.5 | 6.265 |
+| 7 | D8: open-addressed dynamic visited table reduces peak RSS | pending | 1.737 | 129.7 | 6.634 |
 
 ### Experiment Log (Wave 1)
 - **Step 2 (D5 - Parallel queries):**
@@ -35,3 +36,7 @@ Every step from the reference to your final version, each with the live-board ru
   - *Hypothesis:* Queries returning -1 can trigger worst-case graph exploration if target $t$ has zero incoming edges or source $s$ has zero outgoing edges ($s \ne t$). Tracking an incoming-edge bitset (217.5 KiB) during pass 1 enables $O(1)$ early detection and eliminates massive wasted searches.
   - *Local relative result:* Hyperfine on full (10 runs, interleaved vs Step 5): 2.620 s -> 1.678 s (1.56x speedup). Peak RSS dropped from 228.1 MB to 219.5 MB.
   - *Verdict:* Kept. Invariance verified for threads 1/2/6/12, 20/20 identical sample runs, 49/49 fuzz seeds passed. K estimate 6.265.
+- **Step 7 (D8 - Open-addressed dynamic visited table):**
+  - *Hypothesis:* Preallocating 12 dense `vec![u64::MAX; n]` distance buffers consumed 167 MB heap. Replacing them with a dynamic open-addressed hash table (`DistTable`, initial $2^{16}$ slots, multiplicative Fibonacci hashing `>> shift`, touched list reset) will drastically reduce memory while keeping queries cache-local.
+  - *Local relative result:* Hyperfine on full (10 runs, interleaved vs Step 6): 1.885 s -> 1.737 s (1.08x speedup). Peak RSS dropped dramatically from 219.4 MB to 129.7 MB (-89.7 MB, 41% memory reduction).
+  - *Verdict:* Kept. Invariance verified for threads 1/2/6/12, 20/20 identical sample runs, 49/49 fuzz seeds passed. K estimate 6.634.
