@@ -7,7 +7,6 @@ use std::io::{BufWriter, Write};
 use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::thread;
 
 const HOURS: usize = 72;
@@ -179,6 +178,22 @@ fn parse_worker_range(file: &File, mut start: usize, end: usize) -> Local {
 }
 
 #[inline(always)]
+fn push_field(buf: &mut Vec<u8>, mut n: u64, delim: u8) {
+    let mut temp = [0u8; 20];
+    let mut i = 20;
+    loop {
+        i -= 1;
+        temp[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    buf.extend_from_slice(&temp[i..]);
+    buf.push(delim);
+}
+
+#[inline(always)]
 fn percentile_values(latencies: &mut [u32]) -> (u32, u32, u32) {
     let n = latencies.len();
     let a = (50 * n + 99) / 100 - 1;
@@ -264,18 +279,26 @@ fn main() {
         })
         .collect();
 
+    let mut prefixes = [[0u8; 21]; HOURS];
+    for (hour, p) in prefixes.iter_mut().enumerate() {
+        let (h, d) = ((hour + 18) % 24, (hour + 18) / 24);
+        p[0..10].copy_from_slice(DATES[d].as_bytes());
+        p[10] = b'T';
+        p[11] = b'0' + (h / 10) as u8;
+        p[12] = b'0' + (h % 10) as u8;
+        p[13..21].copy_from_slice(b":00:00Z ");
+    }
+
     let next_hour = AtomicUsize::new(0);
-    let names = Arc::new(names);
-    let locals = Arc::new(locals);
-    let remaps = Arc::new(remaps);
     let (tx, rx) = mpsc::channel();
 
     thread::scope(|scope| {
         for _ in 0..workers {
             let next = &next_hour;
-            let names = Arc::clone(&names);
-            let locals = Arc::clone(&locals);
-            let remaps = Arc::clone(&remaps);
+            let names = &names;
+            let locals = &locals;
+            let remaps = &remaps;
+            let prefixes = &prefixes;
             let tx = tx.clone();
             scope.spawn(move || {
                 let mut flat_lats: Vec<u32> = Vec::with_capacity(65536);
@@ -327,8 +350,6 @@ fn main() {
                     }
 
                     let mut out = Vec::with_capacity(32 * 1024);
-                    let (h, d) = ((hour + 18) % 24, (hour + 18) / 24);
-                    let date_str = DATES[d];
                     for ep in 0..num_endpoints {
                         let start = offsets[ep] as usize;
                         let end = offsets[ep + 1] as usize;
@@ -339,12 +360,15 @@ fn main() {
                         let ep_lats = &mut flat_lats[start..end];
                         let (p50, p95, p99) = percentile_values(ep_lats);
                         let errors = err_counts[ep];
-                        let ep_name = std::str::from_utf8(&names[ep]).unwrap();
-                        let _ = write!(
-                            out,
-                            "{date_str}T{h:02}:00:00Z {ep_name} {n} {p50} {p95} {p99} {errors} {}\n",
-                            errors as u64 * 1_000_000 / n as u64
-                        );
+                        out.extend_from_slice(&prefixes[hour]);
+                        out.extend_from_slice(&names[ep]);
+                        out.push(b' ');
+                        push_field(&mut out, n as u64, b' ');
+                        push_field(&mut out, p50 as u64, b' ');
+                        push_field(&mut out, p95 as u64, b' ');
+                        push_field(&mut out, p99 as u64, b' ');
+                        push_field(&mut out, errors as u64, b' ');
+                        push_field(&mut out, errors as u64 * 1_000_000 / n as u64, b'\n');
                     }
                     let _ = tx.send((hour, out));
                 }

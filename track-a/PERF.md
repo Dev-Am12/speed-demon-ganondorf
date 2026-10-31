@@ -17,6 +17,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 10 | A15: per-hour counting sort gather into flat Vec | pending | 0.139 | 44 | 20.25 |
 | 11 | A10: pipelined streaming output via mpsc channel | pending | 0.149 | 42 | 21.35 |
 | 12 | A16: SWAR 8-byte word scan for endpoint boundaries | pending | 0.135 | 41 | 22.84 |
+| 13 | A9: direct integer formatting and precomputed hour prefixes | pending | 0.134 | 44 | 23.80 |
 
 ### Experiment Log
 - **Step 2 (A1 - Positional parsing & integer hour index):**
@@ -73,4 +74,9 @@ Every step from the reference to your final version, each with the live-board ru
   - *Hypothesis:* Scanning 8 bytes per iteration via safe 64-bit integer arithmetic (`u64::from_le_bytes` with zero-byte detection) replaces scalar byte-by-byte scanning for endpoint path delimiters, significantly speeding up the parse loop.
   - *Local relative result:* Hyperfine 10 runs on full: 149.9 ms ± 13.0 ms -> 135.4 ms ± 8.0 ms (saving 14.5 ms, 1.11x speedup, range min 124.5 ms). Peak RSS: 41,192 KB (~41.2 MB). Minor page faults dropped to 11,125. S = 346 lines (+15 lines).
   - *K-accounting:* Evaluated at target (T ~40 ms, S ~330): $\Delta T \approx -3.87\text{ ms} \implies \times 1.0522$; $\Delta S = +15 \implies \times 0.9934$; net gain = $+4.52\% \ge 1\%$.
+  - *Verdict:* Kept. Correctness verified on full, sample, tiny, 49/49 fuzz seeds, and threads 1/2/6/12.
+- **Step 15 (A9 - Direct integer formatter and precomputed hour prefixes):**
+  - *Hypothesis:* Precomputing 72 21-byte hour prefixes and formatting decimal integers directly into byte slices avoids `write!` format string parsing, UTF-8 validation overhead, and allows eliminating all `Arc` wrappers by borrowing stack variables directly across `thread::scope`.
+  - *Local relative result:* Hyperfine 20 runs on full: 139.0 ms ± 18.0 ms -> 134.1 ms ± 23.6 ms (saving 4.9 ms wall time, min 111.4 ms). User CPU time dropped from 656.6 ms to 610.9 ms (-45.7 ms CPU time). Peak RSS: 43.8 MB. Source lines $S = 372$ (+26 lines).
+  - *K-accounting:* Evaluated at target (T ~40 ms, S ~330): $\Delta T \approx 4.0\text{ ms} \implies \times 1.0541$; $\Delta S = +26 \implies \times 0.9887$; net gain = $+4.22\% \ge 1\%$.
   - *Verdict:* Kept. Correctness verified on full, sample, tiny, 49/49 fuzz seeds, and threads 1/2/6/12.
