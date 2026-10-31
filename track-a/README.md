@@ -4,25 +4,23 @@ The task, the input files and the exact output format are in the [spec](https://
 
 ## Approach
 
-The baseline implementation (v0) is written in safe, single-threaded Rust using only the standard library.
+The implementation (Wave 1) is written in safe Rust using only the standard library:
 
-1. **Ingest & I/O:** Reads `/data/requests.log` through a 256 KiB `BufReader`, reusing a single line buffer across the 3.1M lines to avoid per-line heap allocation.
-2. **Zero-allocation timestamp parsing:** Timestamp digits are parsed directly from the guaranteed 27-byte RFC 3339 string. The 72-hour contest span (`2026-10-30T18:00:00Z` to `2026-11-02T17:59:59Z`) is mapped directly via integer arithmetic to a dense hour index in `0..72`.
-3. **Dense endpoint mapping:** Unique endpoints are mapped to contiguous integer IDs via a standard `HashMap<Vec<u8>, usize>`. Lookups borrow `&[u8]` without allocating; allocations occur only on the first encounter of each catalogue endpoint (at most 1,842 times).
-4. **Group aggregation:** Aggregated in a 2D table `groups[hour_idx][endpoint_id]`, giving O(1) direct slice indexing for each line to append latencies and increment error counts.
-5. **Deterministic total ordering:** Unique endpoints are sorted once by unsigned byte order (proper prefix first). The output is emitted hour-major: an outer loop over `0..72` hours and an inner loop over sorted endpoint IDs. This guarantees total lexicographical order without sorting the output file or iterating a `HashMap`.
-6. **Integer arithmetic:** Percentiles use the exact integer nearest-rank formula `(p * n + 99) / 100`, keeping duplicate latencies in sorted order. Error ppm is calculated via `(errors * 1_000_000) / count` with integer math; status 499 is explicitly treated as non-error.
-7. **Buffered output:** The entire output is formatted into an in-memory buffer and written in a single pass to `/out/summary.txt`, then flushed and closed before process exit. Empty input files produce an empty 0-byte output.
+1. **Parallel streaming parse (A3):** Snaps `/data/requests.log` into line-aligned byte ranges across 6 worker threads spawned with `std::thread::scope`. Each worker stream-parses its range in 64 KiB chunks via `read_at`, maintaining carried slice bytes across buffer boundaries. This completely avoids allocating large file-sized or chunk-sized buffers in memory (keeping input buffer memory under 400 KiB total).
+2. **Positional field scanning (A1):** Uses fixed byte offsets from the 27-byte RFC 3339 timestamp to extract date/time digits and compute the dense hour index in `0..72` with overflow-safe arithmetic. Endpoints, status codes, and latencies are parsed directly from byte slices without string allocations.
+3. **Compact endpoint interning (A2):** Each worker maintains a local open-addressing hash table with word-wise hashing and byte-level collision comparison. Local endpoint tables are merged and deduplicated once globally, then sorted lexicographically by unsigned byte order.
+4. **Compact 6-byte records:** Records pack `u32` latency and a 16-bit tagged endpoint ID/error flag into 6 bytes, keeping the entire 3.1M request record state under 25 MB.
+5. **Parallel per-hour quantile formatting & chronological order:** Workers dynamically claim hours via an atomic counter. Group latencies within each hour are sorted to calculate nearest-rank percentiles (`p50`, `p95`, `p99`) alongside 5xx error counts and ppm. Each worker writes its hourly output to an indexed slot in `hour_outputs[0..HOURS]`, which is concatenated in chronological hour order, guaranteeing byte-identical total order across any thread count.
+6. **Single atomic output write:** The merged buffer is written in one buffered pass to `/out/summary.txt`, flushed and closed before process exit. Empty files yield an empty 0-byte output.
 
 AI coding tools were used in drafting this solution, and human teammates reviewed, validated, and verified every line against the formal specification and test harness.
 
 ## Dependencies
 
-None.
+None beyond the Rust standard library.
 
 ## With another 24 hours
 
-1. **Parallel chunking:** Partition `/data/requests.log` into chunks snapped to line boundaries across worker threads using `read_at`, with thread-local endpoint interning and lock-free append buffers.
-2. **Custom hash table:** Replace standard `HashMap` with a compact, cache-friendly open-addressing table and word-wise integer hashing.
-3. **SIMD delimiter scanning:** Use AVX2 vector instructions to find spaces and newlines rapidly.
-4. **Fast formatting:** Replace `write!` with branchless two-digit lookup table formatting directly into page-aligned output buffers.
+1. **SIMD delimiter search:** Accelerate space and newline scanning using AVX2 vector instructions.
+2. **Monotone bucket sort:** For large groups, replace sorting with a small-radix or bucket queue for latency percentiles.
+3. **Branchless integer output formatting:** Format numbers directly into preallocated page-aligned buffers via two-digit lookup tables.
