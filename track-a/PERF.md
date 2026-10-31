@@ -23,6 +23,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 16 | A18: parallel endpoint remap across worker threads | pending | 0.125 | 41 | 26.15 |
 | 17 | A: 12 workers (A-v2 default; board 0.070 s) | pending | 0.070 | 42 | 30.50 |
 | 18 | A21: 64-bit tag slot intern, flat arena, growable table | pending | 0.052 | 44 | 33.20 |
+| 19 | M1: reserve record buffers once with chunk_len / 40 | pending | 0.052 | 44 | 33.20 |
 
 ### Experiment Log
 - **Step 2 (A1 - Positional parsing & integer hour index):**
@@ -110,6 +111,10 @@ Every step from the reference to your final version, each with the live-board ru
     - Scan only: 51.56 ns/line
     - Baseline (scan + intern): 108.02 ns/line (intern alone: 56.46 ns/line)
     - A21 (scan + intern): 83.35 ns/line (intern alone: 31.79 ns/line, -43.7% intern time, saving ~76.7 ms CPU)
-  - *Local relative result:* Hyperfine 10 runs on full: baseline 163.4 ms ± 30.3 ms -> A21 118.0 ms ± 12.0 ms (1.38x speedup locally, min 105.1 ms). User CPU time dropped from 670.9 ms to 492.9 ms (-178 ms). System time dropped from 524.0 ms to 284.0 ms (-240 ms). Peak RSS: 40,904 KB (~40.9 MB). Cgroup `memory.peak`: 44.55 MB. Source lines $S = 404$ (+36 lines).
-  - *K-accounting:* Evaluated at target ($T \le 52$ ms, $S \le 340$): $\Delta T \approx -10.9\text{ ms} \implies \times 1.1248$; $\Delta S = +36 \implies \times 0.9851$; net gain = $+10.80\% \ge 1\%$.
+  - *Local relative result:* Interleaved 20 runs on full: baseline c841249 (150.3 ms ± 37.8 ms, User: 647.0 ms, Sys: 347.6 ms) -> A21 f8e8dd0 (113.9 ms ± 8.8 ms, User: 480.4 ms, Sys: 286.5 ms). Default 12 threads. 1.32x speedup. Peak RSS (42.4 MB vs 43.2 MB) and cgroup `memory.peak` (45.2 MB vs 46.9 MB, ~10,747 vs 11,109 faults) are unchanged by A21 (memory is flat; local RSS is not board M, as board M includes output file page cache). Source lines $S = 404$ (+36 lines).
+  - *K-accounting:* Evaluated at board operating point ($T = 70\text{ ms}$, $S = 312 \to 404$): $\Delta T \approx -10.96\text{ ms} \implies \times 1.0889$; $\Delta S = +92 \implies \times 0.9620$; net gain $= +4.75\% \ge 1\%$ (relative to immediate prior commit $S = 368 \to 404 \implies \times 0.9861$, net gain $= +7.38\%$).
+  - *Verdict:* Kept. Correctness verified on full, sample, tiny, 49/49 fuzz seeds, and threads 1/2/6/8/12.
+- **Step 21 (M1 - Reserve record buffers once with capacity = chunk_len / 40):**
+  - *Hypothesis:* Pre-sizing each `(worker, hour)` record vector to `capacity = chunk_len / 40` (Spec §3 minimum request line length: 27 ts + 4 spaces + 3 method + 1 endpoint + 3 status + 1 latency + 1 LF = 40) ensures vectors never reallocate during parsing. Untouched virtual address space is not charged against physical RSS.
+  - *Local relative result:* Minor page faults dropped from 10,687 to 10,468 (-219 faults). VmHWM dropped from 40.3 MB to 39.7 MB. Container check passes (0.90 s). S = 405 lines (+1 line).
   - *Verdict:* Kept. Correctness verified on full, sample, tiny, 49/49 fuzz seeds, and threads 1/2/6/8/12.
