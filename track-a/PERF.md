@@ -12,6 +12,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 5 | A4: FNV-1a interning and line count reduction (S=287) | pending | 1.010 | 52 | 11.15 |
 | 6 | A5: structure-of-arrays records and direct streamed output | pending | 0.213 | 39 | 18.39 |
 | 7 | A6: single-pass forward line parser | pending | 0.205 | 39 | 18.86 |
+| 8 | A7: 8-byte word-wise endpoint hash table with u16 slots | pending | 0.205 | 39 | 18.97 |
 
 ### Experiment Log
 - **Step 2 (A1 - Positional parsing & integer hour index):**
@@ -37,4 +38,8 @@ Every step from the reference to your final version, each with the live-board ru
 - **Step 7 (A6 - Single-pass forward line parser):**
   - *Hypothesis:* Replacing per-line subslice splitting (`split('\n')`) and multi-pass space scanning (`position(' ')`) with a single forward scan loop traversing directly from timestamp to LF touches each byte in the 64 KiB buffer once, eliminating intermediate Option checks and slice bounds checks.
   - *Local relative result:* Hyperfine 10 runs on full: A5 217.2 ms ± 21.2 ms -> A6 205.3 ms ± 16.7 ms (1.06x faster, min 191.5 ms). Peak RSS: 39,168 KB (~39.2 MB). S = 306 lines.
+  - *Verdict:* Kept. Correctness verified on tiny, sample, full, 49/49 fuzz seeds, and threads 1/2/6/12.
+- **Step 8 (A7 - 8-byte word-wise endpoint hash table with u16 slots):**
+  - *Hypothesis:* Replacing byte-by-byte FNV-1a with an 8-byte chunked hash mixing the first 8 bytes, last 8 bytes, and length reduces hash calculation from ~30-50 iterations to two 64-bit loads and rotate-mix operations for 99.9% of endpoints. Storing slot indices as `u16` instead of `usize` shrinks the 4096-entry table from 32 KiB to 8 KiB, keeping each worker's entire hash table in L1 cache. Full byte comparison resolves collisions on hit.
+  - *Local relative result:* Hyperfine 10 runs on full: A6 220.6 ms ± 20.2 ms -> A7 205.3 ms ± 18.4 ms (1.07x faster, min 190.8 ms). Peak RSS: 38,848 KB (~38.8 MB). S = 316 lines.
   - *Verdict:* Kept. Correctness verified on tiny, sample, full, 49/49 fuzz seeds, and threads 1/2/6/12.

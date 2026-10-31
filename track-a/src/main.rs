@@ -14,52 +14,53 @@ const CHUNK_SIZE: usize = 64 * 1024;
 const DATES: [&str; 4] = ["2026-10-30", "2026-10-31", "2026-11-01", "2026-11-02"];
 
 struct Table {
-    slots: Vec<usize>,
+    slots: Vec<u16>,
     names: Vec<Vec<u8>>,
 }
 
 impl Table {
     fn new() -> Self {
-        Self {
-            slots: vec![0; 4096],
-            names: Vec::with_capacity(2048),
-        }
+        Self { slots: vec![0u16; 4096], names: Vec::with_capacity(2048) }
     }
 
-    fn hash(name: &[u8]) -> u64 {
-        let mut h = 0xcbf29ce484222325u64;
-        for &b in name {
-            h = (h ^ b as u64).wrapping_mul(0x100000001b3);
+    #[inline(always)]
+    fn hash(name: &[u8]) -> usize {
+        let len = name.len();
+        if len >= 8 {
+            let first = u64::from_ne_bytes(name[..8].try_into().unwrap());
+            let last = u64::from_ne_bytes(name[len - 8..].try_into().unwrap());
+            let mut h = first ^ last.rotate_left(31) ^ (len as u64);
+            h = (h ^ (h >> 33)).wrapping_mul(0xff51afd7ed558ccd);
+            h as usize
+        } else {
+            let mut h = len as u64;
+            for &b in name { h = (h ^ b as u64).wrapping_mul(0x100000001b3); }
+            h as usize
         }
-        h
     }
 
     fn intern(&mut self, name: &[u8]) -> u16 {
         if (self.names.len() + 1) * 2 >= self.slots.len() {
-            let mut next = vec![0; self.slots.len() * 2];
+            let mut next = vec![0u16; self.slots.len() * 2];
             let mask = next.len() - 1;
             for (id, n) in self.names.iter().enumerate() {
-                let mut i = Self::hash(n) as usize & mask;
-                while next[i] != 0 {
-                    i = (i + 1) & mask;
-                }
-                next[i] = id + 1;
+                let mut i = Self::hash(n) & mask;
+                while next[i] != 0 { i = (i + 1) & mask; }
+                next[i] = (id + 1) as u16;
             }
             self.slots = next;
         }
         let mask = self.slots.len() - 1;
-        let mut i = Self::hash(name) as usize & mask;
+        let mut i = Self::hash(name) & mask;
         loop {
             let slot = self.slots[i];
             if slot == 0 {
                 let id = self.names.len();
                 self.names.push(name.to_vec());
-                self.slots[i] = id + 1;
+                self.slots[i] = (id + 1) as u16;
                 return id as u16;
             }
-            if self.names[slot - 1] == name {
-                return (slot - 1) as u16;
-            }
+            if self.names[(slot - 1) as usize] == name { return slot - 1; }
             i = (i + 1) & mask;
         }
     }
