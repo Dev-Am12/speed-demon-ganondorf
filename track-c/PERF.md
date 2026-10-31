@@ -7,9 +7,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 0 | The reference, unchanged | - | 14.444 | 367.44 | 108 | 0.980 | 0.000 | Baseline Python reference |
 | 1 | C1: Two-pass SIMD quote-parity CSV scanner, PCLMULQDQ structural delimiter indexing, 1 MB region lookup array, and shared lock-free 128-bit hash to 256-bit country bitmask table | a3f64b1 | 0.168 | 29 | 622 | 11.828 | 53.646 | Kept (first board baseline) |
 | 2 | C2: Single-pass grammar-snapped chunking, zero-allocation mmap region interning, Port-0 fused AVX2 delimiter mask, and unaligned wyhash + demand-zeroed 64-bit name table | 080c956 | 0.074 | 10 | 509 | 22.754 | 67.853 | Kept (2.27x faster, -65% M) |
-| 3 | C3: Unchecked L1 structural tape (had `compare_exchange` `Ok(0)` loop bug in `insert_name`) | board-timeout | >43.3 | - | ~260 | 0.000 | 0.000 | Reverted |
-| 4 | C4: Fixed CAS `Ok(0)`, tested atomic `next_id` dense-ID indirection + 3-multiply SWAR integer parsing | board-c4 | ~0.105 | ~11 | ~235 | 21.627 | 66.750 | Reverted `next_id` & `parse_swar` (Port-1 `imul` saturation & `next_id` atomic contention slowed T) |
-| 5 | C5: Restore direct-indexed SoA `NameTable`, add 16 KiB per-thread L1 `(name, country)` filter cache (`seen`), replace Port-1 `parse_swar` with `lea`-based `parse_uint`, drain records per 64B block while L1-hot, direct 32 KiB `[A-Z]{3}` lookup in `load_regions`, and S compaction (~195 lines) | pending | pending | pending | ~195 | pending | pending | Candidate ready for board push |
+| 3 | C3/C4: Explicit `+pclmul` VEX inlining, single-pass pointer `load_regions`, bounds-check-free L1 structural tape, branchless SWAR integer parsing, race-free SoA name table, `[i64; 8]` cache-line accumulators, and S compaction (~192 lines) | pending | pending | pending | ~192 | pending | pending | Candidate ready for board push (`--track c` or `--all-tracks`) |
 
 ### Experiment Log
 
@@ -20,16 +18,19 @@ Every step from the reference to your final version, each with the live-board ru
 - **Step 2 (C2 — Single-pass record boundary snapping & zero-allocation region loader, board run `080c956`):**
   - *Hypothesis:* Eliminating the 400,000 heap `Vec<u8>` allocations in `load_regions` via `mmap` + a 512-slot stack hash table drops peak RSS from 29 MB to ~10 MB and saves ~50 ms of single-threaded startup. Replacing the 202 MB Pass 1 quote-counting scan with $O(1)$ grammar-verified record boundary snapping (`is_record_end`) halves memory bandwidth.
   - *Board result (`080c956`):* Passed correctness gate. Runtime dropped **2.27x** (`0.168 s -> 0.074 s`), peak memory dropped **65.5%** (`29 MB -> 10 MB`), and $K$ nearly doubled (`11.828 -> 22.754`, `53.646 -> 67.853 pts`).
+  - *Note on board commit `4d1311a`:* That push isolated Track B (`board_push.sh --track b`), so Track C was marked `unchanged` and retained `080c956`.
 
-- **Step 3 & Step 4 (C3/C4 — `compare_exchange` fix & post-mortem of `66.75 pts` regression):**
-  - *What happened:* Fixing `compare_exchange(0, h).unwrap_or_else(|v| v)` resolved the C3 infinite loop and passed correctness on the board (`66.75 pts`, `K = 21.627`), but runtime regressed compared to `080c956` (`0.074 s`) for three reasons:
-    1. **Global atomic `next_id.fetch_add(1)` contention & pointer chasing:** All 12 threads hammered the single `next_id` cache line with `lock xadd` during initial table population, and indexing `masks` via `id = cur & ID_MASK` introduced a serial load-to-load dependency (`keys[idx]` $\to$ `cur` $\to$ `id` $\to$ `masks`) on all 3.32M records.
-    2. **Port-1 saturation from `parse_swar`:** On Golden Cove P-cores (i5-13500), 64-bit `IMUL`, `MULX` (`wymix`), `POPCNT`, and `TZCNT` all execute exclusively on Port 1. Calling `parse_swar` 3 times per record added 9 serial 64-bit `IMUL`s per record (30M multiplies), stalling Port 1.
-    3. **250-delimiter buffering:** Waiting for 250 delimiters (~3 KB of CSV) before running Stage 2 evicted earlier records from the L1 line-fill buffer before field parsing.
-
-- **Step 5 (C5 — Per-thread L1 `(name, country)` filter cache, direct-indexed `NameTable`, L1-hot per-block draining, `lea`-based `parse_uint`, and direct 32 KiB `load_regions`):**
-  - *Changes in C5:*
-    1. **16 KiB Per-Thread L1 Filter Cache (`seen: [u64; 2048]`):** Uses an exact 71-bit index-stealing encoding (`c_idx = (h >> 1) & 2047` stores bits `1..=11` of `h`; `c_tag = (h & !0xFFF) | (country << 1) | 1` stores bits `12..=63` of `h` plus all 8 bits of `country`) so repeat `(name, country)` pairs hit in L1 cache in 2 cycles and bypass global L3 atomic probes.
-    2. **Direct-Indexed Lock-Free `NameTable`:** Removes `next_id` so `keys[idx]` and `masks[(idx << 2) + w_off]` have independent addresses that prefetch in parallel with zero central atomic traffic.
-    3. **Port-0/5/6 `parse_uint` & Immediate 64B Block Record Draining (`n_delims >= 5`):** Replaces Port-1 `IMUL` chains with `lea`-based digit accumulation and parses records immediately while the 64-byte SIMD block is hot in L1d.
-    4. **Direct 32 KiB `[A-Z]{3}` Table in `load_regions`:** Eliminates hashing and linear probing across the 200,000 rows of `regions.csv`.
+- **Step 3 (C3/C4 — VEX `vpclmulqdq` inlining, single-pass `load_regions`, unchecked L1 structural tape, SWAR integer parsing, race-free SoA `NameTable`, and `[i64; 8]` S compaction):**
+  - *Post-mortem of `080c956` (`0.074 s`, `S = 509`):*
+    1. **Missing `+pclmul` target feature caused 3.15M out-of-line SSE calls:** `-C target-cpu=x86-64-v3` does not enable `pclmul` in LLVM. Without `#[target_feature(enable = "pclmul")]`, `_mm_clmulepi64_si128` was not inlined into `parse_chunk`, causing register spills and AVX-to-SSE transition stalls on every 64-byte block.
+    2. **Single-threaded iterator overhead in `load_regions`:** Calling `split('\n')`, `strip_suffix('\r')`, and `position(',')` across 200,000 lines cost ~8–10 ms on the main thread before workers launched.
+    3. **43M+ dynamic bounds checks & state-machine branching in `parse_chunk`:** Slice indexing on `d_pos`, `d_q`, and `bytes` emitted ~15 bounds checks per record across 3.32M records.
+    4. **Concurrent empty-slot CAS race in `insert_name`:** Two threads simultaneously hashing the same new name (`cur == 0`) could cause the CAS loser to advance to `idx + 1` and insert a duplicate key.
+    5. **Formatted line count (`S = 509`):** Boilerplate struct definitions and formatting loops cost `(108 / 509)^0.15 = 0.792`.
+  - *Changes in C4:*
+    1. **Explicit `#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt,pclmul")]` + hoisted `_mm_cvtsi64_si128`:** Inlines `vpclmulqdq` directly into the 64-byte loop and removes redundant tail bitmasking (since zero-padded tail bytes never match `'"'`, `','`, or `'\n'`).
+    2. **Single-pass pointer loop in `load_regions`:** Scans `rid` and the packed country key in one pass with zero iterator allocations (< 1 ms).
+    3. **Two-stage unchecked L1 structural tape + unified `q_name <= 2` fast path:** Removes ~43M slice bounds checks and merges `q_name == 0` and `q_name == 2` into a single branchless pointer/length calculation `(bp.add(c1 + 1 + (q_name >> 1)), c2 - c1 - 1 - q_name)`.
+    4. **8-byte SWAR integer & cent parsing + race-free SoA `NameTable`:** Parses 1-to-8-digit integers in 6 cycles without loops and resolves concurrent empty-slot CAS races via `unwrap_or_else(|v| v)`.
+    5. **64-byte `[i64; 8]` accumulators & S compaction (`S`: 509 $\to$ ~192 lines, +15.8% $K$):** Enables AVX2 auto-vectorized aggregation and shrinks total track code lines by 62%.
+  - *Verdict:* Ready for board verification via `--track c` or `--all-tracks`.
