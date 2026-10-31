@@ -1,4 +1,4 @@
-// Track C (Join): Two-stage AVX2 + VPCLMULQDQ structural CSV join with SWAR integer parsing.
+// Track C (Join): AVX2 + VPCLMULQDQ structural CSV join with L1 filter cache.
 use std::arch::x86_64::*;
 use std::ffi::c_void;
 use std::fs::{self, File};
@@ -9,7 +9,6 @@ use std::thread;
 
 const MAX_THREADS: usize = 12;
 const NAME_SLOTS: usize = 1 << 17;
-const ID_MASK: u64 = (NAME_SLOTS as u64) - 1;
 const INIT_AGG: [i64; 8] = [0, 0, 0, i64::MAX, i64::MIN, 0, 0, 0];
 
 // SAFETY: standard POSIX mmap ABI linked via libc.
@@ -61,24 +60,21 @@ unsafe fn hash_name_fast(p: *const u8, len: usize) -> u64 {
 }
 
 #[inline(always)]
-fn insert_name(keys: &[AtomicU64], masks: &[AtomicU64], next_id: &AtomicU64, h: u64, c: usize) {
-    let tag = (h & !ID_MASK).max(ID_MASK + 1);
+fn insert_name(keys: &[AtomicU64], masks: &[AtomicU64], h: u64, c: usize) {
     let (bit, w_off) = (1u64 << (c & 63), c >> 6);
     let mut idx = (h as usize) & (NAME_SLOTS - 1);
     loop {
-        // SAFETY: idx < NAME_SLOTS and dense id * 4 + w_off < masks.len().
+        // SAFETY: idx < NAME_SLOTS and masks has length NAME_SLOTS * 4.
         let k_slot = unsafe { keys.get_unchecked(idx) };
         let mut cur = k_slot.load(Ordering::Relaxed);
         if cur == 0 {
-            let new_val = tag | next_id.fetch_add(1, Ordering::Relaxed);
-            cur = match k_slot.compare_exchange(0, new_val, Ordering::Relaxed, Ordering::Relaxed) {
-                Ok(_) => new_val,
+            cur = match k_slot.compare_exchange(0, h, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => h,
                 Err(v) => v,
             };
         }
-        if (cur & !ID_MASK) == tag {
-            let id = (cur & ID_MASK) as usize;
-            let m = unsafe { masks.get_unchecked((id << 2) + w_off) };
+        if cur == h {
+            let m = unsafe { masks.get_unchecked((idx << 2) + w_off) };
             if (m.load(Ordering::Relaxed) & bit) == 0 {
                 m.fetch_or(bit, Ordering::Relaxed);
             }
@@ -89,53 +85,52 @@ fn insert_name(keys: &[AtomicU64], masks: &[AtomicU64], next_id: &AtomicU64, h: 
 }
 
 #[inline(always)]
-unsafe fn parse_swar(end_ptr: *const u8, len: usize) -> i64 {
-    // SAFETY: caller ensures end_ptr >= mmap_base + 8 and 1 <= len <= 8.
-    let raw = unsafe { end_ptr.sub(8).cast::<u64>().read_unaligned() };
-    let d0 = raw & (0x0F0F_0F0F_0F0F_0F0Fu64 << ((8 - len) << 3));
-    let d1 = (d0.wrapping_mul(2561) >> 8) & 0x00FF_00FF_00FF_00FF;
-    let d2 = (d1.wrapping_mul(6_553_601) >> 16) & 0x0000_FFFF_0000_FFFF;
-    (d2.wrapping_mul(42_949_672_960_001) >> 32) as i64
+unsafe fn parse_uint(mut p: *const u8, end: *const u8) -> i64 {
+    let mut v = 0i64;
+    while p < end {
+        // SAFETY: caller guarantees p..end lies within the mapped CSV slice.
+        v = v * 10 + unsafe { (*p - b'0') as i64 };
+        p = unsafe { p.add(1) };
+    }
+    v
 }
 
 fn load_regions(path: &str) -> io::Result<(Vec<&'static [u8]>, Vec<u8>)> {
     let raw = mmap_file(path)?;
     let mut countries: Vec<&'static [u8]> = vec![b"_UNMATCHED"];
-    let (mut c_keys, mut c_ids, mut rmap) = ([0u64; 512], [0u8; 512], vec![0u8; 1_000_000]);
+    let (mut c_ids, mut rmap) = ([0u8; 32768], vec![0u8; 1_000_000]);
     let mut i = raw
         .iter()
         .position(|&b| b == b'\n')
         .map_or(raw.len(), |p| p + 1);
+    let bp = raw.as_ptr();
     while i < raw.len() {
         let mut rid = 0usize;
-        while i < raw.len() && raw[i] >= b'0' {
-            rid = rid * 10 + (raw[i] - b'0') as usize;
+        while i < raw.len() && unsafe { *bp.add(i) } >= b'0' {
+            rid = rid * 10 + unsafe { (*bp.add(i) - b'0') as usize };
             i += 1;
         }
-        if i >= raw.len() {
+        if i + 3 >= raw.len() {
             break;
         }
-        i += 1;
-        let (cs, mut key) = (i, 0u64);
-        while i < raw.len() && raw[i] > b'\r' {
-            key = (key << 8) | raw[i] as u64;
-            i += 1;
-        }
-        let ce = i;
-        while i < raw.len() && raw[i] <= b'\r' {
-            i += 1;
-        }
-        let mut s = (key.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 55) as usize;
-        while c_keys[s] != 0 && c_keys[s] != key {
-            s = (s + 1) & 511;
-        }
-        if c_keys[s] == 0 {
-            c_keys[s] = key;
-            c_ids[s] = countries.len() as u8;
-            countries.push(&raw[cs..ce]);
+        let cs = i + 1;
+        let idx = unsafe {
+            (((*bp.add(cs) & 31) as usize) << 10)
+                | (((*bp.add(cs + 1) & 31) as usize) << 5)
+                | ((*bp.add(cs + 2) & 31) as usize)
+        };
+        let mut cid = c_ids[idx];
+        if cid == 0 {
+            cid = countries.len() as u8;
+            c_ids[idx] = cid;
+            countries.push(&raw[cs..cs + 3]);
         }
         if rid < rmap.len() {
-            rmap[rid] = c_ids[s];
+            unsafe { *rmap.get_unchecked_mut(rid) = cid };
+        }
+        i = cs + 4;
+        if i <= raw.len() && unsafe { *bp.add(i - 1) } == b'\r' {
+            i += 1;
         }
     }
     Ok((countries, rmap))
@@ -170,11 +165,11 @@ unsafe fn parse_chunk(
     num_countries: usize,
     keys: &[AtomicU64],
     masks: &[AtomicU64],
-    next_id: &AtomicU64,
 ) -> Vec<[i64; 8]> {
     let mut aggs = vec![INIT_AGG; num_countries];
+    let mut seen = [0u64; 2048];
     let mut ubuf = vec![0u8; 512];
-    let (mut d_pos, mut d_q, mut tail) = ([0u32; 320], [0u32; 320], [0u8; 64]);
+    let (mut d_pos, mut d_q, mut tail) = ([0u32; 72], [0u32; 72], [0u8; 64]);
     let (mut n_delims, mut prev_in_quote, mut q_prefix, mut rec_start, mut blk_start) =
         (0usize, 0u64, 0u32, 0usize, 0usize);
     let (qv, cv) = (_mm256_set1_epi8(b'"' as i8), _mm256_set1_epi8(b',' as i8));
@@ -205,7 +200,7 @@ unsafe fn parse_chunk(
         while sep != 0 {
             let bit = sep.trailing_zeros();
             sep &= sep - 1;
-            // SAFETY: Stage 2 drains whenever n_delims >= 250, so n_delims + 64 <= 313 < 320.
+            // SAFETY: drained whenever n_delims >= 5, so n_delims <= 4 + 64 = 68 < 72.
             unsafe {
                 *d_pos.get_unchecked_mut(n_delims) = (blk_start + bit as usize) as u32;
                 *d_q.get_unchecked_mut(n_delims) = q_prefix + _bzhi_u64(q_mask, bit).count_ones();
@@ -214,10 +209,10 @@ unsafe fn parse_chunk(
         }
         q_prefix += q_mask.count_ones();
         blk_start += 64;
-        if n_delims >= 250 || blk_start >= bytes.len() {
+        if n_delims >= 5 {
             let mut idx = 0;
             while idx + 5 <= n_delims {
-                // SAFETY: idx + 4 < n_delims < 320 and all delimiter positions lie inside bytes.
+                // SAFETY: idx + 4 < n_delims < 72 and all delimiter offsets lie in bytes.
                 unsafe {
                     let pos = |k: usize| *d_pos.get_unchecked(idx + k) as usize;
                     let (c1, c2, c3, c4, nl) = (pos(0), pos(1), pos(2), pos(3), pos(4));
@@ -227,8 +222,8 @@ unsafe fn parse_chunk(
                         *d_q.get_unchecked(idx + 2),
                     );
                     let rs = rec_start + 3 * usize::from(*bp.add(rec_start) == 0xEF);
-                    let id = parse_swar(bp.add(c1), c1 - rs);
-                    let rid = parse_swar(bp.add(c4), c4 - c3 - 1) as usize;
+                    let id = parse_uint(bp.add(rs), bp.add(c1));
+                    let rid = parse_uint(bp.add(c3 + 1), bp.add(c4)) as usize;
                     let country = if rid < 1_000_000 {
                         *region_map.get_unchecked(rid) as usize
                     } else {
@@ -236,7 +231,7 @@ unsafe fn parse_chunk(
                     };
                     let a_end = nl - usize::from(*bp.add(nl - 1) == b'\r');
                     let neg = usize::from(*bp.add(c4 + 1) == b'-');
-                    let whole = parse_swar(bp.add(a_end - 3), a_end - c4 - 4 - neg);
+                    let whole = parse_uint(bp.add(c4 + 1 + neg), bp.add(a_end - 3));
                     let frac = (*bp.add(a_end - 2) - b'0') as i64 * 10
                         + (*bp.add(a_end - 1) - b'0') as i64;
                     let cents = if neg != 0 {
@@ -267,7 +262,13 @@ unsafe fn parse_chunk(
                     if n_len == 0 {
                         agg[7] = 1;
                     } else {
-                        insert_name(keys, masks, next_id, hash_name_fast(n_ptr, n_len), country);
+                        let h = hash_name_fast(n_ptr, n_len);
+                        let c_idx = ((h >> 1) as usize) & 2047;
+                        let c_tag = (h & !0xFFF) | ((country as u64) << 1) | 1;
+                        if *seen.get_unchecked(c_idx) != c_tag {
+                            *seen.get_unchecked_mut(c_idx) = c_tag;
+                            insert_name(keys, masks, h, country);
+                        }
                     }
                     agg[0] += 1;
                     agg[1] += id;
@@ -280,8 +281,12 @@ unsafe fn parse_chunk(
                     idx += 5;
                 }
             }
-            d_pos.copy_within(idx..n_delims, 0);
-            d_q.copy_within(idx..n_delims, 0);
+            for k in 0..(n_delims - idx) {
+                unsafe {
+                    *d_pos.get_unchecked_mut(k) = *d_pos.get_unchecked(idx + k);
+                    *d_q.get_unchecked_mut(k) = *d_q.get_unchecked(idx + k);
+                }
+            }
             n_delims -= idx;
         }
     }
@@ -329,17 +334,12 @@ fn main() -> io::Result<()> {
         bounds[t] = (pos + 1).min(body.len());
     }
     bounds[threads] = body.len();
-    let mask_cap = (NAME_SLOTS + 4096) * 4;
-    let (raw_keys, raw_masks, next_id) = (
-        vec![0u64; NAME_SLOTS],
-        vec![0u64; mask_cap],
-        AtomicU64::new(0),
-    );
+    let (raw_keys, raw_masks) = (vec![0u64; NAME_SLOTS], vec![0u64; NAME_SLOTS * 4]);
     // SAFETY: AtomicU64 has identical layout and alignment as u64.
     let (keys, masks) = unsafe {
         (
             std::slice::from_raw_parts(raw_keys.as_ptr().cast::<AtomicU64>(), NAME_SLOTS),
-            std::slice::from_raw_parts(raw_masks.as_ptr().cast::<AtomicU64>(), mask_cap),
+            std::slice::from_raw_parts(raw_masks.as_ptr().cast::<AtomicU64>(), NAME_SLOTS * 4),
         )
     };
     let thread_aggs: Vec<Vec<[i64; 8]>> = thread::scope(|s| {
@@ -347,14 +347,7 @@ fn main() -> io::Result<()> {
         for w in bounds.windows(2).filter(|w| w[0] < w[1]) {
             // SAFETY: x86-64-v3 + pclmulqdq is available on the target CPU.
             hs.push(s.spawn(|| unsafe {
-                parse_chunk(
-                    &body[w[0]..w[1]],
-                    &region_map,
-                    num_countries,
-                    keys,
-                    masks,
-                    &next_id,
-                )
+                parse_chunk(&body[w[0]..w[1]], &region_map, num_countries, keys, masks)
             }));
         }
         hs.into_iter().map(|h| h.join().unwrap()).collect()
@@ -371,13 +364,14 @@ fn main() -> io::Result<()> {
         }
     }
     let mut distinct_counts: Vec<i64> = final_aggs.iter().map(|a| a[7]).collect();
-    let used_ids = (next_id.load(Ordering::Relaxed) as usize).min(NAME_SLOTS + 4096);
-    for id in 0..used_ids {
-        for w_idx in 0..4 {
-            let mut w = masks[(id << 2) + w_idx].load(Ordering::Relaxed);
-            while w != 0 {
-                distinct_counts[w_idx * 64 + w.trailing_zeros() as usize] += 1;
-                w &= w - 1;
+    for (idx, k) in keys.iter().enumerate() {
+        if k.load(Ordering::Relaxed) != 0 {
+            for w_idx in 0..4 {
+                let mut w = masks[(idx << 2) + w_idx].load(Ordering::Relaxed);
+                while w != 0 {
+                    distinct_counts[w_idx * 64 + w.trailing_zeros() as usize] += 1;
+                    w &= w - 1;
+                }
             }
         }
     }
