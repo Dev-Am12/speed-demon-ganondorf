@@ -191,7 +191,6 @@ unsafe fn parse_chunk(
     masks: &[AtomicU64],
 ) -> Vec<[i64; 9]> {
     let mut aggs = vec![INIT_AGG; num_countries];
-    let mut seen = [0u64; 2048];
     let mut ubuf = vec![0u8; 512];
     let (mut d_pos, mut d_q, mut tail) = ([0u32; 72], [0u32; 72], [0u8; 64]);
     let (mut n_delims, mut prev_in_quote, mut q_prefix, mut rec_start, mut blk_start) =
@@ -287,13 +286,8 @@ unsafe fn parse_chunk(
                         agg[7] = 1;
                     } else {
                         let h = hash_name_fast(n_ptr, n_len);
-                        let c_idx = ((h >> 1) as usize) & 2047;
-                        let c_tag = (h & !0xFFF) | ((country as u64) << 1) | 1;
-                        if *seen.get_unchecked(c_idx) != c_tag {
-                            *seen.get_unchecked_mut(c_idx) = c_tag;
-                            if insert_name(keys, masks, h, country) {
-                                agg[8] += 1;
-                            }
+                        if insert_name(keys, masks, h, country) {
+                            agg[8] += 1;
                         }
                     }
                     agg[0] += 1;
