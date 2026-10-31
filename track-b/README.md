@@ -20,7 +20,7 @@ One shard layer replaces v3's segments, replay buffers and per-segment serial lo
 
 ## Measurements
 
-Board results are in [PERF.md](PERF.md): v2.5 (272dc82) T 0.652 s, M 103 MB, S 1,059, K 11.872829; v3 (f473810) T 0.711 s, M 63 MB, S 1,212, K 12.304135. The V4 version in this folder was written without a Rust toolchain and has not been built, gated or timed, so it has no measurements and no board run yet.
+The fastest Track B board time recorded so far is commit a3f64b1 (T 0.631 s, M 57 MB, S 1,294, K 13.162834, 55.967 points), ahead of v2.5 (0.652 s) and v3 (0.711 s). Board results are in [PERF.md](PERF.md): v2.5 (272dc82) T 0.652 s, M 103 MB, S 1,059, K 11.872829; v3 (f473810) T 0.711 s, M 63 MB, S 1,212, K 12.304135. The V4 version in this folder was written without a Rust toolchain and has not been built, gated or timed, so it has no measurements and no board run yet.
 
 ## Dependencies
 
