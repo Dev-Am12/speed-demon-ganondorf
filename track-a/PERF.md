@@ -23,6 +23,9 @@ Every step from the reference to your final version, each with the live-board ru
 | 16 | A18: parallel endpoint remap across worker threads | pending | 0.125 | 41 | 26.15 |
 | 17 | A: 12 workers (A-v2 default; board 0.070 s) | pending | 0.070 | 42 | 30.50 |
 | 18 | A21: 64-bit tag slot intern, flat arena, growable table | pending | 0.052 | 44 | 33.20 |
+| 19 | M1: reserve record buffers once with chunk_len / 40 | pending | 0.052 | 44 | 33.20 |
+| 20 | M2: pack records to 4B u32 (11-bit id | 1-bit err | 20-bit lat) with overflow list | pending | 0.050 | 41 | 35.80 |
+| 21 | M3: progressive hourly buffer drops with ordered streaming pipeline | pending | 0.050 | 26 | 38.40 |
 
 ### Experiment Log
 - **Step 2 (A1 - Positional parsing & integer hour index):**
@@ -110,6 +113,21 @@ Every step from the reference to your final version, each with the live-board ru
     - Scan only: 51.56 ns/line
     - Baseline (scan + intern): 108.02 ns/line (intern alone: 56.46 ns/line)
     - A21 (scan + intern): 83.35 ns/line (intern alone: 31.79 ns/line, -43.7% intern time, saving ~76.7 ms CPU)
-  - *Local relative result:* Hyperfine 10 runs on full: baseline 163.4 ms ± 30.3 ms -> A21 118.0 ms ± 12.0 ms (1.38x speedup locally, min 105.1 ms). User CPU time dropped from 670.9 ms to 492.9 ms (-178 ms). System time dropped from 524.0 ms to 284.0 ms (-240 ms). Peak RSS: 40,904 KB (~40.9 MB). Cgroup `memory.peak`: 44.55 MB. Source lines $S = 404$ (+36 lines).
-  - *K-accounting:* Evaluated at target ($T \le 52$ ms, $S \le 340$): $\Delta T \approx -10.9\text{ ms} \implies \times 1.1248$; $\Delta S = +36 \implies \times 0.9851$; net gain = $+10.80\% \ge 1\%$.
+  - *Local relative result:* Interleaved 20 runs on full: baseline c841249 (150.3 ms ± 37.8 ms, User: 647.0 ms, Sys: 347.6 ms) -> A21 f8e8dd0 (113.9 ms ± 8.8 ms, User: 480.4 ms, Sys: 286.5 ms). Default 12 threads. 1.32x speedup. Peak RSS (42.4 MB vs 43.2 MB) and cgroup `memory.peak` (45.2 MB vs 46.9 MB, ~10,747 vs 11,109 faults) are unchanged by A21 (memory is flat; local RSS is not board M, as board M includes output file page cache). Source lines $S = 404$ (+36 lines).
+  - *K-accounting:* Evaluated at board operating point ($T = 70\text{ ms}$, $S = 312 \to 404$): $\Delta T \approx -10.96\text{ ms} \implies \times 1.0889$; $\Delta S = +92 \implies \times 0.9620$; net gain $= +4.75\% \ge 1\%$ (relative to immediate prior commit $S = 368 \to 404 \implies \times 0.9861$, net gain $= +7.38\%$).
+  - *Verdict:* Kept. Correctness verified on full, sample, tiny, 49/49 fuzz seeds, and threads 1/2/6/8/12.
+- **Step 21 (M1 - Reserve record buffers once with capacity = chunk_len / 40):**
+  - *Hypothesis:* Pre-sizing each `(worker, hour)` record vector to `capacity = chunk_len / 40` (Spec §3 minimum request line length: 27 ts + 4 spaces + 3 method + 1 endpoint + 3 status + 1 latency + 1 LF = 40) ensures vectors never reallocate during parsing. Untouched virtual address space is not charged against physical RSS.
+  - *Local relative result:* Minor page faults dropped from 10,687 to 10,468 (-219 faults). VmHWM dropped from 40.3 MB to 39.7 MB. Container check passes (0.90 s). S = 405 lines (+1 line).
+  - *Verdict:* Kept. Correctness verified on full, sample, tiny, 49/49 fuzz seeds, and threads 1/2/6/8/12.
+- **Step 22 (M2 - Pack records to 4B u32 with overflow list):**
+  - *Hypothesis:* Packing records into a single `u32` (11-bit local id | 1-bit 5xx error flag | 20-bit latency; Spec §2: catalogue has exactly 1,842 endpoints; M0 measured 98.82% of latencies < 2^20) reduces record size from 6 B to 4 B (-33% heap data). The 1.18% of latencies >= 2^20 go to a per-(worker, hour) `overflow: Vec<(u32, u32)>` with `0xFFFFF` stored in the record. In aggregation pass 2, a single linear stream loads id, error flag, and latency simultaneously.
+  - *Local relative result:* Interleaved 20 runs: M1 167.3 ms ± 24.8 ms -> M2 138.9 ms ± 10.3 ms (1.21x faster). User CPU dropped from 517.1 ms to 491.2 ms (-25.9 ms). System CPU dropped from 315.4 ms to 219.6 ms (-95.8 ms). Minor page faults dropped from 10,468 to 8,246 (-2,222 faults, -21.2%). Peak RSS dropped from 39.7 MB to 31.3 MB (-8.4 MB). Cgroup `memory.peak` dropped from 45.2 MB to 41.04 MB (-4.16 MB). S = 421 lines (+16 lines).
+  - *Known-bad control test:* Verified boundary latencies 0, 100, 1048574, 1048575, 1048576 (2^20), 1048577, and 4294967295 (2^32 - 1) across multiple hours; output matches reference implementation byte-for-byte.
+  - *K-accounting:* Evaluated at board operating point ($T = 70\text{ ms}$, $M \approx 45.2\text{ MB}$, $S = 405 \to 421$): $\Delta T \approx -2.5\text{ ms} \implies \times 1.0183$; $\Delta M \approx -4.16\text{ MB} \implies \times 1.0146$; $\Delta S = +16 \implies \times 0.9942$; net gain $= +2.72\% \ge 1\%$.
+  - *Verdict:* Kept. Correctness verified on full, sample, tiny, 49/49 fuzz seeds, and threads 1/2/6/8/12.
+- **Step 23 (M3 - Progressive hourly buffer drops with ordered streaming pipeline):**
+  - *Hypothesis:* Workers claim hours dynamically from a shared `Mutex<Vec<Option<Vec<HourData>>>>`. Once an hour's data is scattered into `flat_lats`, that hour's buffers across all workers are dropped immediately (`drop(hour_data)`). Only currently active hours occupy memory during Phase C, allowing glibc to reclaim or reuse pages and preventing Phase A records from coexisting with Phase C formatted output.
+  - *Local relative result:* Cgroup `memory.peak` dropped dramatically from 41.04 MB to 26.13 MB (-14.91 MB, -36.3% peak memory reduction). Peak RSS (VmHWM) dropped from 31.3 MB to 21.2 MB (-10.1 MB, -32.3%). Minor page faults dropped from 8,246 to 7,026 (-1,220 faults, -14.8%). User CPU time dropped from 477.3 ms to 469.1 ms. Container check passes (0.88 s). Because `memory.peak` fell to 26.13 MB, M4 (`malloc_trim`) is not triggered, keeping the code 100% `#![forbid(unsafe_code)]`. S = 440 lines (+19 lines).
+  - *K-accounting:* Evaluated at board operating point ($M \approx 41.04 \to 26.13\text{ MB}$, $S = 421 \to 440$, $T \approx 70\text{ ms}$): $\Delta M \approx -14.91\text{ MB} \implies \times 1.0701$; $\Delta S = +19 \implies \times 0.9934$; net gain $= +6.30\% \ge 1\%$.
   - *Verdict:* Kept. Correctness verified on full, sample, tiny, 49/49 fuzz seeds, and threads 1/2/6/8/12.

@@ -6,7 +6,7 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc;
+use std::sync::{mpsc, Mutex};
 use std::thread;
 
 const HOURS: usize = 72;
@@ -103,8 +103,8 @@ impl Table {
 }
 
 struct HourData {
-    lats: Vec<u32>,
-    id_errs: Vec<u16>,
+    records: Vec<u32>,
+    overflow: Vec<(u32, u32)>,
 }
 
 struct Local {
@@ -148,7 +148,7 @@ fn parse_line(buf: &[u8], pos: usize, local: &mut Local) -> usize {
     }
     let ep_start = i + 1;
     let ep_end = find_space_swar(buf, ep_start);
-    let err = (buf[ep_end + 1] == b'5') as u16;
+    let err = (buf[ep_end + 1] == b'5') as u32;
     let mut latency = 0u32;
     i = ep_end + 5;
     while buf[i] != b'\n' {
@@ -157,19 +157,31 @@ fn parse_line(buf: &[u8], pos: usize, local: &mut Local) -> usize {
     }
     let id = local.table.intern(&buf[ep_start..ep_end]);
     let hd = &mut local.hours[hour];
-    hd.lats.push(latency);
-    // Spec §2: catalogue has exactly 1,842 endpoints (<= 32,767); fits in 15 bits, bit 15 is 5xx flag.
-    hd.id_errs.push((id & 0x7FFF) | (err << 15));
+    let (packed_lat, is_overflow) = if latency >= 0xFFFFF {
+        (0xFFFFF, true)
+    } else {
+        (latency, false)
+    };
+    if is_overflow {
+        hd.overflow.push((hd.records.len() as u32, latency));
+    }
+    // Spec §2: Catalogue has exactly 1,842 endpoints (<= 2047); fits in 11 bits.
+    // Bit 11 is 5xx error flag. Bits 12..31 (20 bits) store packed latency or 0xFFFFF overflow sentinel.
+    hd.records
+        .push((id as u32 & 0x7FF) | (err << 11) | (packed_lat << 12));
     i + 1
 }
 
 fn parse_worker_range(file: &File, mut start: usize, end: usize) -> Local {
+    // Spec §3: Minimum request line length is 40 bytes:
+    // 27 (timestamp) + 4 (spaces) + 3 (method) + 1 (endpoint) + 3 (status) + 1 (latency) + 1 (LF) = 40.
+    let cap = ((end - start) / 40).max(64);
     let mut local = Local {
         table: Table::new(),
         hours: (0..HOURS)
             .map(|_| HourData {
-                lats: Vec::with_capacity(4096),
-                id_errs: Vec::with_capacity(4096),
+                records: Vec::with_capacity(cap),
+                overflow: Vec::new(),
             })
             .collect(),
     };
@@ -275,25 +287,33 @@ fn main() {
     bounds[parse_workers] = len;
     bounds.dedup();
 
-    let locals: Vec<Local> = thread::scope(|scope| {
+    let (tables, hours_by_worker): (Vec<Table>, Vec<Vec<HourData>>) = thread::scope(|scope| {
         let mut tasks = Vec::new();
         for pair in bounds.windows(2) {
             let (start, end) = (pair[0], pair[1]);
             tasks.push(scope.spawn(move || {
                 let source = File::open(input).expect("reopen requests.log");
-                parse_worker_range(&source, start, end)
+                let local = parse_worker_range(&source, start, end);
+                (local.table, local.hours)
             }));
         }
-        tasks
+        let results: Vec<(Table, Vec<HourData>)> = tasks
             .into_iter()
             .map(|t| t.join().expect("parser worker panicked"))
-            .collect()
+            .collect();
+        let mut tables = Vec::with_capacity(results.len());
+        let mut hours = Vec::with_capacity(results.len());
+        for (t, h) in results {
+            tables.push(t);
+            hours.push(h);
+        }
+        (tables, hours)
     });
 
-    let mut names = Vec::with_capacity(2048 * locals.len());
-    for local in &locals {
-        for id in 0..local.table.offsets.len() as u16 {
-            names.push(local.table.get_name(id));
+    let mut names = Vec::with_capacity(2048 * tables.len());
+    for table in &tables {
+        for id in 0..table.offsets.len() as u16 {
+            names.push(table.get_name(id));
         }
     }
     names.sort_unstable();
@@ -302,11 +322,11 @@ fn main() {
 
     let remaps: Vec<Vec<u16>> = thread::scope(|scope| {
         let mut tasks = Vec::new();
-        for local in &locals {
+        for table in &tables {
             let names = &names;
             tasks.push(scope.spawn(move || {
-                (0..local.table.offsets.len() as u16)
-                    .map(|id| names.binary_search(&local.table.get_name(id)).unwrap() as u16)
+                (0..table.offsets.len() as u16)
+                    .map(|id| names.binary_search(&table.get_name(id)).unwrap() as u16)
                     .collect()
             }));
         }
@@ -315,6 +335,17 @@ fn main() {
             .map(|t| t.join().expect("remap worker panicked"))
             .collect()
     });
+
+    let num_workers = hours_by_worker.len();
+    let mut hourly: Vec<Option<Vec<HourData>>> = (0..HOURS)
+        .map(|_| Some(Vec::with_capacity(num_workers)))
+        .collect();
+    for hours in hours_by_worker {
+        for (h, hd) in hours.into_iter().enumerate() {
+            hourly[h].as_mut().unwrap().push(hd);
+        }
+    }
+    let hourly = Mutex::new(hourly);
 
     let mut prefixes = [[0u8; 21]; HOURS];
     for (hour, p) in prefixes.iter_mut().enumerate() {
@@ -333,7 +364,7 @@ fn main() {
         for _ in 0..agg_workers {
             let next = &next_hour;
             let names = &names;
-            let locals = &locals;
+            let hourly = &hourly;
             let remaps = &remaps;
             let prefixes = &prefixes;
             let tx = tx.clone();
@@ -349,15 +380,16 @@ fn main() {
                     if hour >= HOURS {
                         break;
                     }
+                    let hour_data = hourly.lock().unwrap()[hour].take().unwrap();
                     counts.fill(0);
                     err_counts.fill(0);
 
-                    for (w, local) in locals.iter().enumerate() {
+                    for (w, hd) in hour_data.iter().enumerate() {
                         let w_remap = &remaps[w];
-                        for &r in &local.hours[hour].id_errs {
-                            let gid = w_remap[(r & 0x7FFF) as usize] as usize;
+                        for &r in &hd.records {
+                            let gid = w_remap[(r & 0x7FF) as usize] as usize;
                             counts[gid] += 1;
-                            if (r & 0x8000) != 0 {
+                            if (r & 0x800) != 0 {
                                 err_counts[gid] += 1;
                             }
                         }
@@ -374,17 +406,25 @@ fn main() {
                         flat_lats.resize(sum as usize, 0);
                     }
 
-                    for (w, local) in locals.iter().enumerate() {
+                    for (w, hd) in hour_data.iter().enumerate() {
                         let w_remap = &remaps[w];
-                        let hd = &local.hours[hour];
-                        for i in 0..hd.lats.len() {
-                            let r = hd.id_errs[i];
-                            let gid = w_remap[(r & 0x7FFF) as usize] as usize;
+                        let mut of_idx = 0;
+                        for &r in &hd.records {
+                            let gid = w_remap[(r & 0x7FF) as usize] as usize;
                             let slot = cursors[gid] as usize;
                             cursors[gid] += 1;
-                            flat_lats[slot] = hd.lats[i];
+                            let lat = r >> 12;
+                            let lat = if lat == 0xFFFFF {
+                                let full = hd.overflow[of_idx].1;
+                                of_idx += 1;
+                                full
+                            } else {
+                                lat
+                            };
+                            flat_lats[slot] = lat;
                         }
                     }
+                    drop(hour_data);
 
                     let mut out = Vec::with_capacity(160 * 1024);
                     for ep in 0..num_endpoints {
