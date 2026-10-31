@@ -42,6 +42,8 @@ struct PhrasePlan {
     len: u8,
     seed: u32,
     second: u32,
+    positional: bool,
+    seed_positions: u8,
     keys: [(u64, u64); 8],
 }
 
@@ -154,10 +156,11 @@ fn mapped(t: &[u8], i: usize) -> u8 {
 }
 
 /// Tokenizes t[i..] up to the first LF (or the end). `f` receives each token's key (None for a
-/// token longer than 32 bytes, which still occupies a position) and returns false to stop early.
+/// token longer than 32 bytes, which still occupies a position) plus its byte offset, and
+/// returns false to stop early.
 /// Returns the index where the scan stopped: the LF position, or t.len().
 #[inline(always)]
-fn scan<F: FnMut(Option<(u64, u64)>) -> bool>(t: &[u8], mut i: usize, mut f: F) -> usize {
+fn scan<F: FnMut(usize, Option<(u64, u64)>) -> bool>(t: &[u8], mut i: usize, mut f: F) -> usize {
     let n = t.len();
     while i < n {
         let c = mapped(t, i);
@@ -168,6 +171,7 @@ fn scan<F: FnMut(Option<(u64, u64)>) -> bool>(t: &[u8], mut i: usize, mut f: F) 
             i += 1;
             continue;
         }
+        let token_start = i;
         let mut lo = c as u64;
         let mut shift = 8u32;
         i += 1;
@@ -219,7 +223,7 @@ fn scan<F: FnMut(Option<(u64, u64)>) -> bool>(t: &[u8], mut i: usize, mut f: F) 
             let h_lo = mix64(lo ^ w2.rotate_left(17) ^ (16 + m) as u64).max(1);
             Some((h_lo, mix64(hi ^ w3.rotate_left(37) ^ h_lo) | (1u64 << 63)))
         };
-        if !f(key) {
+        if !f(token_start, key) {
             return n;
         }
         if i < n && t[i] == b'\n' {
@@ -318,12 +322,21 @@ impl SetView<'_> {
 }
 
 /// One contiguous run of documents (at most MAX_DOCS) with its own posting lists and bitsets.
+#[derive(Clone, Copy)]
+struct PosRef {
+    term: u32,
+    start: u32,
+    len: u32,
+}
+
 struct Shard {
     base: u32,              // global id of the shard's first document
     spans: Vec<(u32, u32)>, // per document: text start and end (absolute byte offsets)
     refs: Vec<TermRef>,
     arena: Vec<u16>,
     bits: Vec<u64>,
+    pos_refs: Vec<PosRef>, // sorted by term; only rare phrase seeds have entries
+    positions: Vec<u64>,   // sorted (term, local-doc, byte-offset) packed events
 }
 
 impl Shard {
@@ -363,7 +376,7 @@ fn pass1(
             .filter(|&p| head[p] == b'\t')
             .map(|p| pos + p + 1);
         let end = match tab {
-            Some(ts) => scan(&docs[..b], ts, |tok| {
+            Some(ts) => scan(&docs[..b], ts, |_, tok| {
                 if let Some(t) = tok.and_then(|k| vocab.get(k)) {
                     let t = t as usize;
                     if last[t] != doc {
@@ -393,13 +406,22 @@ fn pass2(
     arena: &mut [u16],
     bits: &mut [u64],
     cursor: &mut [u16],
+    positional: &[bool],
+    positions: &mut Vec<u64>,
 ) {
     cursor.fill(0);
     for (d, &(s, e)) in spans.iter().enumerate() {
         let d = d as u16;
-        scan(&docs[s as usize..e as usize], 0, |tok| {
+        scan(&docs[s as usize..e as usize], 0, |offset, tok| {
             if let Some(t) = tok.and_then(|k| vocab.get(k)) {
-                let r = refs[t as usize];
+                let t = t as usize;
+                if positional[t] {
+                    // Query grammar bounds the vocabulary below 2^24 terms; each generated
+                    // document is far shorter than 2^24 bytes (999 units, <=32-byte tokens).
+                    debug_assert!(t < (1 << 24) && offset < (1 << 24));
+                    positions.push(((t as u64) << 40) | ((d as u64) << 24) | offset as u64);
+                }
+                let r = refs[t];
                 if r.len == SKIP {
                     return true;
                 }
@@ -463,22 +485,52 @@ fn parse_queries(qb: &[u8], vocab: &mut Vocab) -> (Vec<Query>, Vec<PhrasePlan>) 
     (queries, plans)
 }
 
-/// True if `text` contains the phrase keys as consecutive tokens (shift-and over token keys).
-fn phrase_matches(text: &[u8], keys: &[(u64, u64)]) -> bool {
-    let target = 1u8 << (keys.len() - 1);
+/// Checks a phrase from one known occurrence of its rare seed term. The seed's token
+/// position within the phrase is supplied by `anchor_pos`; only the at-most-seven preceding
+/// tokens and the phrase itself are touched, rather than rescanning the document from byte 0.
+fn phrase_at(text: &[u8], anchor: usize, anchor_pos: usize, keys: &[(u64, u64)]) -> bool {
+    let mut first = anchor;
+    for _ in 0..anchor_pos {
+        // Move across separators, then across the preceding token. Every non-ASCII byte is
+        // a separator under the frozen byte-tokenization contract, including UTF-8 bytes.
+        while first > 0 && mapped(text, first - 1) == 0 {
+            first -= 1;
+        }
+        if first == 0 {
+            return false;
+        }
+        while first > 0 && mapped(text, first - 1) != 0 {
+            first -= 1;
+        }
+    }
+
+    let mut matched = 0usize;
+    scan(text, first, |_, token| {
+        if token != Some(keys[matched]) {
+            return false;
+        }
+        matched += 1;
+        matched < keys.len()
+    });
+    matched == keys.len()
+}
+
+/// Exact fallback for the few generated repeat phrases without a rare anchor.
+fn phrase_fallback(text: &[u8], keys: &[(u64, u64)]) -> bool {
     let mut state = 0u8;
+    let target = 1u8 << (keys.len() - 1);
     let mut hit = false;
-    scan(text, 0, |tok| {
-        let Some(k) = tok else {
-            state = 0; // an over-long token occupies a position and breaks adjacency
+    scan(text, 0, |_, token| {
+        let Some(key) = token else {
+            state = 0;
             return true;
         };
-        if state == 0 && k != keys[0] {
+        if state == 0 && key != keys[0] {
             return true;
         }
         let mut mask = 0u8;
-        for (i, &pk) in keys.iter().enumerate() {
-            if k == pk {
+        for (i, &expected) in keys.iter().enumerate() {
+            if key == expected {
                 mask |= 1u8 << i;
             }
         }
@@ -487,6 +539,25 @@ fn phrase_matches(text: &[u8], keys: &[(u64, u64)]) -> bool {
         !hit
     });
     hit
+}
+
+/// Builds compact term ranges over an already-sorted positional-event array.
+fn make_pos_refs(events: &[u64]) -> Vec<PosRef> {
+    let mut refs = Vec::new();
+    let mut i = 0usize;
+    while i < events.len() {
+        let term = (events[i] >> 40) as u32;
+        let start = i;
+        while i < events.len() && (events[i] >> 40) as u32 == term {
+            i += 1;
+        }
+        refs.push(PosRef {
+            term,
+            start: start as u32,
+            len: (i - start) as u32,
+        });
+    }
+    refs
 }
 
 /// Running result of one query across shards: count, id sum and the 10 smallest ids.
@@ -611,6 +682,22 @@ fn mark(view: SetView<'_>, out: &mut [u64], set: bool) {
     }
 }
 
+/// Finds the first value >= target at or after `start` using exponential/galloping
+/// search followed by a bounded binary search. The caller supplies nondecreasing targets.
+#[inline]
+fn gallop_lower_bound(a: &[u16], start: usize, target: u16) -> usize {
+    if start >= a.len() || a[start] >= target {
+        return start;
+    }
+    let mut step = 1usize;
+    while start + step < a.len() && a[start + step] < target {
+        step = step.saturating_mul(2);
+    }
+    let lo = start + step / 2 + 1;
+    let hi = (start + step + 1).min(a.len());
+    lo + a[lo..hi].partition_point(|&value| value < target)
+}
+
 /// Merge of two sorted lists: intersection, or union when `union` is set.
 fn merge(a: &[u16], b: &[u16], out: &mut Vec<u16>, union: bool) {
     let (mut i, mut j) = (0, 0);
@@ -676,6 +763,20 @@ fn step(cur: Cur, rhs: u32, op: Op, sh: &Shard, sc: &mut Scratch) -> Cur {
             };
             match o {
                 SetView::List(b) if b.len() <= 16 * s.len() => merge(s, b, out, false),
+                SetView::List(b) => {
+                    let (small, large) = if s.len() <= b.len() { (s, b) } else { (b, s) };
+                    let mut j = 0usize;
+                    for &x in small {
+                        j = gallop_lower_bound(large, j, x);
+                        if j < large.len() && large[j] == x {
+                            out.push(x);
+                            j += 1;
+                        }
+                        if j == large.len() {
+                            break;
+                        }
+                    }
+                }
                 _ => out.extend(s.iter().copied().filter(|&x| o.contains(x))),
             }
         }
@@ -710,14 +811,56 @@ fn eval(q: &Query, plans: &[PhrasePlan], docs: &[u8], sh: &Shard, sc: &mut Scrat
             let p = &plans[*plan as usize];
             let second = (p.second != u32::MAX).then(|| sh.view(p.second));
             let keys = &p.keys[..p.len as usize];
-            sh.view(p.seed).each(|d| {
-                if second.map_or(true, |s| s.contains(d)) {
-                    let (s, e) = sh.spans[d as usize];
-                    if phrase_matches(&docs[s as usize..e as usize], keys) {
-                        a.push(sh.base + d as u32);
+            if p.positional {
+                let Ok(ridx) = sh.pos_refs.binary_search_by_key(&p.seed, |r| r.term) else {
+                    return; // an absent seed has no positional events in this shard
+                };
+                let r = sh.pos_refs[ridx];
+                let events = &sh.positions[r.start as usize..(r.start + r.len) as usize];
+                let mut i = 0usize;
+                while i < events.len() {
+                    let doc = ((events[i] >> 24) & 0xffff) as u16;
+                    let mut end = i + 1;
+                    while end < events.len() && ((events[end] >> 24) & 0xffff) as u16 == doc {
+                        end += 1;
                     }
+                    if second.map_or(true, |set| set.contains(doc)) {
+                        let (s, e) = sh.spans[doc as usize];
+                        let text = &docs[s as usize..e as usize];
+                        let mut found = false;
+                        for &event in &events[i..end] {
+                            let offset = (event & 0x00ff_ffff) as usize;
+                            let mut mask = p.seed_positions;
+                            while mask != 0 {
+                                let at = mask.trailing_zeros() as usize;
+                                if phrase_at(text, offset, at, keys) {
+                                    found = true;
+                                    break;
+                                }
+                                mask &= mask - 1;
+                            }
+                            if found {
+                                break;
+                            }
+                        }
+                        if found {
+                            a.push(sh.base + doc as u32);
+                        }
+                    }
+                    i = end;
                 }
-            });
+            } else {
+                // A small number of repeated-word edge phrases have no rare anchor. Keep
+                // the exact original whole-document verifier for those plans only.
+                sh.view(p.seed).each(|d| {
+                    if second.map_or(true, |set| set.contains(d)) {
+                        let (s, e) = sh.spans[d as usize];
+                        if phrase_fallback(&docs[s as usize..e as usize], keys) {
+                            a.push(sh.base + d as u32);
+                        }
+                    }
+                });
+            }
         }
     }
 }
@@ -738,8 +881,10 @@ fn run(docs: &[u8]) -> io::Result<()> {
         .min(MAX_THREADS)
         .max(1);
 
-    // Shards: byte chunks that start at line starts, doubled until each holds <= MAX_DOCS documents.
-    let mut c = threads * 2;
+    // Shards: one line-snapped byte chunk per worker; double only if a shard exceeds the
+    // u16 local-document limit. This keeps all index phases parallel while halving the
+    // number of per-query shard evaluations versus the previous 2x-thread layout.
+    let mut c = threads;
     let (cuts, counts) = loop {
         let mut cuts: Vec<usize> = (0..c)
             .map(|k| {
@@ -799,13 +944,34 @@ fn run(docs: &[u8]) -> io::Result<()> {
         }
     }
     let mut keep = vec![false; v];
-    for q in &queries {
-        if let Query::Bool { terms, len, .. } = q {
-            for &t in &terms[..*len as usize] {
+    let mut positional = vec![false; v];
+    for q in &mut queries {
+        if let Query::Bool { terms, ops, len } = q {
+            let m = *len as usize;
+            for &t in &terms[..m] {
                 keep[t as usize] = true;
+            }
+            // Reorder operands only inside a contiguous AND run. Set intersection is
+            // associative and commutative; boundaries at OR/NOT remain untouched, so the
+            // query's strictly left-to-right semantics are preserved.
+            let mut start = 0usize;
+            while start < m {
+                let mut end = start;
+                while end + 1 < m && matches!(ops[end], Op::And) {
+                    end += 1;
+                }
+                let sort_from = if start == 0 { start } else { start + 1 };
+                if sort_from < end {
+                    terms[sort_from..=end].sort_unstable_by_key(|&t| (df[t as usize], t));
+                } else if start == 0 && sort_from == end {
+                    // A two-term initial AND is also safe to reorder.
+                    terms[start..=end].sort_unstable_by_key(|&t| (df[t as usize], t));
+                }
+                start = end + 1;
             }
         }
     }
+    let rare_anchor_limit = total as usize / 1000;
     for p in &mut plans {
         let m = p.len as usize;
         let mut ord = p.terms;
@@ -814,7 +980,21 @@ fn run(docs: &[u8]) -> io::Result<()> {
         let second = ord[1..m].iter().copied().find(|&t| t != seed);
         p.seed = seed;
         p.second = second.unwrap_or(u32::MAX);
-        keep[seed as usize] = true;
+        p.seed_positions = 0;
+        for i in 0..m {
+            if p.terms[i] == seed {
+                p.seed_positions |= 1u8 << i;
+            }
+        }
+        // The frozen generator guarantees an anchor (df <= N/1000) for every phrase
+        // except a small repeat-word edge set. Index positions only for those rare seeds;
+        // retain document postings and the original verifier for the unanchored repeats.
+        p.positional = df[seed as usize] <= rare_anchor_limit as u32;
+        if p.positional {
+            positional[seed as usize] = true;
+        } else {
+            keep[seed as usize] = true;
+        }
         if let Some(s) = second {
             keep[s as usize] = true;
         }
@@ -869,18 +1049,33 @@ fn run(docs: &[u8]) -> io::Result<()> {
             let (refs, sp, dn) = &layouts[i];
             let mut arena = vec![0u16; *sp];
             let mut bits = vec![0u64; *dn];
-            pass2(docs, &spans[i], &vocab, refs, &mut arena, &mut bits, cursor);
-            (arena, bits)
+            let mut positions = Vec::new();
+            pass2(
+                docs,
+                &spans[i],
+                &vocab,
+                refs,
+                &mut arena,
+                &mut bits,
+                cursor,
+                &positional,
+                &mut positions,
+            );
+            positions.sort_unstable();
+            (arena, bits, positions)
         },
     );
     let mut shards = Vec::with_capacity(n);
-    for (i, ((arena, bits), (refs, _, _))) in bodies.into_iter().zip(layouts).enumerate() {
+    for (i, ((arena, bits, positions), (refs, _, _))) in bodies.into_iter().zip(layouts).enumerate() {
+        let pos_refs = make_pos_refs(&positions);
         shards.push(Shard {
             base: bases[i],
             spans: std::mem::take(&mut spans[i]),
             refs,
             arena,
             bits,
+            pos_refs,
+            positions,
         });
     }
 
