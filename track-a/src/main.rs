@@ -14,98 +14,102 @@ const CHUNK_SIZE: usize = 64 * 1024;
 const DATES: [&str; 4] = ["2026-10-30", "2026-10-31", "2026-11-01", "2026-11-02"];
 
 struct Table {
-    slots: Vec<usize>,
+    slots: Vec<u16>,
     names: Vec<Vec<u8>>,
 }
 
 impl Table {
     fn new() -> Self {
-        Self {
-            slots: vec![0; 4096],
-            names: Vec::with_capacity(2048),
-        }
+        Self { slots: vec![0u16; 4096], names: Vec::with_capacity(2048) }
     }
 
-    fn hash(name: &[u8]) -> u64 {
-        let mut h = 0xcbf29ce484222325u64;
-        for &b in name {
-            h = (h ^ b as u64).wrapping_mul(0x100000001b3);
+    #[inline(always)]
+    fn hash(name: &[u8]) -> usize {
+        let len = name.len();
+        if len >= 8 {
+            let first = u64::from_ne_bytes(name[..8].try_into().unwrap());
+            let last = u64::from_ne_bytes(name[len - 8..].try_into().unwrap());
+            let mut h = first ^ last.rotate_left(31) ^ (len as u64);
+            h = (h ^ (h >> 33)).wrapping_mul(0xff51afd7ed558ccd);
+            h as usize
+        } else {
+            let mut h = len as u64;
+            for &b in name { h = (h ^ b as u64).wrapping_mul(0x100000001b3); }
+            h as usize
         }
-        h
     }
 
     fn intern(&mut self, name: &[u8]) -> u16 {
         if (self.names.len() + 1) * 2 >= self.slots.len() {
-            let mut next = vec![0; self.slots.len() * 2];
+            let mut next = vec![0u16; self.slots.len() * 2];
             let mask = next.len() - 1;
             for (id, n) in self.names.iter().enumerate() {
-                let mut i = Self::hash(n) as usize & mask;
-                while next[i] != 0 {
-                    i = (i + 1) & mask;
-                }
-                next[i] = id + 1;
+                let mut i = Self::hash(n) & mask;
+                while next[i] != 0 { i = (i + 1) & mask; }
+                next[i] = (id + 1) as u16;
             }
             self.slots = next;
         }
         let mask = self.slots.len() - 1;
-        let mut i = Self::hash(name) as usize & mask;
+        let mut i = Self::hash(name) & mask;
         loop {
             let slot = self.slots[i];
             if slot == 0 {
                 let id = self.names.len();
                 self.names.push(name.to_vec());
-                self.slots[i] = id + 1;
+                self.slots[i] = (id + 1) as u16;
                 return id as u16;
             }
-            if self.names[slot - 1] == name {
-                return (slot - 1) as u16;
-            }
+            if self.names[(slot - 1) as usize] == name { return slot - 1; }
             i = (i + 1) & mask;
         }
     }
 }
 
-#[derive(Clone, Copy)]
-struct Record {
-    latency: u32,
-    id_err: u16,
+struct HourData {
+    lats: Vec<u32>,
+    id_errs: Vec<u16>,
 }
 
 struct Local {
     table: Table,
-    hours: Vec<Vec<Record>>,
+    hours: Vec<HourData>,
 }
 
 #[inline(always)]
-fn hour_index(line: &[u8]) -> usize {
-    let day = (line[8] - b'0') as usize * 10 + (line[9] - b'0') as usize;
-    let day_idx = if line[6] == b'0' { day - 30 } else { 1 + day };
-    let hour = ((line[11] - b'0') * 10 + line[12] - b'0') as usize;
-    day_idx * 24 + hour - 18
-}
+fn parse_line(buf: &[u8], pos: usize, local: &mut Local) -> usize {
+    let day = (buf[pos + 8] - b'0') as usize * 10 + (buf[pos + 9] - b'0') as usize;
+    let day_idx = if buf[pos + 6] == b'0' { day - 30 } else { 1 + day };
+    let hour = day_idx * 24 + ((buf[pos + 11] - b'0') * 10 + buf[pos + 12] - b'0') as usize - 18;
 
-#[inline(always)]
-fn parse_line(line: &[u8], local: &mut Local) {
-    let method_end = 28 + line[28..].iter().position(|&b| b == b' ').unwrap();
-    let ep_start = method_end + 1;
-    let ep_end = ep_start + line[ep_start..].iter().position(|&b| b == b' ').unwrap();
+    let mut i = pos + 28;
+    while buf[i] != b' ' { i += 1; }
+    let ep_start = i + 1;
+    i = ep_start;
+    while buf[i] != b' ' { i += 1; }
+    let ep_end = i;
+    let err = (buf[ep_end + 1] == b'5') as u16;
     let mut latency = 0u32;
-    for &d in &line[ep_end + 5..] {
-        latency = latency * 10 + (d - b'0') as u32;
+    i = ep_end + 5;
+    while buf[i] != b'\n' {
+        latency = latency * 10 + (buf[i] - b'0') as u32;
+        i += 1;
     }
-    let hour = hour_index(line);
-    let id = local.table.intern(&line[ep_start..ep_end]);
-    let err = (line[ep_end + 1] == b'5') as u16;
-    local.hours[hour].push(Record {
-        latency,
-        id_err: (id & 0x7FFF) | (err << 15),
-    });
+    let id = local.table.intern(&buf[ep_start..ep_end]);
+    let hd = &mut local.hours[hour];
+    hd.lats.push(latency);
+    // Spec §2: catalogue has exactly 1,842 endpoints (<= 32,767); fits in 15 bits, bit 15 is 5xx flag.
+    hd.id_errs.push((id & 0x7FFF) | (err << 15));
+    i + 1
 }
 
 fn parse_worker_range(file: &File, mut start: usize, end: usize) -> Local {
     let mut local = Local {
         table: Table::new(),
-        hours: (0..HOURS).map(|_| Vec::with_capacity(1024)).collect(),
+        hours: (0..HOURS).map(|_| HourData {
+            lats: Vec::with_capacity(4096),
+            id_errs: Vec::with_capacity(4096),
+        }).collect(),
     };
     let mut buf = [0u8; CHUNK_SIZE];
     let mut carried = 0;
@@ -127,10 +131,8 @@ fn parse_worker_range(file: &File, mut start: usize, end: usize) -> Local {
             }
         };
         let mut pos = 0;
-        while pos <= last_nl {
-            let nl = pos + buf[pos..=last_nl].iter().position(|&b| b == b'\n').unwrap();
-            parse_line(&buf[pos..nl], &mut local);
-            pos = nl + 1;
+        while pos < last_nl {
+            pos = parse_line(&buf, pos, &mut local);
         }
         buf.copy_within(last_nl + 1..valid, 0);
         carried = valid - (last_nl + 1);
@@ -161,7 +163,7 @@ fn main() {
         return;
     }
 
-    let default_workers = 6usize;
+    let default_workers = 12usize;
     let requested_workers = std::env::var("THREADS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -249,10 +251,12 @@ fn main() {
 
                     for (w, local) in locals.iter().enumerate() {
                         let w_remap = &remaps[w];
-                        for r in &local.hours[hour] {
-                            let gid = w_remap[(r.id_err & 0x7FFF) as usize] as usize;
-                            hour_lats[gid].push(r.latency);
-                            if (r.id_err & 0x8000) != 0 {
+                        let hd = &local.hours[hour];
+                        for i in 0..hd.lats.len() {
+                            let r = hd.id_errs[i];
+                            let gid = w_remap[(r & 0x7FFF) as usize] as usize;
+                            hour_lats[gid].push(hd.lats[i]);
+                            if (r & 0x8000) != 0 {
                                 hour_errs[gid] += 1;
                             }
                         }
@@ -292,11 +296,12 @@ fn main() {
             hour_outputs[hour] = out;
         }
     }
-    let output_bytes = hour_outputs.concat();
 
     let out = File::create(output).expect("cannot create summary.txt");
     let mut writer = BufWriter::with_capacity(256 * 1024, out);
-    writer.write_all(&output_bytes).expect("write summary.txt");
+    for h in 0..HOURS {
+        writer.write_all(&hour_outputs[h]).expect("write summary.txt");
+    }
     writer.flush().expect("flush output");
     drop(writer);
 }
