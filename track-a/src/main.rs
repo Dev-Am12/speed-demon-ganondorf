@@ -6,6 +6,7 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 
@@ -250,17 +251,16 @@ fn main() {
     let names = Arc::new(names);
     let locals = Arc::new(locals);
     let remaps = Arc::new(remaps);
-    let mut hour_outputs: Vec<Vec<u8>> = (0..HOURS).map(|_| Vec::new()).collect();
+    let (tx, rx) = mpsc::channel();
 
-    let thread_results: Vec<Vec<(usize, Vec<u8>)>> = thread::scope(|scope| {
-        let mut handles = Vec::new();
+    thread::scope(|scope| {
         for _ in 0..workers {
             let next = &next_hour;
             let names = Arc::clone(&names);
             let locals = Arc::clone(&locals);
             let remaps = Arc::clone(&remaps);
-            handles.push(scope.spawn(move || {
-                let mut my_hours = Vec::new();
+            let tx = tx.clone();
+            scope.spawn(move || {
                 let mut flat_lats: Vec<u32> = Vec::with_capacity(65536);
                 let mut counts = vec![0u32; num_endpoints + 1];
                 let mut offsets = vec![0u32; num_endpoints + 1];
@@ -329,30 +329,27 @@ fn main() {
                             errors as u64 * 1_000_000 / n as u64
                         );
                     }
-                    my_hours.push((hour, out));
+                    let _ = tx.send((hour, out));
                 }
-                my_hours
-            }));
+            });
         }
-        handles
-            .into_iter()
-            .map(|h| h.join().expect("formatter worker panicked"))
-            .collect()
+        drop(tx);
+
+        let out = File::create(output).expect("cannot create summary.txt");
+        let mut writer = BufWriter::with_capacity(256 * 1024, out);
+        let mut pending: Vec<Option<Vec<u8>>> = (0..HOURS).map(|_| None).collect();
+        let mut next_to_write = 0;
+
+        while next_to_write < HOURS {
+            let (h, buf) = rx.recv().expect("receive hour");
+            pending[h] = Some(buf);
+            while next_to_write < HOURS && pending[next_to_write].is_some() {
+                let b = pending[next_to_write].take().unwrap();
+                writer.write_all(&b).expect("write summary.txt");
+                drop(b);
+                next_to_write += 1;
+            }
+        }
+        writer.flush().expect("flush output");
     });
-
-    for my_hours in thread_results {
-        for (hour, out) in my_hours {
-            hour_outputs[hour] = out;
-        }
-    }
-
-    let out = File::create(output).expect("cannot create summary.txt");
-    let mut writer = BufWriter::with_capacity(256 * 1024, out);
-    for h in 0..HOURS {
-        writer
-            .write_all(&hour_outputs[h])
-            .expect("write summary.txt");
-    }
-    writer.flush().expect("flush output");
-    drop(writer);
 }

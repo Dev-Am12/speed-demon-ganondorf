@@ -15,6 +15,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 8 | A7: 8-byte word-wise endpoint hash table with u16 slots | pending | 0.205 | 39 | 18.97 |
 | 9 | A11: 12-thread default worker pool | pending | 0.214 | 39 | 19.58 |
 | 10 | A15: per-hour counting sort gather into flat Vec | pending | 0.139 | 44 | 20.25 |
+| 11 | A10: pipelined streaming output via mpsc channel | pending | 0.149 | 42 | 21.35 |
 
 ### Experiment Log
 - **Step 2 (A1 - Positional parsing & integer hour index):**
@@ -61,4 +62,9 @@ Every step from the reference to your final version, each with the live-board ru
   - *Hypothesis:* Counting sort (histogram + prefix sum + scatter into one flat `Vec<u32>`) eliminates 1,842 small `Vec` allocations per worker per hour (~22,000 allocations across 12 threads), improves cache locality, and reduces minor page faults.
   - *Local relative result:* Hyperfine 10 runs on full: baseline 147.2 ms ± 18.5 ms -> A15 139.3 ms ± 8.0 ms (saving 7.9 ms, 1.06x speedup). Peak RSS dropped from 47.1 MB to 44.5 MB (-2.6 MB). Page faults reduced by 612. System time dropped from 0.46s to 0.35s. S = 334 lines.
   - *K-accounting:* Evaluated at target (T ~40 ms, S ~330): $\Delta T \approx -2.15\text{ ms} \implies \times 1.0280$; $\Delta S = +22 \implies \times 0.9904$; net gain = $+1.81\% \ge 1\%$.
+  - *Verdict:* Kept. Correctness verified on full, sample, tiny, 49/49 fuzz seeds, and threads 1/2/6/12.
+- **Step 13 (A10 - Pipelined ordered output via mpsc channel):**
+  - *Hypothesis:* Streaming completed hours to the main writer thread via a safe standard library channel allows immediate sequential writing and per-hour buffer reclamation, overlapping disk I/O with worker compute and eliminating all 72 formatted hour buffers from peak memory.
+  - *Local relative result:* Peak RSS dropped from 44.5 MB to 42.1 MB (-2.4 MB). Under cgroup v2 measurement, `memory.peak` dropped from 55.4 MB to 45.9 MB (-9.5 MB reduction in peak kernel footprint). Source lines reduced from 334 to 331 (-3 lines).
+  - *K-accounting:* Evaluated at target (T ~40 ms, S ~330): $\Delta S = -3 \implies \times 1.0014$; memory saving $\Delta M \approx -9.5\text{ MB} \implies \times 1.066$; net gain = $+6.8\% \ge 1\%$.
   - *Verdict:* Kept. Correctness verified on full, sample, tiny, 49/49 fuzz seeds, and threads 1/2/6/12.
