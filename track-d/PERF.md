@@ -12,6 +12,9 @@ Every step from the reference to your final version, each with the live-board ru
 | 5 | D1+D2+D9: parallel line-snapped parse and atomic packed CSR build | pending | 2.801 | 222 | 5.691 |
 | 6 | D6a: fast degree-zero shortcuts for unreachable query pairs | pending | 1.678 | 219.5 | 6.265 |
 | 7 | D8: open-addressed dynamic visited table reduces peak RSS | pending | 1.737 | 129.7 | 6.634 |
+| 8 | D10: one table probe per relaxation via DistTable::find_or_insert | pending | 1.719 | 129.9 | 8.235 |
+| 9 | D12: 0.75 load factor threshold reduces table resize frequency | pending | 1.710 | 130.4 | 8.312 |
+| 10 | D13: unified edge reader, atomic result vector & S cleanup (S=369) | pending | 1.592 | 130.8 | 8.723 |
 
 ### Experiment Log (Wave 1)
 - **Step 2 (D5 - Parallel queries):**
@@ -40,3 +43,17 @@ Every step from the reference to your final version, each with the live-board ru
   - *Hypothesis:* Preallocating 12 dense `vec![u64::MAX; n]` distance buffers consumed 167 MB heap. Replacing them with a dynamic open-addressed hash table (`DistTable`, initial $2^{16}$ slots, multiplicative Fibonacci hashing `>> shift`, touched list reset) will drastically reduce memory while keeping queries cache-local.
   - *Local relative result:* Hyperfine on full (10 runs, interleaved vs Step 6): 1.885 s -> 1.737 s (1.08x speedup). Peak RSS dropped dramatically from 219.4 MB to 129.7 MB (-89.7 MB, 41% memory reduction).
   - *Verdict:* Kept. Invariance verified for threads 1/2/6/12, 20/20 identical sample runs, 49/49 fuzz seeds passed. K estimate 6.634.
+
+### Experiment Log (Wave 3)
+- **Step 8 (D10 - One table probe per edge relaxation via DistTable::find_or_insert):**
+  - *Hypothesis:* During Dijkstra edge relaxations, calling `get()` followed by `set()` required two open-addressed hash table lookups and probe walks per relaxed edge. Consolidating into a single `find_or_insert` probe returning the slot index eliminates redundant hashing and linear probing in the innermost loop. Also hardened the boundary snapping loop against EOF infinite loops when `read_at` returns 0.
+  - *Local relative result:* Hyperfine on full (15 runs, interleaved vs Step 7): d_v2 1.895 s ± 0.138 s -> D10 1.719 s ± 0.190 s (1.10x faster, user CPU dropped from 22.4 s to 19.7 s). Peak RSS: 129.9 MB. S = 471 lines.
+  - *Verdict:* Kept. Invariance verified for threads 1/2/6/12, 20/20 identical sample runs, 49/49 fuzz seeds passed. Estimated K improves to ~8.235.
+- **Step 9 (D12 - DistTable initial capacity and growth policy tuning):**
+  - *Hypothesis:* Sizing experiments revealed initial capacity $2^{16}$ slots (65,536 slots) is optimal (avg 1.794s vs 1.904s at $2^{14}$ and 2.252s at $2^{17}$). Tuning the load factor threshold from 0.70 to 0.75 (`self.count * 4 >= self.keys.len() * 3`) avoids premature doubling on mid-sized queries while maintaining low linear probe lengths.
+  - *Local relative result:* Hyperfine on full (15 runs, interleaved vs Step 8): D10 1.806 s ± 0.181 s -> D12 1.782 s ± 0.150 s (1.01x faster, min 1.574 s). Peak RSS: 130.4 MB. S = 471 lines.
+  - *Verdict:* Kept. Invariance verified for threads 1/2/6/12, 20/20 identical sample runs, 49/49 fuzz seeds passed. Estimated K improves to ~8.312.
+- **Step 10 (D13 - Unified edge reader, atomic direct result vector, S reduction):**
+  - *Hypothesis:* Deduplicating the file chunk reading across Pass 1 and Pass 2 into a single generic `for_each_edge` helper, consolidating table probing into `slot_of`, and writing directly into a preallocated `Vec<AtomicI64>` inside `std::thread::scope` removes per-thread result vector allocations and join overhead while dropping source lines toward $\le 330$.
+  - *Local relative result:* Hyperfine on full (15 runs, interleaved vs d_v2 baseline): d_v2 1.745 s ± 0.157 s -> d_d13 1.592 s ± 0.056 s (1.10x speedup; min 1.512 s, user CPU dropped from 20.12 s to 18.86 s). Peak RSS: 130.8 MB. Source lines $S$ dropped from 471 to 369 (-102 lines / 22% reduction).
+  - *Verdict:* Kept. Invariance verified for threads 1/2/6/12, 20/20 identical sample runs, 49/49 fuzz seeds passed. Estimated K improves to 8.723 (Speed Score 47.03 / 100.0).
