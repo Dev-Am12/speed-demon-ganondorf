@@ -9,6 +9,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 2 | D5: parallel queries via std::thread::scope and AtomicUsize | pending | 3.716 | 239 | 5.355 |
 | 3 | D3: compact u32 offsets array; drops redundant working arrays | pending | 4.087 | 227 | 5.424 |
 | 4 | D4: flat 4-ary QuadHeap replaces BinaryHeap | pending | 3.214 | 227 | 5.567 |
+| 5 | D1+D2+D9: parallel line-snapped parse and atomic packed CSR build | pending | 2.801 | 222 | 5.691 |
 
 ### Experiment Log (Wave 1)
 - **Step 2 (D5 - Parallel queries):**
@@ -23,3 +24,9 @@ Every step from the reference to your final version, each with the live-board ru
   - *Hypothesis:* A 4-ary flat min-heap halves the tree depth compared to a binary heap ($\log_4(N) = \frac{1}{2}\log_2(N)$), halving bubble-up sift comparisons and aligning 4 contiguous child elements to a 64-byte cache line during pop sift-down.
   - *Local relative result:* Hyperfine on full (12 threads): 4.087 s -> 3.214 s (27% faster query processing). Peak RSS unchanged at 227.2 MB.
   - *Verdict:* Kept. Invariance verified for threads 1/2/6/12, 5/5 identical sample runs, 49/49 fuzz seeds passed. K estimate 5.567.
+
+### Experiment Log (Wave 2)
+- **Step 5 (D1+D2+D9 - Parallel parse & atomic packed CSR build):**
+  - *Hypothesis:* Graph parsing and CSR construction took 1.29s (36.3% of total time). Partitioning the graph file into line-snapped chunks using `FileExt::read_at` with small 64 KiB per-thread buffers, counting node out-degrees in parallel using `AtomicU32`, and populating a packed 64-bit edge array `(w << 32) | v` via atomic cursor slots will reduce CSR build time to <300 ms while eliminating dual targets/weights allocations.
+  - *Local relative result:* Hyperfine on full (10 runs, interleaved vs D4): 3.900 s -> 2.801 s (1.39x speedup). Peak RSS dropped from 227.2 MB to 222.7 MB (-4.5 MB). CSR build dropped from 1,290 ms to 289 ms (4.4x faster graph build).
+  - *Verdict:* Kept. Invariance verified for threads 1/2/6/12, 20/20 identical sample runs, 49/49 fuzz seeds passed. K estimate 5.691.
