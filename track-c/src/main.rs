@@ -9,7 +9,7 @@ use std::thread;
 
 const MAX_THREADS: usize = 12;
 const NAME_SLOTS: usize = 1 << 17;
-const INIT_AGG: [i64; 8] = [0, 0, 0, i64::MAX, i64::MIN, 0, 0, 0];
+const INIT_AGG: [i64; 9] = [0, 0, 0, i64::MAX, i64::MIN, 0, 0, 0, 0];
 
 // SAFETY: standard POSIX mmap ABI linked via libc.
 unsafe extern "C" {
@@ -41,6 +41,10 @@ fn wymix(a: u64, b: u64) -> u64 {
 
 #[inline(always)]
 unsafe fn hash_name_fast(p: *const u8, len: usize) -> u64 {
+    if len > 32 {
+        // SAFETY: caller guarantees [p, p + len) is readable.
+        return unsafe { hash_long(p, len) };
+    }
     // SAFETY: caller guarantees [p, p + 8) and [p + len - 8, p + len) lie in mapped/padded memory.
     unsafe {
         let sbits = (8 - len.min(8)) << 3;
@@ -59,8 +63,27 @@ unsafe fn hash_name_fast(p: *const u8, len: usize) -> u64 {
     }
 }
 
+/// Full-coverage hash for names longer than 32 bytes: every byte takes part.
+/// Reads 8-byte words at offsets 0, 8, ... while they fit, then one overlapping
+/// word at len-8 that covers the tail. Names of 32 bytes or less never use this.
+#[cold]
+#[inline(never)]
+unsafe fn hash_long(p: *const u8, len: usize) -> u64 {
+    // SAFETY: len > 32, so every read at i (i + 8 <= len) and at len - 8 is inside [p, p + len).
+    unsafe {
+        let mut h = (len as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0x517c_c1b7_2722_0a95;
+        let mut i = 0usize;
+        while i + 8 <= len {
+            h = wymix(h ^ p.add(i).cast::<u64>().read_unaligned(), 0xa076_1d64_78bd_642f);
+            i += 8;
+        }
+        let tail = p.add(len - 8).cast::<u64>().read_unaligned();
+        wymix(h ^ tail, 0xe703_7ed1_a0b4_28db) | 1
+    }
+}
+
 #[inline(always)]
-fn insert_name(keys: &[AtomicU64], masks: &[AtomicU64], h: u64, c: usize) {
+fn insert_name(keys: &[AtomicU64], masks: &[AtomicU64], h: u64, c: usize) -> bool {
     let (bit, w_off) = (1u64 << (c & 63), c >> 6);
     let mut idx = (h as usize) & (NAME_SLOTS - 1);
     loop {
@@ -76,9 +99,10 @@ fn insert_name(keys: &[AtomicU64], masks: &[AtomicU64], h: u64, c: usize) {
         if cur == h {
             let m = unsafe { masks.get_unchecked((idx << 2) + w_off) };
             if (m.load(Ordering::Relaxed) & bit) == 0 {
-                m.fetch_or(bit, Ordering::Relaxed);
+                // Exactly one thread can observe this bit as previously clear.
+                return (m.fetch_or(bit, Ordering::Relaxed) & bit) == 0;
             }
-            return;
+            return false;
         }
         idx = (idx + 1) & (NAME_SLOTS - 1);
     }
@@ -165,7 +189,7 @@ unsafe fn parse_chunk(
     num_countries: usize,
     keys: &[AtomicU64],
     masks: &[AtomicU64],
-) -> Vec<[i64; 8]> {
+) -> Vec<[i64; 9]> {
     let mut aggs = vec![INIT_AGG; num_countries];
     let mut seen = [0u64; 2048];
     let mut ubuf = vec![0u8; 512];
@@ -267,7 +291,9 @@ unsafe fn parse_chunk(
                         let c_tag = (h & !0xFFF) | ((country as u64) << 1) | 1;
                         if *seen.get_unchecked(c_idx) != c_tag {
                             *seen.get_unchecked_mut(c_idx) = c_tag;
-                            insert_name(keys, masks, h, country);
+                            if insert_name(keys, masks, h, country) {
+                                agg[8] += 1;
+                            }
                         }
                     }
                     agg[0] += 1;
@@ -342,7 +368,7 @@ fn main() -> io::Result<()> {
             std::slice::from_raw_parts(raw_masks.as_ptr().cast::<AtomicU64>(), NAME_SLOTS * 4),
         )
     };
-    let thread_aggs: Vec<Vec<[i64; 8]>> = thread::scope(|s| {
+    let thread_aggs: Vec<Vec<[i64; 9]>> = thread::scope(|s| {
         let mut hs = Vec::with_capacity(threads);
         for w in bounds.windows(2).filter(|w| w[0] < w[1]) {
             // SAFETY: x86-64-v3 + pclmulqdq is available on the target CPU.
@@ -355,24 +381,12 @@ fn main() -> io::Result<()> {
     let mut final_aggs = vec![INIT_AGG; num_countries];
     for t_agg in thread_aggs {
         for (dst, src) in final_aggs.iter_mut().zip(t_agg).filter(|(_, s)| s[0] > 0) {
-            for k in [0, 1, 2, 5, 6] {
+            for k in [0, 1, 2, 5, 6, 8] {
                 dst[k] += src[k];
             }
             dst[3] = dst[3].min(src[3]);
             dst[4] = dst[4].max(src[4]);
             dst[7] |= src[7];
-        }
-    }
-    let mut distinct_counts: Vec<i64> = final_aggs.iter().map(|a| a[7]).collect();
-    for (idx, k) in keys.iter().enumerate() {
-        if k.load(Ordering::Relaxed) != 0 {
-            for w_idx in 0..4 {
-                let mut w = masks[(idx << 2) + w_idx].load(Ordering::Relaxed);
-                while w != 0 {
-                    distinct_counts[w_idx * 64 + w.trailing_zeros() as usize] += 1;
-                    w &= w - 1;
-                }
-            }
         }
     }
     let mut order: Vec<usize> = (1..num_countries).collect();
@@ -387,7 +401,7 @@ fn main() -> io::Result<()> {
                 fmt_cents(agg[2]),
                 fmt_cents(agg[3]),
                 fmt_cents(agg[4]),
-                distinct_counts[c],
+                final_aggs[c][7] + final_aggs[c][8],
             );
             let _ = writeln!(
                 out,
