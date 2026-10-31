@@ -1,12 +1,79 @@
-// Track D (Traverse): single-threaded baseline (v0) in safe standard-library Rust.
+// Track D (Traverse): parallelized solution (v1) in safe standard-library Rust.
 // Implements the shortest path contract defined in specs/d-traverse.md.
-// No threads, no unsafe, no SIMD, no mmap, no custom hashers, no renumbering, no bidirectional search (GR-P2, PLAN §6, §7.3, §11).
+// No unsafe, no SIMD, no mmap, no custom hashers, no renumbering, no bidirectional search (GR-P2..P10, PLAN §6, §7.3, §11).
 
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// 4-ary flat min-heap of (u64, u32) priority items.
+/// Spec §3 & PLAN §7.3: shallower tree depth (log4 vs log2) and cache-line aligned child scanning.
+struct QuadHeap {
+    data: Vec<(u64, u32)>,
+}
+
+impl QuadHeap {
+    fn with_capacity(cap: usize) -> Self {
+        Self {
+            data: Vec::with_capacity(cap),
+        }
+    }
+
+    fn push(&mut self, item: (u64, u32)) {
+        let mut idx = self.data.len();
+        self.data.push(item);
+        // Sift up: parent is (idx - 1) / 4
+        while idx > 0 {
+            let parent = (idx - 1) >> 2;
+            // Safe index: parent < idx guaranteed by bit shift
+            if self.data[idx].0 < self.data[parent].0 {
+                self.data.swap(idx, parent);
+                idx = parent;
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn pop(&mut self) -> Option<(u64, u32)> {
+        if self.data.is_empty() {
+            return None;
+        }
+        let top = self.data.swap_remove(0);
+        if !self.data.is_empty() {
+            let mut idx = 0;
+            let len = self.data.len();
+            loop {
+                let first_child = (idx << 2) + 1;
+                if first_child >= len {
+                    break;
+                }
+                // Scan up to 4 contiguous children in a single cache line
+                let mut best_child = first_child;
+                let mut best_cost = self.data[first_child].0;
+                let last_child = (first_child + 4).min(len);
+                for c in (first_child + 1)..last_child {
+                    // Safe index: c < last_child <= len guaranteed by min(len)
+                    if self.data[c].0 < best_cost {
+                        best_cost = self.data[c].0;
+                        best_child = c;
+                    }
+                }
+                if best_cost < self.data[idx].0 {
+                    self.data.swap(idx, best_child);
+                    idx = best_child;
+                } else {
+                    break;
+                }
+            }
+        }
+        Some(top)
+    }
+
+    fn clear(&mut self) {
+        self.data.clear();
+    }
+}
 
 /// Parse the next unsigned decimal integer from line bytes starting at pos.
 fn parse_u32_field(line: &[u8], pos: &mut usize) -> u32 {
@@ -33,7 +100,7 @@ fn shortest_path(
     t: u32,
     dist: &mut [u64],
     touched: &mut Vec<u32>,
-    heap: &mut BinaryHeap<Reverse<(u64, u32)>>,
+    heap: &mut QuadHeap,
 ) -> i64 {
     // Spec §3: d(s, s) = 0 for every node, including isolated nodes and nodes with self-loops
     if s == t {
@@ -45,11 +112,11 @@ fn shortest_path(
     dist[s as usize] = 0;
     touched.push(s);
     // Heap tracks (cost, node); cost is u64 per Spec §3 (exceeds 2^32), node is u32
-    heap.push(Reverse((0, s)));
+    heap.push((0, s));
 
     let mut answer: i64 = -1;
 
-    while let Some(Reverse((d, u))) = heap.pop() {
+    while let Some((d, u)) = heap.pop() {
         // Safe index: u < n guaranteed by edge target bounds
         if d > dist[u as usize] {
             // Stale heap entry: u was already settled via a shorter path
@@ -80,7 +147,7 @@ fn shortest_path(
                     touched.push(v);
                 }
                 dist[v as usize] = next_d;
-                heap.push(Reverse((next_d, v)));
+                heap.push((next_d, v));
             }
         }
     }
@@ -253,7 +320,7 @@ fn main() {
                     // Pre-allocate thread-local query state buffers
                     let mut dist = vec![u64::MAX; n];
                     let mut touched = Vec::with_capacity(16 * 1024);
-                    let mut heap = BinaryHeap::with_capacity(16 * 1024);
+                    let mut heap = QuadHeap::with_capacity(16 * 1024);
                     let mut local_results = Vec::with_capacity(total_queries / num_threads + 16);
 
                     loop {
