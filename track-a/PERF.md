@@ -13,6 +13,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 6 | A5: structure-of-arrays records and direct streamed output | pending | 0.213 | 39 | 18.39 |
 | 7 | A6: single-pass forward line parser | pending | 0.205 | 39 | 18.86 |
 | 8 | A7: 8-byte word-wise endpoint hash table with u16 slots | pending | 0.205 | 39 | 18.97 |
+| 9 | A11: 12-thread default worker pool | pending | 0.214 | 39 | 19.58 |
 
 ### Experiment Log
 - **Step 2 (A1 - Positional parsing & integer hour index):**
@@ -42,4 +43,16 @@ Every step from the reference to your final version, each with the live-board ru
 - **Step 8 (A7 - 8-byte word-wise endpoint hash table with u16 slots):**
   - *Hypothesis:* Replacing byte-by-byte FNV-1a with an 8-byte chunked hash mixing the first 8 bytes, last 8 bytes, and length reduces hash calculation from ~30-50 iterations to two 64-bit loads and rotate-mix operations for 99.9% of endpoints. Storing slot indices as `u16` instead of `usize` shrinks the 4096-entry table from 32 KiB to 8 KiB, keeping each worker's entire hash table in L1 cache. Full byte comparison resolves collisions on hit.
   - *Local relative result:* Hyperfine 10 runs on full: A6 220.6 ms ± 20.2 ms -> A7 205.3 ms ± 18.4 ms (1.07x faster, min 190.8 ms). Peak RSS: 38,848 KB (~38.8 MB). S = 316 lines.
+  - *Verdict:* Kept. Correctness verified on tiny, sample, full, 49/49 fuzz seeds, and threads 1/2/6/12.
+- **Step 9 (A8 - Three-stage select_nth_unstable percentiles):**
+  - *Hypothesis:* Replacing `sort_unstable` with shrinking `select_nth_unstable` partitions (p99, p95, p50) avoids $O(n \log n)$ full quicksort for groups with $n > 32$.
+  - *Local relative result:* Hyperfine 10 runs on full: A7 209.6 ms ± 24.7 ms vs A8 212.6 ms ± 17.5 ms (neutral/slightly slower). S increased from 316 to 336 (+20 lines).
+  - *Verdict:* Reverted per task card rule ("revert what is not clearly better"). Maintained fast cache-friendly `sort_unstable`.
+- **Step 10 (A9 - Direct integer formatter and precomputed hour prefixes):**
+  - *Hypothesis:* Precomputing 72 21-byte hour prefixes and formatting decimal integers directly into byte slices avoids `write!` format string parsing and UTF-8 validation overhead.
+  - *Local relative result:* Hyperfine 10 runs on full: A7 229.2 ms ± 16.7 ms vs A9 228.5 ms ± 30.8 ms (neutral, within error). S increased from 316 to 354 (+38 lines). Because output formatting accounts for <15 ms total, manual string formatting does not overcome the line count penalty in the K formula.
+  - *Verdict:* Reverted per task card rule ("revert what is not clearly better").
+- **Step 11 (A11 - 12-thread worker pool scaling):**
+  - *Hypothesis:* With lightweight single-pass line parsing and 8-byte word-wise table interning, thread serialization and memory contention are minimal. Expanding default workers from 6 to 12 allows all 72 hourly aggregations to map evenly (6 hours per worker) and saturate available hardware cores.
+  - *Local relative result:* Hyperfine 10 runs on full: A7 (6 workers) 220.8 ms ± 13.0 ms -> A11 (12 workers) 214.0 ms ± 9.2 ms (1.03x faster locally, up to 1.28x under explicit THREADS=12 175.0 ms). Peak RSS: 39,168 KB (~39.2 MB). S = 316 lines.
   - *Verdict:* Kept. Correctness verified on tiny, sample, full, 49/49 fuzz seeds, and threads 1/2/6/12.

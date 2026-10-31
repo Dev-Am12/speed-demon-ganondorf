@@ -163,7 +163,7 @@ fn main() {
         return;
     }
 
-    let default_workers = 6usize;
+    let default_workers = 12usize;
     let requested_workers = std::env::var("THREADS")
         .ok()
         .and_then(|v| v.parse().ok())
