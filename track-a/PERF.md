@@ -19,6 +19,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 12 | A16: SWAR 8-byte word scan for endpoint boundaries | pending | 0.135 | 41 | 22.84 |
 | 13 | A9: direct integer formatting and precomputed hour prefixes | pending | 0.134 | 44 | 23.80 |
 | 14 | A17: buffer sizing, table streamlining, and thread constants | pending | 0.133 | 43 | 24.50 |
+| 15 | Thread tuning: 6-thread default for cgroup safety and low jitter | pending | 0.131 | 41 | 25.40 |
 
 ### Experiment Log
 - **Step 2 (A1 - Positional parsing & integer hour index):**
@@ -86,3 +87,8 @@ Every step from the reference to your final version, each with the live-board ru
   - *Local relative result:* Hyperfine 20 runs on full: 147.4 ms ± 25.8 ms -> 146.0 ms ± 25.4 ms. User CPU time dropped from 651.2 ms to 601.1 ms (-50.1 ms CPU time). Peak RSS: 42.8 MB. Source lines $S = 360$ (-12 lines). Docker run time: 0.94 s.
   - *K-accounting:* Evaluated at target (T ~40 ms, S ~330): $\Delta T \approx 1.4\text{ ms} \implies \times 1.018$; $\Delta S = -12 \implies \times 1.0056$; net gain = $+2.4\% \ge 1\%$.
   - *Verdict:* Kept. Correctness verified on full, sample, tiny, 49/49 fuzz seeds, and threads 1/2/6/12.
+- **Step 17 (Thread tuning: 6-thread default for cgroup safety and low jitter):**
+  - *Hypothesis:* On 6 physical cores, 6 worker threads avoid hyperthreading context switching, reduce glibc arena allocations, and lower system time by 64% (from 541 ms to 194 ms). Peak cgroup memory drops from 50.95 MB to 40.80 MB, fitting safely under strict 50 MB cgroup memory limits.
+  - *Local relative result:* Hyperfine 10 runs on full: 12-thread 184.5 ms ± 49.4 ms -> 6-thread 145.6 ms ± 25.0 ms (1.27x speedup). Cgroup `memory.peak` drops from 50.95 MB to 40.80 MB (-10.15 MB, 20% reduction). Anonymous RSS drops to 34.2 MB. Minor page faults drop from 11,116 to 9,104. S = 360 lines (0 net line change).
+  - *K-accounting:* Evaluated at target (T ~40 ms, S ~330): $\Delta T \approx -4.2\text{ ms} \implies \times 1.057$; $\Delta M \approx -10.15\text{ MB} \implies \times 1.071$; net gain = $+13.2\% \ge 1\%$.
+  - *Verdict:* Kept. Correctness verified on full, sample, tiny, 49/49 fuzz seeds, and threads 1/2/6/8/12.
