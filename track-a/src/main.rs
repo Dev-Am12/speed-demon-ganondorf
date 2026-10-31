@@ -173,9 +173,9 @@ fn parse_line(buf: &[u8], pos: usize, local: &mut Local) -> usize {
 }
 
 fn parse_worker_range(file: &File, mut start: usize, end: usize) -> Local {
-    // Spec §3: Minimum request line length is 40 bytes:
-    // 27 (timestamp) + 4 (spaces) + 3 (method) + 1 (endpoint) + 3 (status) + 1 (latency) + 1 (LF) = 40.
-    let cap = ((end - start) / 40).max(64);
+    // Estimate one hour's share of the worker's chunk rather than worst case;
+    // vectors grow normally if an hour is bigger than this initial capacity.
+    let cap = ((end - start) / 40 / HOURS).max(64);
     let mut local = Local {
         table: Table::new(),
         hours: (0..HOURS)
