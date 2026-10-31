@@ -259,16 +259,24 @@ fn main() {
     names.dedup();
     let num_endpoints = names.len();
 
-    let remaps: Vec<Vec<u16>> = locals
-        .iter()
-        .map(|l| {
-            l.table
-                .names
-                .iter()
-                .map(|n| names.binary_search(n).unwrap() as u16)
-                .collect()
-        })
-        .collect();
+    let remaps: Vec<Vec<u16>> = thread::scope(|scope| {
+        let mut tasks = Vec::new();
+        for local in &locals {
+            let names = &names;
+            tasks.push(scope.spawn(move || {
+                local
+                    .table
+                    .names
+                    .iter()
+                    .map(|n| names.binary_search(n).unwrap() as u16)
+                    .collect()
+            }));
+        }
+        tasks
+            .into_iter()
+            .map(|t| t.join().expect("remap worker panicked"))
+            .collect()
+    });
 
     let mut prefixes = [[0u8; 21]; HOURS];
     for (hour, p) in prefixes.iter_mut().enumerate() {
