@@ -2,11 +2,10 @@ use std::ffi::c_void;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::thread;
 
 const MAX_THREADS: usize = 12;
-const QUERY_BLOCK_SIZE: usize = 256;
 const PROT_READ: i32 = 1;
 const MAP_PRIVATE: i32 = 2;
 const DENSE_TAG: u32 = 1 << 31;
@@ -339,13 +338,21 @@ where
     }
 }
 
-fn document_ranges(doc_count: usize, workers: usize) -> Vec<(u32, u32)> {
+fn segment_document_ranges(start: u32, end: u32, workers: usize) -> Vec<(u32, u32)> {
+    let len = (end - start) as usize;
     (0..workers)
         .map(|i| {
-            (
-                (doc_count * i / workers) as u32,
-                (doc_count * (i + 1) / workers) as u32,
-            )
+            let a = if i == 0 {
+                0
+            } else {
+                (len * i / workers / 64) * 64
+            };
+            let b = if i + 1 == workers {
+                len
+            } else {
+                (len * (i + 1) / workers / 64) * 64
+            };
+            (start + a as u32, start + b as u32)
         })
         .collect()
 }
@@ -451,6 +458,7 @@ fn scan_chunk_write(
     starts: &[u32],
     doc_start: u32,
     doc_end: u32,
+    segment_base: u32,
     vocab: &Vocabulary,
     states: &mut TermStates,
     bases: &[u32],
@@ -460,6 +468,7 @@ fn scan_chunk_write(
 ) {
     for doc_id in doc_start..doc_end {
         let local = doc_id - doc_start;
+        let segment_id = doc_id - segment_base;
         let (a, b) = text_bounds(docs, starts, doc_id as usize);
         if a < b {
             scan_doc_tokens(&docs[a..b], |tok| {
@@ -472,17 +481,17 @@ fn scan_chunk_write(
                                 return true;
                             }
                             if r.is_dense() {
-                                let slot = r.start as usize + (doc_id as usize >> 6);
+                                let slot = r.start as usize + (segment_id as usize >> 6);
                                 unsafe {
                                     bits.get_unchecked(slot)
-                                        .fetch_or(1u64 << (doc_id & 63), Ordering::Relaxed);
+                                        .fetch_or(1u64 << (segment_id & 63), Ordering::Relaxed);
                                 }
                             } else {
                                 let slot = unsafe { *bases.get_unchecked(i) } + cursor;
                                 unsafe {
                                     sparse
                                         .get_unchecked(slot as usize)
-                                        .store(doc_id, Ordering::Relaxed);
+                                        .store(segment_id, Ordering::Relaxed);
                                 }
                             }
                         }
@@ -545,14 +554,15 @@ impl SetView<'_> {
     }
 }
 
-struct PostingIndex {
-    sparse: Vec<u32>,
-    bitsets: Vec<u64>,
-    sets: Vec<TermRef>,
+#[derive(Clone, Copy)]
+struct PostingIndex<'a> {
+    sparse: &'a [u32],
+    bitsets: &'a [u64],
+    sets: &'a [TermRef],
     doc_count: usize,
 }
 
-impl PostingIndex {
+impl PostingIndex<'_> {
     #[inline(always)]
     fn view(&self, term_id: u32) -> SetView<'_> {
         let r = self.sets[term_id as usize];
@@ -625,7 +635,7 @@ fn eval_step(
     acc: Acc,
     rhs_id: u32,
     op: Op,
-    postings: &PostingIndex,
+    postings: &PostingIndex<'_>,
     scratch: &mut Scratch,
     threshold: usize,
 ) -> Acc {
@@ -755,45 +765,74 @@ fn push_u64(out: &mut Vec<u8>, mut v: u64) {
     out.extend_from_slice(&buf[i..]);
 }
 
-fn append_view_result(out: &mut Vec<u8>, view: SetView<'_>, doc_count: usize) {
-    let mut sum = 0u64;
-    let mut first = [0u32; 10];
-    let mut fc = 0usize;
-    let count = match view {
+#[derive(Clone, Copy, Default)]
+struct QueryPart {
+    count: u32,
+    sum: u64,
+    ids: [u32; 10],
+    len: u8,
+}
+
+#[derive(Default)]
+struct QueryAccum {
+    count: u64,
+    sum: u64,
+    ids: [u32; 10],
+    len: u8,
+}
+
+impl QueryAccum {
+    fn add_segment(&mut self, part: QueryPart, base: u32) {
+        self.count += part.count as u64;
+        self.sum += part.sum + base as u64 * part.count as u64;
+        for &id in &part.ids[..part.len as usize] {
+            if self.len < 10 {
+                self.ids[self.len as usize] = base + id;
+                self.len += 1;
+            }
+        }
+    }
+}
+
+fn result_from_view(view: SetView<'_>, doc_count: usize) -> QueryPart {
+    let mut result = QueryPart::default();
+    match view {
         SetView::List(ids) => {
+            result.count = ids.len() as u32;
             for &id in ids {
-                sum += id as u64;
-                if fc < 10 {
-                    first[fc] = id;
-                    fc += 1;
+                result.sum += id as u64;
+                if result.len < 10 {
+                    result.ids[result.len as usize] = id;
+                    result.len += 1;
                 }
             }
-            ids.len()
         }
         SetView::Bits(words) => {
-            let mut c = 0usize;
-            for (wi, &w) in words.iter().enumerate() {
-                let mut rem = w;
+            for (wi, &word) in words.iter().enumerate() {
+                let mut rem = word;
                 while rem != 0 {
                     let id = wi * 64 + rem.trailing_zeros() as usize;
                     if id < doc_count {
-                        c += 1;
-                        sum += id as u64;
-                        if fc < 10 {
-                            first[fc] = id as u32;
-                            fc += 1;
+                        result.count += 1;
+                        result.sum += id as u64;
+                        if result.len < 10 {
+                            result.ids[result.len as usize] = id as u32;
+                            result.len += 1;
                         }
                     }
                     rem &= rem - 1;
                 }
             }
-            c
         }
-    };
-    push_u64(out, count as u64);
+    }
+    result
+}
+
+fn write_accum(out: &mut Vec<u8>, result: &QueryAccum) {
+    push_u64(out, result.count);
     out.push(b' ');
-    push_u64(out, sum);
-    for &id in &first[..fc] {
+    push_u64(out, result.sum);
+    for &id in &result.ids[..result.len as usize] {
         out.push(b' ');
         push_u64(out, id as u64);
     }
@@ -893,15 +932,15 @@ fn parse_queries(
 }
 
 fn evaluate_query(
-    output: &mut Vec<u8>,
     query: &Query,
     docs: &[u8],
     doc_starts: &[u32],
-    postings: &PostingIndex,
+    doc_base: u32,
+    postings: &PostingIndex<'_>,
     vocab: &Vocabulary,
     scratch: &mut Scratch,
     threshold: usize,
-) {
+) -> QueryPart {
     match query {
         Query::Bool { terms, ops, len } => {
             let count = *len as usize;
@@ -914,7 +953,7 @@ fn evaluate_query(
                 Acc::List => SetView::List(&scratch.cur_list),
                 Acc::Bits => SetView::Bits(&scratch.cur_bits),
             };
-            append_view_result(output, view, postings.doc_count);
+            result_from_view(view, postings.doc_count)
         }
         Query::Phrase { terms, len } => {
             let len = *len as usize;
@@ -928,8 +967,7 @@ fn evaluate_query(
             order[..len].sort_unstable_by_key(|&i| postings.sets[phrase[i] as usize].df());
             let seed = phrase[order[0]];
             if postings.sets[seed as usize].df() == 0 {
-                output.extend_from_slice(b"0 0\n");
-                return;
+                return QueryPart::default();
             }
             let mut filters = [0u32; 8];
             let mut fcount = 0usize;
@@ -948,7 +986,7 @@ fn evaluate_query(
                         return false;
                     }
                 }
-                let (ts, te) = text_bounds(docs, doc_starts, doc_id as usize);
+                let (ts, te) = text_bounds(docs, doc_starts, (doc_base + doc_id) as usize);
                 phrase_matches_text(&docs[ts as usize..te as usize], &pkeys[..len])
             };
             match postings.view(seed) {
@@ -977,7 +1015,7 @@ fn evaluate_query(
                     }
                 }
             }
-            append_view_result(output, SetView::List(matches), postings.doc_count);
+            result_from_view(SetView::List(matches), postings.doc_count)
         }
     }
 }
@@ -985,8 +1023,8 @@ fn evaluate_query(
 fn run(docs: &[u8]) -> io::Result<()> {
     let query_bytes = fs::read("/data/queries.txt")?;
     let mut vocab = Vocabulary::new();
-    let mut keep_posting = Vec::new();
-    let queries = parse_queries(&query_bytes, &mut vocab, &mut keep_posting);
+    let mut bool_terms = Vec::new();
+    let queries = parse_queries(&query_bytes, &mut vocab, &mut bool_terms);
     drop(query_bytes);
 
     let threads = thread::available_parallelism()
@@ -996,194 +1034,206 @@ fn run(docs: &[u8]) -> io::Result<()> {
         .max(1);
     let doc_starts = build_document_starts(docs, threads)?;
     let total_docs = doc_starts.len() - 1;
-    let scan_workers = threads
-        .max(total_docs.div_ceil(u16::MAX as usize))
-        .min(MAX_THREADS);
-    let ranges = document_ranges(total_docs, scan_workers);
-    let packed_states = ranges.iter().all(|(a, b)| b - a <= u16::MAX as u32);
-    let mut chunk_counts: Vec<ChunkCount> = thread::scope(|scope| {
-        let handles: Vec<_> = ranges
-            .iter()
-            .map(|&(a, b)| {
-                let v = &vocab;
-                let starts = &doc_starts;
-                scope.spawn(move || scan_chunk_count(docs, starts, a, b, v, packed_states))
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-    let mut df = vec![0u32; vocab.len()];
-    for c in &chunk_counts {
-        for t in 0..vocab.len() {
-            df[t] += c.states.value(t);
+    let min_segments = total_docs.div_ceil(u16::MAX as usize).max(1);
+    let nominal = total_docs.div_ceil(min_segments);
+    let segment_size = nominal.div_ceil(64).saturating_mul(64).max(64);
+    let mut segments = Vec::new();
+    if total_docs == 0 {
+        segments.push((0u32, 0u32));
+    } else {
+        let mut start = 0usize;
+        while start < total_docs {
+            let end = (start + segment_size).min(total_docs);
+            segments.push((start as u32, end as u32));
+            start = end;
         }
     }
 
-    for q in &queries {
-        if let Query::Phrase { terms, len } = q {
-            let len = *len as usize;
-            let mut ord = *terms;
-            ord[..len].sort_unstable_by_key(|&tid| (df[tid as usize], tid));
-            let mut distinct = 0usize;
-            let mut previous = u32::MAX;
-            for &tid in &ord[..len] {
-                if tid != previous {
-                    if distinct < 2 {
-                        keep_posting[tid as usize] = true;
+    let mut accumulated: Vec<QueryAccum> = std::iter::repeat_with(QueryAccum::default)
+        .take(queries.len())
+        .collect();
+    let query_workers = threads.min(queries.len().max(1));
+    let mut scratches: Vec<Scratch> = std::iter::repeat_with(|| Scratch::new(0))
+        .take(query_workers)
+        .collect();
+
+    for &(segment_base, segment_end) in &segments {
+        let segment_docs = (segment_end - segment_base) as usize;
+        let scan_workers = threads.min(segment_docs.max(1));
+        let ranges = segment_document_ranges(segment_base, segment_end, scan_workers);
+        let packed_states = ranges.iter().all(|(a, b)| b - a <= u16::MAX as u32);
+        let mut chunk_counts: Vec<ChunkCount> = thread::scope(|scope| {
+            let handles: Vec<_> = ranges
+                .iter()
+                .map(|&(a, b)| {
+                    let v = &vocab;
+                    let starts = &doc_starts;
+                    scope.spawn(move || scan_chunk_count(docs, starts, a, b, v, packed_states))
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let mut df = vec![0u32; vocab.len()];
+        for c in &chunk_counts {
+            for t in 0..vocab.len() {
+                df[t] += c.states.value(t);
+            }
+        }
+
+        let mut keep = bool_terms.clone();
+        for q in &queries {
+            if let Query::Phrase { terms, len } = q {
+                let len = *len as usize;
+                let mut ord = *terms;
+                ord[..len].sort_unstable_by_key(|&tid| (df[tid as usize], tid));
+                let mut previous = u32::MAX;
+                let mut distinct = 0usize;
+                for &tid in &ord[..len] {
+                    if tid != previous {
+                        if distinct < 2 {
+                            keep[tid as usize] = true;
+                        }
+                        distinct += 1;
+                        previous = tid;
                     }
-                    distinct += 1;
-                    previous = tid;
-                }
-                if df[tid as usize] < 2048 {
-                    keep_posting[tid as usize] = true;
                 }
             }
         }
-    }
 
-    let threshold = (total_docs / 32).max(1);
-    let word_count = total_docs.div_ceil(64) as u32;
-    let mut term_refs = vec![
-        TermRef {
-            start: 0,
-            tagged_len: 0,
-        };
-        vocab.len()
-    ];
-    let mut sparse_total = 0u32;
-    let mut bitset_total = 0u32;
-    for t in 0..vocab.len() {
-        let f = df[t];
-        if !keep_posting[t] {
-            term_refs[t] = TermRef {
+        let dense_threshold = (total_docs / 32).max(1);
+        let word_count = segment_docs.div_ceil(64);
+        let mut refs = vec![
+            TermRef {
                 start: 0,
-                tagged_len: SKIP_TAG,
+                tagged_len: 0
             };
-        } else if f as usize >= threshold {
-            term_refs[t] = TermRef {
-                start: bitset_total,
-                tagged_len: DENSE_TAG | f,
-            };
-            bitset_total += word_count;
-        } else {
-            term_refs[t] = TermRef {
-                start: sparse_total,
-                tagged_len: f,
-            };
-            sparse_total += f;
-        }
-    }
-
-    let mut thread_term_bases = Vec::with_capacity(chunk_counts.len());
-    let mut running = term_refs.iter().map(|r| r.start).collect::<Vec<u32>>();
-    for c in &chunk_counts {
-        let mut bases = vec![0u32; vocab.len()];
+            vocab.len()
+        ];
+        let mut sparse_total = 0u32;
+        let mut bitset_total = 0u32;
         for t in 0..vocab.len() {
-            bases[t] = running[t];
-            if !term_refs[t].is_dense() && !term_refs[t].is_skip() {
-                running[t] += c.states.value(t);
+            let f = df[t];
+            if !keep[t] {
+                refs[t] = TermRef {
+                    start: 0,
+                    tagged_len: SKIP_TAG,
+                };
+            } else if f as usize >= dense_threshold {
+                refs[t] = TermRef {
+                    start: bitset_total,
+                    tagged_len: DENSE_TAG | f,
+                };
+                bitset_total += word_count as u32;
+            } else {
+                refs[t] = TermRef {
+                    start: sparse_total,
+                    tagged_len: f,
+                };
+                sparse_total += f;
             }
         }
-        thread_term_bases.push(bases);
-    }
-    drop(running);
 
-    let mut sparse = vec![0u32; sparse_total as usize];
-    let mut bitsets = vec![0u64; bitset_total as usize];
-    {
-        let sparse_atom: &[AtomicU32] = AtomicU32::from_mut_slice(&mut sparse);
-        let bitset_atom: &[AtomicU64] = AtomicU64::from_mut_slice(&mut bitsets);
-        for chunk in &mut chunk_counts {
-            chunk.states.reset();
+        let mut bases = Vec::with_capacity(chunk_counts.len());
+        let mut running = refs.iter().map(|r| r.start).collect::<Vec<u32>>();
+        for c in &chunk_counts {
+            let mut thread_base = vec![0u32; vocab.len()];
+            for t in 0..vocab.len() {
+                thread_base[t] = running[t];
+                if !refs[t].is_dense() && !refs[t].is_skip() {
+                    running[t] += c.states.value(t);
+                }
+            }
+            bases.push(thread_base);
         }
-        thread::scope(|s| {
-            for (i, chunk) in chunk_counts.iter_mut().enumerate() {
-                let (d_base, d_end) = ranges[i];
-                let starts = &doc_starts;
-                let t_base = &thread_term_bases[i];
-                let v = &vocab;
-                let t_refs = &term_refs;
-                let states = &mut chunk.states;
-                s.spawn(move || {
-                    scan_chunk_write(
-                        docs,
-                        starts,
-                        d_base,
-                        d_end,
-                        v,
-                        states,
-                        t_base,
-                        t_refs,
-                        sparse_atom,
-                        bitset_atom,
-                    )
+        drop(running);
+        for c in &mut chunk_counts {
+            c.states.reset();
+        }
+
+        let mut sparse = vec![0u32; sparse_total as usize];
+        let mut bitsets = vec![0u64; bitset_total as usize];
+        {
+            let sparse_atom: &[AtomicU32] = AtomicU32::from_mut_slice(&mut sparse);
+            let bitset_atom: &[AtomicU64] = AtomicU64::from_mut_slice(&mut bitsets);
+            thread::scope(|scope| {
+                for (i, c) in chunk_counts.iter_mut().enumerate() {
+                    let (a, b) = ranges[i];
+                    let starts = &doc_starts;
+                    let v = &vocab;
+                    let state = &mut c.states;
+                    let base = &bases[i];
+                    let refs = &refs;
+                    scope.spawn(move || {
+                        scan_chunk_write(
+                            docs,
+                            starts,
+                            a,
+                            b,
+                            segment_base,
+                            v,
+                            state,
+                            base,
+                            refs,
+                            sparse_atom,
+                            bitset_atom,
+                        )
+                    });
+                }
+            });
+        }
+        drop(bases);
+        drop(chunk_counts);
+        let postings = PostingIndex {
+            sparse: &sparse,
+            bitsets: &bitsets,
+            sets: &refs,
+            doc_count: segment_docs,
+        };
+
+        let local_threshold = (segment_docs / 32).max(1);
+        let mut accum_rest = &mut accumulated[..];
+        let mut scratch_iter = scratches.iter_mut();
+        let mut q_start = 0usize;
+        thread::scope(|scope| {
+            for worker in 0..query_workers {
+                let q_end = queries.len() * (worker + 1) / query_workers;
+                let take = q_end - q_start;
+                let (acc_slice, rest) = accum_rest.split_at_mut(take);
+                let q_slice = &queries[q_start..q_end];
+                let starts_ref = &doc_starts;
+                let vocab_ref = &vocab;
+                let postings_ref = &postings;
+                let scratch = scratch_iter.next().unwrap();
+                scratch.cur_bits.resize(word_count, 0);
+                scratch.tmp_bits.resize(word_count, 0);
+                scope.spawn(move || {
+                    for (query, acc) in q_slice.iter().zip(acc_slice) {
+                        let part = evaluate_query(
+                            query,
+                            docs,
+                            starts_ref,
+                            segment_base,
+                            postings_ref,
+                            vocab_ref,
+                            scratch,
+                            local_threshold,
+                        );
+                        acc.add_segment(part, segment_base);
+                    }
                 });
+                accum_rest = rest;
+                q_start = q_end;
             }
         });
     }
-    drop(thread_term_bases);
-    drop(chunk_counts);
 
-    let postings = PostingIndex {
-        sparse,
-        bitsets,
-        sets: term_refs,
-        doc_count: total_docs,
-    };
-
-    let block_count = queries.len().div_ceil(QUERY_BLOCK_SIZE);
-    let next_block = AtomicUsize::new(0);
-    let worker_results: Vec<Vec<(usize, Vec<u8>)>> = thread::scope(|s| {
-        let handles: Vec<_> = (0..threads.min(block_count.max(1)))
-            .map(|_| {
-                let q_ref = &queries;
-                let starts_ref = &doc_starts;
-                let p_ref = &postings;
-                let v_ref = &vocab;
-                let nb_ref = &next_block;
-                s.spawn(move || {
-                    let mut scratch = Scratch::new(word_count as usize);
-                    let mut local_blocks = Vec::new();
-                    loop {
-                        let b = nb_ref.fetch_add(1, Ordering::Relaxed);
-                        if b >= block_count {
-                            break;
-                        }
-                        let start = b * QUERY_BLOCK_SIZE;
-                        let end = (start + QUERY_BLOCK_SIZE).min(q_ref.len());
-                        let mut out = Vec::with_capacity((end - start) * 32);
-                        for q in &q_ref[start..end] {
-                            evaluate_query(
-                                &mut out,
-                                q,
-                                docs,
-                                starts_ref,
-                                p_ref,
-                                v_ref,
-                                &mut scratch,
-                                threshold,
-                            );
-                        }
-                        local_blocks.push((b, out));
-                    }
-                    local_blocks
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-
-    let mut ordered = vec![Vec::new(); block_count];
-    for list in worker_results {
-        for (b, out) in list {
-            ordered[b] = out;
-        }
+    let mut output = Vec::with_capacity(queries.len() * 32);
+    for result in &accumulated {
+        write_accum(&mut output, result);
     }
     fs::create_dir_all("/out")?;
     let mut file = File::create("/out/results.txt")?;
-    for out in &ordered {
-        file.write_all(out)?;
-    }
+    file.write_all(&output)?;
     file.flush()?;
     drop(file);
     std::process::exit(0);
