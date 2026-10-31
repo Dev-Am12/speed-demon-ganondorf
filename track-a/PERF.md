@@ -9,6 +9,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 2 | A1: positional fixed-offset parsing and integer hour mapping | pending | 2.510 | 36 | 8.25 |
 | 3 | A2: open-addressed compact endpoint table with word-wise hash | pending | 2.180 | 36 | 8.85 |
 | 4 | A3: parallel line-snapped streaming parse and chronological assembly | pending | 1.004 | 52 | 11.45 |
+| 5 | A4: FNV-1a interning and line count reduction (S=287) | pending | 1.010 | 52 | 11.15 |
 
 ### Experiment Log
 - **Step 2 (A1 - Positional parsing & integer hour index):**
@@ -21,5 +22,9 @@ Every step from the reference to your final version, each with the live-board ru
   - *Verdict:* Kept. Correctness verified on tiny, sample, and full.
 - **Step 4 (A3 - Parallel streaming parse, 6-byte records, chronological formatting):**
   - *Hypothesis:* Chunking `requests.log` with small 64 KiB streaming buffers per worker avoids 240 MB chunk allocations. Packing records to 6 bytes (`u32 latency` + `u16 id|err<<15`) keeps records under 25 MB. Reusable thread-local hour accumulators and strictly ordered `hour_outputs` guarantee chronological output and low peak RSS.
-  - *Local relative result:* Hyperfine 10 runs on full: baseline v0 2.764 s -> v1 1.004 s (2.75x speedup). Peak RSS dropped from 271 MB to 52 MB (/usr/bin/time -v). S = 285 lines. Estimated K = 11.45 (vs v0 baseline 7.92).
+  - *Local relative result:* Hyperfine 10 runs on full: baseline v0 2.764 s -> v1 1.004 s (2.75x speedup). Peak RSS dropped from 271 MB to 52 MB (/usr/bin/time -v). S = 320 lines.
   - *Verdict:* Kept. Thread count invariance (1, 2, 6, 12), 5-run determinism, and 49/49 fuzz seeds passed.
+- **Step 5 (A4 - FNV-1a interning and line count reduction):**
+  - *Hypothesis:* Replacing word-wise hashing with 64-bit FNV-1a, merging formatted timestamp output into the summary line writer, and eliminating redundant helper functions reduces source code lines $S$ towards $\le 300$ while maintaining identical throughput and cache locality.
+  - *Local relative result:* Hyperfine 10 runs on full: 1.010 s ± 0.067 s (2.66x faster than v0 2.684 s). Peak RSS: 52,708 KB (~52.7 MB). Source lines $S = 287$ (Rust 280, Dockerfile 7), $D = 1$. Estimated $K = 11.15$ (vs baseline 7.92).
+  - *Verdict:* Kept. Passed L0-L3, 5 identical runs, 49/49 fuzz seeds, and thread count invariance.

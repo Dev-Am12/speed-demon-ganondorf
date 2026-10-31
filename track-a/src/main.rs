@@ -11,6 +11,7 @@ use std::thread;
 
 const HOURS: usize = 72;
 const CHUNK_SIZE: usize = 64 * 1024;
+const DATES: [&str; 4] = ["2026-10-30", "2026-10-31", "2026-11-01", "2026-11-02"];
 
 struct Table {
     slots: Vec<usize>,
@@ -26,19 +27,15 @@ impl Table {
     }
 
     fn hash(name: &[u8]) -> u64 {
-        let mut h = 0x9e3779b97f4a7c15u64 ^ name.len() as u64;
-        for part in name.chunks(8) {
-            let mut word = [0u8; 8];
-            word[..part.len()].copy_from_slice(part);
-            let x = u64::from_le_bytes(word).wrapping_add(0x9e3779b97f4a7c15);
-            h ^= (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-            h = h.rotate_left(27).wrapping_mul(5).wrapping_add(0x52dce729);
+        let mut h = 0xcbf29ce484222325u64;
+        for &b in name {
+            h = (h ^ b as u64).wrapping_mul(0x100000001b3);
         }
-        h ^ (h >> 33)
+        h
     }
 
     fn intern(&mut self, name: &[u8]) -> u16 {
-        if (self.names.len() + 1) * 10 >= self.slots.len() * 7 {
+        if (self.names.len() + 1) * 2 >= self.slots.len() {
             let mut next = vec![0; self.slots.len() * 2];
             let mask = next.len() - 1;
             for (id, n) in self.names.iter().enumerate() {
@@ -60,7 +57,7 @@ impl Table {
                 self.slots[i] = id + 1;
                 return id as u16;
             }
-            if self.names[slot - 1].as_slice() == name {
+            if self.names[slot - 1] == name {
                 return (slot - 1) as u16;
             }
             i = (i + 1) & mask;
@@ -81,12 +78,8 @@ struct Local {
 
 #[inline(always)]
 fn hour_index(line: &[u8]) -> usize {
-    let day_of_month = (line[8] - b'0') as usize * 10 + (line[9] - b'0') as usize;
-    let day_idx = if line[6] == b'0' {
-        day_of_month - 30
-    } else {
-        1 + day_of_month
-    };
+    let day = (line[8] - b'0') as usize * 10 + (line[9] - b'0') as usize;
+    let day_idx = if line[6] == b'0' { day - 30 } else { 1 + day };
     let hour = ((line[11] - b'0') * 10 + line[12] - b'0') as usize;
     day_idx * 24 + hour - 18
 }
@@ -146,27 +139,9 @@ fn parse_worker_range(file: &File, mut start: usize, end: usize) -> Local {
     local
 }
 
-fn hour_text(index: usize, out: &mut Vec<u8>) {
-    const DATES: [[u8; 10]; 4] = [
-        *b"2026-10-30",
-        *b"2026-10-31",
-        *b"2026-11-01",
-        *b"2026-11-02",
-    ];
-    out.extend_from_slice(&DATES[(index + 18) / 24]);
-    out.push(b'T');
-    let hour = (index + 18) % 24;
-    out.push(b'0' + (hour / 10) as u8);
-    out.push(b'0' + (hour % 10) as u8);
-    out.extend_from_slice(b":00:00Z ");
-}
-
 #[inline(always)]
 fn percentile_values(latencies: &mut [u32]) -> (u32, u32, u32) {
     let n = latencies.len();
-    if n == 1 {
-        return (latencies[0], latencies[0], latencies[0]);
-    }
     let a = (50 * n + 99) / 100 - 1;
     let b = (95 * n + 99) / 100 - 1;
     let c = (99 * n + 99) / 100 - 1;
@@ -227,7 +202,7 @@ fn main() {
 
     let mut names = Vec::new();
     for local in &locals {
-        names.extend(local.table.names.iter().cloned());
+        names.extend_from_slice(&local.table.names);
     }
     names.sort_unstable();
     names.dedup();
@@ -235,12 +210,11 @@ fn main() {
 
     let remaps: Vec<Vec<u16>> = locals
         .iter()
-        .map(|local| {
-            local
-                .table
+        .map(|l| {
+            l.table
                 .names
                 .iter()
-                .map(|name| names.binary_search(name).unwrap() as u16)
+                .map(|n| names.binary_search(n).unwrap() as u16)
                 .collect()
         })
         .collect();
@@ -285,6 +259,8 @@ fn main() {
                     }
 
                     let mut out = Vec::with_capacity(32 * 1024);
+                    let (h, d) = ((hour + 18) % 24, (hour + 18) / 24);
+                    let date_str = DATES[d];
                     for ep in 0..num_endpoints {
                         let lats = &mut hour_lats[ep];
                         let n = lats.len();
@@ -293,16 +269,10 @@ fn main() {
                         }
                         let (p50, p95, p99) = percentile_values(lats);
                         let errors = hour_errs[ep];
-                        hour_text(hour, &mut out);
-                        out.extend_from_slice(&names[ep]);
+                        let ep_name = std::str::from_utf8(&names[ep]).unwrap();
                         let _ = write!(
                             out,
-                            " {} {} {} {} {} {}\n",
-                            n,
-                            p50,
-                            p95,
-                            p99,
-                            errors,
+                            "{date_str}T{h:02}:00:00Z {ep_name} {n} {p50} {p95} {p99} {errors} {}\n",
                             errors as u64 * 1_000_000 / n as u64
                         );
                     }
@@ -322,11 +292,7 @@ fn main() {
             hour_outputs[hour] = out;
         }
     }
-    let output_len: usize = hour_outputs.iter().map(Vec::len).sum();
-    let mut output_bytes = Vec::with_capacity(output_len);
-    for part in hour_outputs {
-        output_bytes.extend_from_slice(&part);
-    }
+    let output_bytes = hour_outputs.concat();
 
     let out = File::create(output).expect("cannot create summary.txt");
     let mut writer = BufWriter::with_capacity(256 * 1024, out);
