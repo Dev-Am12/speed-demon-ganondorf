@@ -251,6 +251,8 @@ impl TermStates {
 
 struct ChunkCount {
     states: TermStates,
+    events: Vec<u32>,
+    doc_offsets: Vec<u32>,
 }
 
 #[inline(always)]
@@ -437,68 +439,67 @@ fn scan_chunk_count(
     packed: bool,
 ) -> ChunkCount {
     let mut states = TermStates::new(vocab.len(), packed);
+    let mut events = Vec::new();
+    // Document offsets keep replay hits grouped so pass two needs no tokenizer pass.
+    let mut doc_offsets = Vec::with_capacity((doc_end - doc_start) as usize + 1);
+    doc_offsets.push(0);
     for doc_id in doc_start..doc_end {
         let (a, b) = text_bounds(docs, starts, doc_id as usize);
         if a < b {
             scan_doc_tokens(&docs[a..b], |tok| {
                 if let Some((lo, hi)) = tok {
                     if let Some(id) = vocab.get_key(lo, hi) {
+                        events.push(id);
                         states.record(id as usize, doc_id - doc_start);
                     }
                 }
                 true
             });
         }
+        doc_offsets.push(events.len() as u32);
     }
-    ChunkCount { states }
+    ChunkCount {
+        states,
+        events,
+        doc_offsets,
+    }
 }
 
 fn scan_chunk_write(
-    docs: &[u8],
-    starts: &[u32],
     doc_start: u32,
-    doc_end: u32,
     segment_base: u32,
-    vocab: &Vocabulary,
+    events: &[u32],
+    doc_offsets: &[u32],
     states: &mut TermStates,
     bases: &[u32],
     refs: &[TermRef],
     sparse: &[AtomicU32],
     bits: &[AtomicU64],
 ) {
-    for doc_id in doc_start..doc_end {
-        let local = doc_id - doc_start;
-        let segment_id = doc_id - segment_base;
-        let (a, b) = text_bounds(docs, starts, doc_id as usize);
-        if a < b {
-            scan_doc_tokens(&docs[a..b], |tok| {
-                if let Some((lo, hi)) = tok {
-                    if let Some(id) = vocab.get_key(lo, hi) {
-                        let i = id as usize;
-                        if let Some(cursor) = states.record(i, local) {
-                            let r = unsafe { *refs.get_unchecked(i) };
-                            if r.is_skip() {
-                                return true;
-                            }
-                            if r.is_dense() {
-                                let slot = r.start as usize + (segment_id as usize >> 6);
-                                unsafe {
-                                    bits.get_unchecked(slot)
-                                        .fetch_or(1u64 << (segment_id & 63), Ordering::Relaxed);
-                                }
-                            } else {
-                                let slot = unsafe { *bases.get_unchecked(i) } + cursor;
-                                unsafe {
-                                    sparse
-                                        .get_unchecked(slot as usize)
-                                        .store(segment_id, Ordering::Relaxed);
-                                }
-                            }
-                        }
+    for local in 0..doc_offsets.len() - 1 {
+        let segment_id = doc_start + local as u32 - segment_base;
+        for &id in &events[doc_offsets[local] as usize..doc_offsets[local + 1] as usize] {
+            let i = id as usize;
+            if let Some(cursor) = states.record(i, local as u32) {
+                let r = unsafe { *refs.get_unchecked(i) };
+                if r.is_skip() {
+                    continue;
+                }
+                if r.is_dense() {
+                    let slot = r.start as usize + (segment_id as usize >> 6);
+                    unsafe {
+                        bits.get_unchecked(slot)
+                            .fetch_or(1u64 << (segment_id & 63), Ordering::Relaxed);
+                    }
+                } else {
+                    let slot = unsafe { *bases.get_unchecked(i) } + cursor;
+                    unsafe {
+                        sparse
+                            .get_unchecked(slot as usize)
+                            .store(segment_id, Ordering::Relaxed);
                     }
                 }
-                true
-            });
+            }
         }
     }
 }
@@ -1034,7 +1035,7 @@ fn run(docs: &[u8]) -> io::Result<()> {
         .max(1);
     let doc_starts = build_document_starts(docs, threads)?;
     let total_docs = doc_starts.len() - 1;
-    let min_segments = total_docs.div_ceil(u16::MAX as usize).max(1);
+    let min_segments = total_docs.div_ceil(u16::MAX as usize).max(16);
     let nominal = total_docs.div_ceil(min_segments);
     let segment_size = nominal.div_ceil(64).saturating_mul(64).max(64);
     let mut segments = Vec::new();
@@ -1157,20 +1158,18 @@ fn run(docs: &[u8]) -> io::Result<()> {
             let bitset_atom: &[AtomicU64] = AtomicU64::from_mut_slice(&mut bitsets);
             thread::scope(|scope| {
                 for (i, c) in chunk_counts.iter_mut().enumerate() {
-                    let (a, b) = ranges[i];
-                    let starts = &doc_starts;
-                    let v = &vocab;
+                    let a = ranges[i].0;
                     let state = &mut c.states;
+                    let events = &c.events;
+                    let doc_offsets = &c.doc_offsets;
                     let base = &bases[i];
                     let refs = &refs;
                     scope.spawn(move || {
                         scan_chunk_write(
-                            docs,
-                            starts,
                             a,
-                            b,
                             segment_base,
-                            v,
+                            events,
+                            doc_offsets,
                             state,
                             base,
                             refs,
