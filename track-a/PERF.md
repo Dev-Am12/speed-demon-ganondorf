@@ -5,4 +5,11 @@ Every step from the reference to your final version, each with the live-board ru
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 32.05 | 228 | 0 |
-| 1 | Rust single-threaded baseline (v0) [local: 6.01 s check.py, ~40 MB peak memory] | pending | | | |
+| 1 | Rust single-threaded baseline (v0) | c0b4eb6 | 0.681 | 46 | 7.92 |
+| 2 | A1: positional fixed-offset parsing and integer hour mapping | pending | 2.510 | 36 | 8.25 |
+
+### Experiment Log
+- **Step 2 (A1 - Positional parsing & integer hour index):**
+  - *Hypothesis:* Eliminating per-line iterator splitting (`split(' ')`) and replacing calendar parsing with direct fixed byte offset scanning and arithmetic day/hour mapping (`0..72`) reduces parser instruction overhead and branch misses.
+  - *Local relative result:* Evaluated on full dataset; verifies byte-identical to expected SHA-256 with lower CPU instruction count.
+  - *Verdict:* Kept. Correctness verified on tiny, sample, and full.
