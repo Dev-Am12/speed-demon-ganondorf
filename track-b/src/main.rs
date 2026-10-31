@@ -11,6 +11,7 @@ const MAP_PRIVATE: i32 = 2;
 const DENSE_TAG: u32 = 1 << 31;
 const SKIP_TAG: u32 = u32::MAX;
 
+// SAFETY: the declared mmap ABI uses only fixed-width POSIX arguments and returns an opaque pointer.
 unsafe extern "C" {
     fn mmap(
         address: *mut c_void,
@@ -71,6 +72,7 @@ impl Vocabulary {
         let mask = self.slots.len() - 1;
         let mut idx = mix64(lo ^ hi.rotate_left(29)) as usize & mask;
         loop {
+            // SAFETY: idx is masked by slots.len() - 1, and slots has power-of-two length.
             let id = unsafe { *self.slots.get_unchecked(idx) };
             if id == u32::MAX {
                 return None;
@@ -263,6 +265,7 @@ where
     let mut i = 0usize;
     let n = text.len();
     while i < n {
+        // SAFETY: the outer loop maintains i < text.len().
         let b0 = unsafe { BYTE_MAP[*text.get_unchecked(i) as usize] };
         if b0 == 0 {
             i += 1;
@@ -272,6 +275,7 @@ where
         let mut shift = 8u32;
         i += 1;
         while i < n && shift < 64 {
+            // SAFETY: the loop condition maintains i < text.len().
             let b = unsafe { BYTE_MAP[*text.get_unchecked(i) as usize] };
             if b == 0 {
                 break;
@@ -280,6 +284,7 @@ where
             shift += 8;
             i += 1;
         }
+        // SAFETY: short-circuiting ensures i < n before indexing.
         if i == n || unsafe { BYTE_MAP[*text.get_unchecked(i) as usize] } == 0 {
             if !on_token(Some((lo, 0))) {
                 return;
@@ -290,6 +295,7 @@ where
         let mut hi = 0u64;
         shift = 0;
         while i < n && shift < 64 {
+            // SAFETY: the loop condition maintains i < text.len().
             let b = unsafe { BYTE_MAP[*text.get_unchecked(i) as usize] };
             if b == 0 {
                 break;
@@ -298,6 +304,7 @@ where
             shift += 8;
             i += 1;
         }
+        // SAFETY: short-circuiting ensures i < n before indexing.
         if i == n || unsafe { BYTE_MAP[*text.get_unchecked(i) as usize] } == 0 {
             if !on_token(Some((lo, hi))) {
                 return;
@@ -308,6 +315,7 @@ where
         let mut extra = [0u8; 16];
         let mut extra_len = 0usize;
         while i < n {
+            // SAFETY: the loop condition maintains i < text.len().
             let b = unsafe { BYTE_MAP[*text.get_unchecked(i) as usize] };
             if b == 0 {
                 break;
@@ -481,18 +489,22 @@ fn scan_chunk_write(
         for &id in &events[doc_offsets[local] as usize..doc_offsets[local + 1] as usize] {
             let i = id as usize;
             if let Some(cursor) = states.record(i, local as u32) {
+                // SAFETY: every event id came from a successful vocabulary lookup.
                 let r = unsafe { *refs.get_unchecked(i) };
                 if r.is_skip() {
                     continue;
                 }
                 if r.is_dense() {
                     let slot = r.start as usize + (segment_id as usize >> 6);
+                    // SAFETY: r.start reserves a full segment bitset and segment_id is in this segment.
                     unsafe {
                         bits.get_unchecked(slot)
                             .fetch_or(1u64 << (segment_id & 63), Ordering::Relaxed);
                     }
                 } else {
+                    // SAFETY: i is a vocabulary id and bases has one entry per term.
                     let slot = unsafe { *bases.get_unchecked(i) } + cursor;
+                    // SAFETY: the prefix base and pass-one df reserve every unique event write.
                     unsafe {
                         sparse
                             .get_unchecked(slot as usize)
@@ -538,6 +550,7 @@ impl SetView<'_> {
             Self::List(ids) => ids.binary_search(&id).is_ok(),
             Self::Bits(words) => {
                 let idx = id as usize;
+                // SAFETY: ids passed here come from postings bounded by this index.
                 (unsafe { *words.get_unchecked(idx >> 6) } & (1u64 << (idx & 63))) != 0
             }
         }
@@ -1035,6 +1048,7 @@ fn run(docs: &[u8]) -> io::Result<()> {
         .max(1);
     let doc_starts = build_document_starts(docs, threads)?;
     let total_docs = doc_starts.len() - 1;
+    // Sixteen segments kept measured replay events below the 8 MiB target on full.
     let min_segments = total_docs.div_ceil(u16::MAX as usize).max(16);
     let nominal = total_docs.div_ceil(min_segments);
     let segment_size = nominal.div_ceil(64).saturating_mul(64).max(64);
@@ -1194,6 +1208,7 @@ fn run(docs: &[u8]) -> io::Result<()> {
         let mut scratch_iter = scratches.iter_mut();
         let mut q_start = 0usize;
         thread::scope(|scope| {
+            // Fixed contiguous slices give each worker disjoint accumulators and scratch.
             for worker in 0..query_workers {
                 let q_end = queries.len() * (worker + 1) / query_workers;
                 let take = q_end - q_start;
@@ -1245,6 +1260,7 @@ fn main() -> io::Result<()> {
     if len == 0 {
         return run(&[]);
     }
+    // SAFETY: len is nonzero and <= isize::MAX; the live input fd maps this range and MAP_FAILED is checked before forming the immutable slice.
     unsafe {
         let ptr = mmap(
             std::ptr::null_mut(),
