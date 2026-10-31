@@ -1,3 +1,4 @@
+use std::arch::x86_64::*;
 use std::ffi::c_void;
 use std::fs::{self, File};
 use std::io::{self, Write};
@@ -81,37 +82,41 @@ struct Vocab {
 }
 
 impl Vocab {
+    /// Home index and 13-bit tag from one mixing step (tag bits are independent of index bits).
     #[inline(always)]
-    fn home(k: (u64, u64), mask: usize) -> usize {
-        // One-multiply avalanche for table placement. Full key equality is still checked
-        // on every probe, so this changes collision distribution, never token identity.
+    fn home(k: (u64, u64), mask: usize) -> (usize, u32) {
         let mut x = k.0 ^ k.1.rotate_left(29);
         x ^= x >> 30;
         x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        (x ^ (x >> 27)) as usize & mask
+        x ^= x >> 27;
+        ((x as usize) & mask, (x >> 51) as u32)
     }
 
+    /// Slot layout: 0 = empty, otherwise (tag << 19) | (id + 1). Ids stay below 2^19 - 1.
     fn place(slots: &mut [u32], keys: &[(u64, u64)], id: u32) {
         let mask = slots.len() - 1;
-        let mut i = Self::home(keys[id as usize], mask);
-        while slots[i] != u32::MAX {
+        let (mut i, tag) = Self::home(keys[id as usize], mask);
+        while slots[i] != 0 {
             i = (i + 1) & mask;
         }
-        slots[i] = id;
+        slots[i] = (tag << 19) | (id + 1);
     }
 
     #[inline(always)]
     fn get(&self, k: (u64, u64)) -> Option<u32> {
         let mask = self.slots.len() - 1;
-        let mut i = Self::home(k, mask);
+        let (mut i, tag) = Self::home(k, mask);
         loop {
             // SAFETY: i is masked by slots.len() - 1 and slots has a power-of-two length.
-            let id = unsafe { *self.slots.get_unchecked(i) };
-            if id == u32::MAX {
+            let e = unsafe { *self.slots.get_unchecked(i) };
+            if e == 0 {
                 return None;
             }
-            if self.keys[id as usize] == k {
-                return Some(id);
+            if e >> 19 == tag {
+                let id = (e & 0x7_FFFF) - 1;
+                if self.keys[id as usize] == k {
+                    return Some(id);
+                }
             }
             i = (i + 1) & mask;
         }
@@ -123,7 +128,7 @@ impl Vocab {
             return id;
         }
         if (self.keys.len() + 1) * 2 > self.slots.len() {
-            let mut next = vec![u32::MAX; self.slots.len() * 2];
+            let mut next = vec![0u32; self.slots.len() * 2];
             for id in 0..self.keys.len() as u32 {
                 Self::place(&mut next, &self.keys, id);
             }
@@ -131,6 +136,7 @@ impl Vocab {
         }
         self.keys.push(k);
         let id = self.keys.len() as u32 - 1;
+        assert!(id + 1 < (1 << 19), "vocabulary too large for tagged slots");
         Self::place(&mut self.slots, &self.keys, id);
         id
     }
@@ -238,6 +244,133 @@ fn scan<F: FnMut(usize, Option<(u64, u64)>) -> bool>(t: &[u8], mut i: usize, mut
         i += 1;
     }
     n
+}
+
+/// AVX2 block classifier: returns (alphanumeric mask, LF mask) for 64 bytes at p.
+#[inline(always)]
+unsafe fn classify64(p: *const u8) -> (u64, u64) {
+    // SAFETY: caller guarantees 64 readable bytes at p.
+    unsafe {
+        let v0 = _mm256_loadu_si256(p.cast::<__m256i>());
+        let v1 = _mm256_loadu_si256(p.add(32).cast::<__m256i>());
+        let alnum = |v: __m256i| {
+            let d = _mm256_and_si256(
+                _mm256_cmpgt_epi8(v, _mm256_set1_epi8(0x2F)),
+                _mm256_cmpgt_epi8(_mm256_set1_epi8(0x3A), v),
+            );
+            let u = _mm256_and_si256(
+                _mm256_cmpgt_epi8(v, _mm256_set1_epi8(0x40)),
+                _mm256_cmpgt_epi8(_mm256_set1_epi8(0x5B), v),
+            );
+            let l = _mm256_and_si256(
+                _mm256_cmpgt_epi8(v, _mm256_set1_epi8(0x60)),
+                _mm256_cmpgt_epi8(_mm256_set1_epi8(0x7B), v),
+            );
+            _mm256_or_si256(d, _mm256_or_si256(u, l))
+        };
+        let nl = _mm256_set1_epi8(b'\n' as i8);
+        let a = (_mm256_movemask_epi8(alnum(v0)) as u32 as u64)
+            | ((_mm256_movemask_epi8(alnum(v1)) as u32 as u64) << 32);
+        let lf = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, nl)) as u32 as u64)
+            | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, nl)) as u32 as u64) << 32);
+        (a, lf)
+    }
+}
+
+/// Key of the token starting at s. Tokens of 1..=15 bytes take a 16-byte load; anything
+/// longer (or too close to the end of the buffer) uses the exact scalar tokenizer.
+#[inline(always)]
+unsafe fn token_key(t: &[u8], s: usize) -> Option<(u64, u64)> {
+    if s + 16 <= t.len() {
+        // SAFETY: s + 16 <= t.len().
+        unsafe {
+            let v = _mm_loadu_si128(t.as_ptr().add(s).cast::<__m128i>());
+            let up = _mm_and_si128(
+                _mm_cmpgt_epi8(v, _mm_set1_epi8(0x40)),
+                _mm_cmpgt_epi8(_mm_set1_epi8(0x5B), v),
+            );
+            let lo_c = _mm_and_si128(
+                _mm_cmpgt_epi8(v, _mm_set1_epi8(0x60)),
+                _mm_cmpgt_epi8(_mm_set1_epi8(0x7B), v),
+            );
+            let dg = _mm_and_si128(
+                _mm_cmpgt_epi8(v, _mm_set1_epi8(0x2F)),
+                _mm_cmpgt_epi8(_mm_set1_epi8(0x3A), v),
+            );
+            let alnum = (_mm_movemask_epi8(_mm_or_si128(up, _mm_or_si128(lo_c, dg))) as u32)
+                & 0xFFFF;
+            if alnum != 0xFFFF {
+                let len = (!alnum).trailing_zeros() as usize; // 1..=15
+                let lowered = _mm_or_si128(v, _mm_and_si128(up, _mm_set1_epi8(0x20)));
+                let mut b = [0u8; 16];
+                _mm_storeu_si128(b.as_mut_ptr().cast::<__m128i>(), lowered);
+                let w0 = u64::from_le_bytes(b[0..8].try_into().unwrap());
+                let w1 = u64::from_le_bytes(b[8..16].try_into().unwrap());
+                let lo = if len >= 8 { w0 } else { w0 & ((1u64 << (8 * len)) - 1) };
+                let hi = if len <= 8 { 0 } else { w1 & ((1u64 << (8 * (len - 8))) - 1) };
+                return Some((lo, hi));
+            }
+        }
+    }
+    // Exact scalar path for long tokens and the last few bytes of the buffer.
+    let end = s + t[s..].iter().take_while(|&&c| BYTE_MAP[c as usize] != 0).count();
+    let mut key = None;
+    scan(&t[s..end], 0, |_, k| {
+        key = k;
+        true
+    });
+    key
+}
+
+/// Same contract as `scan`, for text that starts at a token boundary: it classifies 64 bytes
+/// per step and visits token starts found in the masks instead of every byte.
+#[target_feature(enable = "avx2,bmi1,bmi2,popcnt")]
+unsafe fn scan_avx2<F: FnMut(usize, Option<(u64, u64)>) -> bool>(
+    t: &[u8],
+    i0: usize,
+    mut f: F,
+) -> usize {
+    let n = t.len();
+    let mut prev = 0u64; // 1 when the byte before the current block is alphanumeric
+    let mut p = i0;
+    let mut tail = [0u8; 64];
+    while p < n {
+        let (alnum, lf) = if p + 64 <= n {
+            // SAFETY: p + 64 <= n.
+            unsafe { classify64(t.as_ptr().add(p)) }
+        } else {
+            let rem = n - p;
+            tail[..rem].copy_from_slice(&t[p..]);
+            tail[rem..].fill(0);
+            // SAFETY: tail has 64 bytes.
+            unsafe { classify64(tail.as_ptr()) }
+        };
+        let starts = alnum & !((alnum << 1) | prev);
+        prev = alnum >> 63;
+        let limit = if lf != 0 { lf.trailing_zeros() } else { 64 };
+        let mut bits = if limit >= 64 { starts } else { starts & ((1u64 << limit) - 1) };
+        while bits != 0 {
+            let b = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            let pos = p + b;
+            // SAFETY: pos < n.
+            if !f(pos, unsafe { token_key(t, pos) }) {
+                return n;
+            }
+        }
+        if lf != 0 {
+            return p + limit as usize;
+        }
+        p += 64;
+    }
+    n
+}
+
+/// Safe entry point; the binary is built for x86-64-v3, so AVX2 and BMI are always present.
+#[inline(always)]
+fn scan_fast<F: FnMut(usize, Option<(u64, u64)>) -> bool>(t: &[u8], i0: usize, f: F) -> usize {
+    // SAFETY: x86-64-v3 includes AVX2, BMI1, BMI2 and POPCNT (see the Dockerfile).
+    unsafe { scan_avx2(t, i0, f) }
 }
 
 // ------------------------------------------------------------------- threads
@@ -382,7 +515,7 @@ fn pass1(
             .filter(|&p| head[p] == b'\t')
             .map(|p| pos + p + 1);
         let end = match tab {
-            Some(ts) => scan(&docs[..b], ts, |_, tok| {
+            Some(ts) => scan_fast(&docs[..b], ts, |_, tok| {
                 if let Some(t) = tok.and_then(|k| vocab.get(k)) {
                     let t = t as usize;
                     if last[t] != doc {
@@ -418,7 +551,7 @@ fn pass2(
     cursor.fill(0);
     for (d, &(s, e)) in spans.iter().enumerate() {
         let d = d as u16;
-        scan(&docs[s as usize..e as usize], 0, |offset, tok| {
+        scan_fast(&docs[s as usize..e as usize], 0, |offset, tok| {
             if let Some(t) = tok.and_then(|k| vocab.get(k)) {
                 let t = t as usize;
                 if positional[t] {
@@ -942,7 +1075,7 @@ fn eval(q: &Query, plans: &[PhrasePlan], docs: &[u8], sh: &Shard, sc: &mut Scrat
 fn run(docs: &[u8]) -> io::Result<()> {
     let qb = fs::read("/data/queries.txt")?;
     let mut vocab = Vocab {
-        slots: vec![u32::MAX; 16],
+        slots: vec![0u32; 16],
         keys: Vec::new(),
     };
     let (mut queries, mut plans) = parse_queries(&qb, &mut vocab);
