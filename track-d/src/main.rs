@@ -6,6 +6,7 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Parse the next unsigned decimal integer from line bytes starting at pos.
 fn parse_u32_field(line: &[u8], pos: &mut usize) -> u32 {
@@ -198,11 +199,6 @@ fn main() {
     }
     drop(cur_offsets);
 
-    // Pre-allocate query state buffers to eliminate per-query allocation
-    let mut dist = vec![u64::MAX; n];
-    let mut touched = Vec::with_capacity(16 * 1024);
-    let mut heap = BinaryHeap::with_capacity(16 * 1024);
-
     // Open queries file
     let qfile = match File::open(&queries_path) {
         Ok(f) => f,
@@ -212,11 +208,9 @@ fn main() {
         }
     };
     let mut qreader = BufReader::with_capacity(64 * 1024, qfile);
+    let mut queries = Vec::with_capacity(2048);
 
-    // In-memory output buffer for single atomic write (PLAN §6 item 3)
-    let mut out_buf = Vec::with_capacity(32 * 1024);
-
-    // Process queries sequentially in input order (Spec §4)
+    // Read all query pairs into memory before parallel search
     loop {
         line_buf.clear();
         let bytes_read = qreader
@@ -232,19 +226,73 @@ fn main() {
         let mut p = 0;
         let s = parse_u32_field(&line_buf, &mut p);
         let t = parse_u32_field(&line_buf, &mut p);
+        queries.push((s, t));
+    }
 
-        let ans = shortest_path(
-            &offsets,
-            &targets,
-            &weights,
-            s,
-            t,
-            &mut dist,
-            &mut touched,
-            &mut heap,
-        );
+    let total_queries = queries.len();
+    let mut results = vec![-1i64; total_queries];
 
-        // Write answer followed by LF (Spec §4: decimal integer or -1)
+    if total_queries > 0 {
+        // At most 12 threads per competition rules; configurable via THREADS env var
+        let default_threads = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(1)
+            .min(12);
+        let num_threads = std::env::var("THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default_threads)
+            .clamp(1, 12);
+
+        let query_counter = AtomicUsize::new(0);
+
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(num_threads);
+            for _ in 0..num_threads {
+                handles.push(scope.spawn(|| {
+                    // Pre-allocate thread-local query state buffers
+                    let mut dist = vec![u64::MAX; n];
+                    let mut touched = Vec::with_capacity(16 * 1024);
+                    let mut heap = BinaryHeap::with_capacity(16 * 1024);
+                    let mut local_results = Vec::with_capacity(total_queries / num_threads + 16);
+
+                    loop {
+                        let idx = query_counter.fetch_add(1, Ordering::Relaxed);
+                        if idx >= total_queries {
+                            break;
+                        }
+                        // Safe index: idx < total_queries verified by atomic loop check
+                        let (s, t) = queries[idx];
+                        let ans = shortest_path(
+                            &offsets,
+                            &targets,
+                            &weights,
+                            s,
+                            t,
+                            &mut dist,
+                            &mut touched,
+                            &mut heap,
+                        );
+                        local_results.push((idx, ans));
+                    }
+                    local_results
+                }));
+            }
+
+            for handle in handles {
+                // Collect results from worker threads and assign to output order
+                for (idx, ans) in handle.join().expect("worker thread panicked") {
+                    // Safe index: idx < results.len() guaranteed by query index bounds
+                    results[idx] = ans;
+                }
+            }
+        });
+    }
+
+    // In-memory output buffer for single atomic write (PLAN §6 item 3)
+    let mut out_buf = Vec::with_capacity(32 * 1024);
+    for ans in results {
+        // Format decimal integer distance or -1 followed by LF (Spec §4)
         writeln!(out_buf, "{}", ans).expect("writing to in-memory Vec<u8> cannot fail");
     }
 
