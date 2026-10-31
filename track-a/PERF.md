@@ -18,6 +18,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 11 | A10: pipelined streaming output via mpsc channel | pending | 0.149 | 42 | 21.35 |
 | 12 | A16: SWAR 8-byte word scan for endpoint boundaries | pending | 0.135 | 41 | 22.84 |
 | 13 | A9: direct integer formatting and precomputed hour prefixes | pending | 0.134 | 44 | 23.80 |
+| 14 | A17: buffer sizing, table streamlining, and thread constants | pending | 0.133 | 43 | 24.50 |
 
 ### Experiment Log
 - **Step 2 (A1 - Positional parsing & integer hour index):**
@@ -79,4 +80,9 @@ Every step from the reference to your final version, each with the live-board ru
   - *Hypothesis:* Precomputing 72 21-byte hour prefixes and formatting decimal integers directly into byte slices avoids `write!` format string parsing, UTF-8 validation overhead, and allows eliminating all `Arc` wrappers by borrowing stack variables directly across `thread::scope`.
   - *Local relative result:* Hyperfine 20 runs on full: 139.0 ms ± 18.0 ms -> 134.1 ms ± 23.6 ms (saving 4.9 ms wall time, min 111.4 ms). User CPU time dropped from 656.6 ms to 610.9 ms (-45.7 ms CPU time). Peak RSS: 43.8 MB. Source lines $S = 372$ (+26 lines).
   - *K-accounting:* Evaluated at target (T ~40 ms, S ~330): $\Delta T \approx 4.0\text{ ms} \implies \times 1.0541$; $\Delta S = +26 \implies \times 0.9887$; net gain = $+4.22\% \ge 1\%$.
+  - *Verdict:* Kept. Correctness verified on full, sample, tiny, 49/49 fuzz seeds, and threads 1/2/6/12.
+- **Step 16 (A17 - Output buffer pre-sizing, dead table resize removal, and compile-time thread constants):**
+  - *Hypothesis:* Pre-sizing hour output buffers to 160 KiB eliminates all dynamic vector reallocations during formatting. Removing dead table-resize checks (catalogue fixed at 1,842 endpoints < 4,096 table capacity) eliminates unneeded branches in the line parser. Compile-time thread constants `PARSE_WORKERS = 12` and `AGG_WORKERS = 12` ensure predictable worker sizing without environment variable overhead.
+  - *Local relative result:* Hyperfine 20 runs on full: 147.4 ms ± 25.8 ms -> 146.0 ms ± 25.4 ms. User CPU time dropped from 651.2 ms to 601.1 ms (-50.1 ms CPU time). Peak RSS: 42.8 MB. Source lines $S = 360$ (-12 lines). Docker run time: 0.94 s.
+  - *K-accounting:* Evaluated at target (T ~40 ms, S ~330): $\Delta T \approx 1.4\text{ ms} \implies \times 1.018$; $\Delta S = -12 \implies \times 1.0056$; net gain = $+2.4\% \ge 1\%$.
   - *Verdict:* Kept. Correctness verified on full, sample, tiny, 49/49 fuzz seeds, and threads 1/2/6/12.

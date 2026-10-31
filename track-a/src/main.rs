@@ -11,6 +11,8 @@ use std::thread;
 
 const HOURS: usize = 72;
 const CHUNK_SIZE: usize = 64 * 1024;
+const PARSE_WORKERS: usize = 12;
+const AGG_WORKERS: usize = 12;
 const DATES: [&str; 4] = ["2026-10-30", "2026-10-31", "2026-11-01", "2026-11-02"];
 
 struct Table {
@@ -44,22 +46,7 @@ impl Table {
     }
 
     fn intern(&mut self, name: &[u8]) -> u16 {
-        let mut mask = self.slots.len() - 1;
-        if self.names.len() * 2 >= self.slots.len() {
-            let mut next = vec![0u16; self.slots.len() * 2];
-            let next_mask = next.len() - 1;
-            for (id, n) in self.names.iter().enumerate() {
-                let mut i = Self::hash(n) & next_mask;
-                while next[i] != 0 {
-                    i = (i + 1) & next_mask;
-                }
-                next[i] = (id + 1) as u16;
-            }
-            self.slots = next;
-            mask = self.slots.len() - 1;
-        }
-
-        let mut i = Self::hash(name) & mask;
+        let mut i = Self::hash(name) & 4095;
         loop {
             let slot = self.slots[i];
             if slot == 0 {
@@ -71,7 +58,7 @@ impl Table {
             if self.names[(slot - 1) as usize] == name {
                 return slot - 1;
             }
-            i = (i + 1) & mask;
+            i = (i + 1) & 4095;
         }
     }
 }
@@ -221,18 +208,22 @@ fn main() {
         return;
     }
 
-    let default_workers = 12usize;
-    let requested_workers = std::env::var("THREADS")
+    let parse_workers = std::env::var("THREADS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(default_workers)
+        .unwrap_or(PARSE_WORKERS)
+        .min(len.div_ceil(CHUNK_SIZE))
         .clamp(1, 12);
-    let workers = requested_workers.min(len.div_ceil(CHUNK_SIZE)).max(1);
+    let agg_workers = std::env::var("THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(AGG_WORKERS)
+        .clamp(1, 12);
 
-    let mut bounds = vec![0; workers + 1];
+    let mut bounds = vec![0; parse_workers + 1];
     let mut buf = [0u8; 1024];
-    for w in 1..workers {
-        let mut pos = len * w / workers;
+    for w in 1..parse_workers {
+        let mut pos = len * w / parse_workers;
         while let Ok(n) = file.read_at(&mut buf[..1024.min(len - pos)], pos as u64) {
             if let Some(i) = buf[..n].iter().position(|&b| b == b'\n') {
                 pos += i + 1;
@@ -242,7 +233,7 @@ fn main() {
         }
         bounds[w] = pos;
     }
-    bounds[workers] = len;
+    bounds[parse_workers] = len;
     bounds.dedup();
 
     let locals: Vec<Local> = thread::scope(|scope| {
@@ -293,7 +284,7 @@ fn main() {
     let (tx, rx) = mpsc::channel();
 
     thread::scope(|scope| {
-        for _ in 0..workers {
+        for _ in 0..agg_workers {
             let next = &next_hour;
             let names = &names;
             let locals = &locals;
@@ -349,7 +340,7 @@ fn main() {
                         }
                     }
 
-                    let mut out = Vec::with_capacity(32 * 1024);
+                    let mut out = Vec::with_capacity(160 * 1024);
                     for ep in 0..num_endpoints {
                         let start = offsets[ep] as usize;
                         let end = offsets[ep + 1] as usize;
