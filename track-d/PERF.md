@@ -9,6 +9,9 @@ Every step from the reference to your final version, each with the live-board ru
 | 2 | D5: parallel queries via std::thread::scope and AtomicUsize | pending | 3.716 | 239 | 5.355 |
 | 3 | D3: compact u32 offsets array; drops redundant working arrays | pending | 4.087 | 227 | 5.424 |
 | 4 | D4: flat 4-ary QuadHeap replaces BinaryHeap | pending | 3.214 | 227 | 5.567 |
+| 5 | D1+D2+D9: parallel line-snapped parse and atomic packed CSR build | pending | 2.801 | 222 | 5.691 |
+| 6 | D6a: fast degree-zero shortcuts for unreachable query pairs | pending | 1.678 | 219.5 | 6.265 |
+| 7 | D8: open-addressed dynamic visited table reduces peak RSS | pending | 1.737 | 129.7 | 6.634 |
 
 ### Experiment Log (Wave 1)
 - **Step 2 (D5 - Parallel queries):**
@@ -23,3 +26,17 @@ Every step from the reference to your final version, each with the live-board ru
   - *Hypothesis:* A 4-ary flat min-heap halves the tree depth compared to a binary heap ($\log_4(N) = \frac{1}{2}\log_2(N)$), halving bubble-up sift comparisons and aligning 4 contiguous child elements to a 64-byte cache line during pop sift-down.
   - *Local relative result:* Hyperfine on full (12 threads): 4.087 s -> 3.214 s (27% faster query processing). Peak RSS unchanged at 227.2 MB.
   - *Verdict:* Kept. Invariance verified for threads 1/2/6/12, 5/5 identical sample runs, 49/49 fuzz seeds passed. K estimate 5.567.
+
+### Experiment Log (Wave 2)
+- **Step 5 (D1+D2+D9 - Parallel parse & atomic packed CSR build):**
+  - *Hypothesis:* Graph parsing and CSR construction took 1.29s (36.3% of total time). Partitioning the graph file into line-snapped chunks using `FileExt::read_at` with small 64 KiB per-thread buffers, counting node out-degrees in parallel using `AtomicU32`, and populating a packed 64-bit edge array `(w << 32) | v` via atomic cursor slots will reduce CSR build time to <300 ms while eliminating dual targets/weights allocations.
+  - *Local relative result:* Hyperfine on full (10 runs, interleaved vs D4): 3.900 s -> 2.801 s (1.39x speedup). Peak RSS dropped from 227.2 MB to 222.7 MB (-4.5 MB). CSR build dropped from 1,290 ms to 289 ms (4.4x faster graph build).
+  - *Verdict:* Kept. Invariance verified for threads 1/2/6/12, 20/20 identical sample runs, 49/49 fuzz seeds passed. K estimate 5.691.
+- **Step 6 (D6a - Degree-zero short-circuit check):**
+  - *Hypothesis:* Queries returning -1 can trigger worst-case graph exploration if target $t$ has zero incoming edges or source $s$ has zero outgoing edges ($s \ne t$). Tracking an incoming-edge bitset (217.5 KiB) during pass 1 enables $O(1)$ early detection and eliminates massive wasted searches.
+  - *Local relative result:* Hyperfine on full (10 runs, interleaved vs Step 5): 2.620 s -> 1.678 s (1.56x speedup). Peak RSS dropped from 228.1 MB to 219.5 MB.
+  - *Verdict:* Kept. Invariance verified for threads 1/2/6/12, 20/20 identical sample runs, 49/49 fuzz seeds passed. K estimate 6.265.
+- **Step 7 (D8 - Open-addressed dynamic visited table):**
+  - *Hypothesis:* Preallocating 12 dense `vec![u64::MAX; n]` distance buffers consumed 167 MB heap. Replacing them with a dynamic open-addressed hash table (`DistTable`, initial $2^{16}$ slots, multiplicative Fibonacci hashing `>> shift`, touched list reset) will drastically reduce memory while keeping queries cache-local.
+  - *Local relative result:* Hyperfine on full (10 runs, interleaved vs Step 6): 1.885 s -> 1.737 s (1.08x speedup). Peak RSS dropped dramatically from 219.4 MB to 129.7 MB (-89.7 MB, 41% memory reduction).
+  - *Verdict:* Kept. Invariance verified for threads 1/2/6/12, 20/20 identical sample runs, 49/49 fuzz seeds passed. K estimate 6.634.

@@ -1,10 +1,13 @@
-// Track D (Traverse): parallelized solution (v1) in safe standard-library Rust.
+// Track D (Traverse): parallelized solution in safe standard-library Rust.
 // Implements the shortest path contract defined in specs/d-traverse.md.
-// No unsafe, no SIMD, no mmap, no custom hashers, no renumbering, no bidirectional search (GR-P2..P10, PLAN §6, §7.3, §11).
+// Safe Rust, std only, no unsafe, no SIMD (GR-P2..P10, PLAN §6, §7.3, §11).
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::os::unix::fs::FileExt;
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+
+const CHUNK_SIZE: usize = 64 * 1024;
 
 /// 4-ary flat min-heap of (u64, u32) priority items.
 /// Spec §3 & PLAN §7.3: shallower tree depth (log4 vs log2) and cache-line aligned child scanning.
@@ -22,10 +25,8 @@ impl QuadHeap {
     fn push(&mut self, item: (u64, u32)) {
         let mut idx = self.data.len();
         self.data.push(item);
-        // Sift up: parent is (idx - 1) / 4
         while idx > 0 {
             let parent = (idx - 1) >> 2;
-            // Safe index: parent < idx guaranteed by bit shift
             if self.data[idx].0 < self.data[parent].0 {
                 self.data.swap(idx, parent);
                 idx = parent;
@@ -48,12 +49,10 @@ impl QuadHeap {
                 if first_child >= len {
                     break;
                 }
-                // Scan up to 4 contiguous children in a single cache line
                 let mut best_child = first_child;
                 let mut best_cost = self.data[first_child].0;
                 let last_child = (first_child + 4).min(len);
                 for c in (first_child + 1)..last_child {
-                    // Safe index: c < last_child <= len guaranteed by min(len)
                     if self.data[c].0 < best_cost {
                         best_cost = self.data[c].0;
                         best_child = c;
@@ -75,115 +74,201 @@ impl QuadHeap {
     }
 }
 
-/// Parse the next unsigned decimal integer from line bytes starting at pos.
-fn parse_u32_field(line: &[u8], pos: &mut usize) -> u32 {
-    // Skip spaces and trailing line delimiters per Spec §2 ASCII formatting
-    while *pos < line.len() && (line[*pos] == b' ' || line[*pos] == b'\r' || line[*pos] == b'\n') {
+/// Open-addressed hash table for visited nodes: key = node (u32), val = dist (u64).
+/// Empty slot indicated by key == u32::MAX.
+struct DistTable {
+    keys: Vec<u32>,
+    vals: Vec<u64>,
+    shift: u32,
+    mask: usize,
+    count: usize,
+    touched: Vec<usize>,
+}
+
+impl DistTable {
+    fn with_power(pow: u32) -> Self {
+        let cap = 1usize << pow;
+        Self {
+            keys: vec![u32::MAX; cap],
+            vals: vec![u64::MAX; cap],
+            shift: 64 - pow,
+            mask: cap - 1,
+            count: 0,
+            touched: Vec::with_capacity(cap / 2),
+        }
+    }
+
+    #[inline(always)]
+    fn hash(&self, node: u32) -> usize {
+        let h = (node as u64).wrapping_mul(0x9E3779B97F4A7C15);
+        (h >> self.shift) as usize & self.mask
+    }
+
+    fn grow(&mut self) {
+        let new_pow = (64 - self.shift) + 1;
+        let new_cap = 1usize << new_pow;
+        let mut new_keys = vec![u32::MAX; new_cap];
+        let mut new_vals = vec![u64::MAX; new_cap];
+        let new_shift = 64 - new_pow;
+        let new_mask = new_cap - 1;
+        let mut new_touched = Vec::with_capacity(self.count * 2);
+
+        for &slot in &self.touched {
+            let k = self.keys[slot];
+            let v = self.vals[slot];
+            let h = (k as u64).wrapping_mul(0x9E3779B97F4A7C15);
+            let mut idx = (h >> new_shift) as usize & new_mask;
+            while new_keys[idx] != u32::MAX {
+                idx = (idx + 1) & new_mask;
+            }
+            new_keys[idx] = k;
+            new_vals[idx] = v;
+            new_touched.push(idx);
+        }
+
+        self.keys = new_keys;
+        self.vals = new_vals;
+        self.shift = new_shift;
+        self.mask = new_mask;
+        self.touched = new_touched;
+    }
+
+    #[inline(always)]
+    fn get(&self, node: u32) -> u64 {
+        let mut idx = self.hash(node);
+        loop {
+            let k = self.keys[idx];
+            if k == node {
+                return self.vals[idx];
+            }
+            if k == u32::MAX {
+                return u64::MAX;
+            }
+            idx = (idx + 1) & self.mask;
+        }
+    }
+
+    #[inline(always)]
+    fn set(&mut self, node: u32, dist: u64) {
+        if self.count * 10 >= self.keys.len() * 7 {
+            self.grow();
+        }
+        let mut idx = self.hash(node);
+        loop {
+            let k = self.keys[idx];
+            if k == node {
+                self.vals[idx] = dist;
+                return;
+            }
+            if k == u32::MAX {
+                self.keys[idx] = node;
+                self.vals[idx] = dist;
+                self.touched.push(idx);
+                self.count += 1;
+                return;
+            }
+            idx = (idx + 1) & self.mask;
+        }
+    }
+
+    fn clear(&mut self) {
+        for &slot in &self.touched {
+            self.keys[slot] = u32::MAX;
+            self.vals[slot] = u64::MAX;
+        }
+        self.touched.clear();
+        self.count = 0;
+    }
+}
+
+/// Parse unsigned decimal integer from byte buffer.
+#[inline(always)]
+fn parse_u32(buf: &[u8], pos: &mut usize) -> u32 {
+    while *pos < buf.len() && (buf[*pos] == b' ' || buf[*pos] == b'\r' || buf[*pos] == b'\n') {
         *pos += 1;
     }
-    let mut val: u64 = 0;
-    // Accumulate digits into u64 to prevent intermediate overflow before u32 truncation
-    while *pos < line.len() && line[*pos].is_ascii_digit() {
-        val = val * 10 + (line[*pos] - b'0') as u64;
+    let mut val = 0u64;
+    while *pos < buf.len() && buf[*pos].is_ascii_digit() {
+        val = val * 10 + (buf[*pos] - b'0') as u64;
         *pos += 1;
     }
     val as u32
 }
 
-/// Run single-source Dijkstra search from s to t using forward CSR graph.
+/// Run single-source Dijkstra search from s to t using packed edge CSR.
 /// Spec §3: Returns shortest directed distance in u64, or -1 if unreachable.
 fn shortest_path(
     offsets: &[u32],
-    targets: &[u32],
-    weights: &[u32],
+    edges: &[AtomicU64],
+    has_incoming: &[u64],
     s: u32,
     t: u32,
-    dist: &mut [u64],
-    touched: &mut Vec<u32>,
+    dist_table: &mut DistTable,
     heap: &mut QuadHeap,
 ) -> i64 {
-    // Spec §3: d(s, s) = 0 for every node, including isolated nodes and nodes with self-loops
     if s == t {
         return 0;
     }
 
-    // Initialize source node distance to 0
-    // Safe index: s < n guaranteed by Spec §2 query constraints
-    dist[s as usize] = 0;
-    touched.push(s);
-    // Heap tracks (cost, node); cost is u64 per Spec §3 (exceeds 2^32), node is u32
+    // D6a: degree-zero short-circuit check.
+    // If s has out-degree 0 or t has in-degree 0 (and s != t), t is provably unreachable.
+    if offsets[s as usize] == offsets[s as usize + 1] {
+        return -1;
+    }
+    let t_word = (t as usize) >> 6;
+    let t_bit = 1u64 << ((t as usize) & 63);
+    if (has_incoming[t_word] & t_bit) == 0 {
+        return -1;
+    }
+
+    dist_table.set(s, 0);
     heap.push((0, s));
 
     let mut answer: i64 = -1;
 
     while let Some((d, u)) = heap.pop() {
-        // Safe index: u < n guaranteed by edge target bounds
-        if d > dist[u as usize] {
-            // Stale heap entry: u was already settled via a shorter path
+        let cur_d = dist_table.get(u);
+        if d > cur_d {
             continue;
         }
 
-        // Spec §3 & §7: early exit as soon as target node t is settled
         if u == t {
             answer = d as i64;
             break;
         }
 
-        // Relax outgoing edges from node u using CSR slices
-        // Safe indices: u and u + 1 within bounds of offsets array of size n + 1
         let start = offsets[u as usize] as usize;
         let end = offsets[u as usize + 1] as usize;
 
         for i in start..end {
-            // Safe indices: i < m guaranteed by CSR construction
-            let v = targets[i];
-            let w = weights[i];
-            let next_d = d + w as u64;
+            let packed = edges[i].load(Ordering::Relaxed);
+            let v = (packed & 0xFFFF_FFFF) as u32;
+            let w = (packed >> 32) as u64;
+            let next_d = d + w;
+            let v_d = dist_table.get(v);
 
-            // Safe index: v < n guaranteed by Spec §2 edge head bounds
-            if next_d < dist[v as usize] {
-                if dist[v as usize] == u64::MAX {
-                    // Record touched node for O(visited) cleanup at end of query
-                    touched.push(v);
-                }
-                dist[v as usize] = next_d;
+            if next_d < v_d {
+                dist_table.set(v, next_d);
                 heap.push((next_d, v));
             }
         }
     }
 
-    // Reset distance state for all touched nodes in O(visited) without O(n) array sweep
-    for &node in touched.iter() {
-        // Safe index: node < n guaranteed by touched node origin
-        dist[node as usize] = u64::MAX;
-    }
-    touched.clear();
+    dist_table.clear();
     heap.clear();
 
     answer
 }
 
 fn main() {
-    // Resolve file paths: default to standard container paths /data and /out
     let args: Vec<String> = std::env::args().collect();
-    let data_dir = if args.len() > 1 {
-        // Safe index: args.len() > 1 verified
-        &args[1]
-    } else {
-        "/data"
-    };
-    let out_dir = if args.len() > 2 {
-        // Safe index: args.len() > 2 verified
-        &args[2]
-    } else {
-        "/out"
-    };
+    let data_dir = if args.len() > 1 { &args[1] } else { "/data" };
+    let out_dir = if args.len() > 2 { &args[2] } else { "/out" };
 
     let graph_path = format!("{}/graph.txt", data_dir);
     let queries_path = format!("{}/queries.txt", data_dir);
     let output_path = format!("{}/distances.txt", out_dir);
 
-    // Open graph file for first pass; handle realistic failure mode with clear diagnostic (PLAN §6 item 9)
     let file = match File::open(&graph_path) {
         Ok(f) => f,
         Err(e) => {
@@ -191,82 +276,168 @@ fn main() {
             std::process::exit(1);
         }
     };
+    let file_len = file.metadata().expect("cannot stat graph.txt").len() as usize;
 
-    // Use 256 KiB buffered reader to stream graph without full-file allocation (PLAN §6 item 2, GR-P5)
-    let mut reader = BufReader::with_capacity(256 * 1024, file);
-    let mut line_buf = Vec::with_capacity(256);
+    let mut header_buf = [0u8; 128];
+    let n_read = file.read_at(&mut header_buf, 0).expect("read header");
+    let nl_pos = header_buf[..n_read]
+        .iter()
+        .position(|&b| b == b'\n')
+        .expect("newline in header");
+    let mut p = 0;
+    let n = parse_u32(&header_buf[..nl_pos], &mut p) as usize;
+    let m = parse_u32(&header_buf[..nl_pos], &mut p) as usize;
+    let data_start = nl_pos + 1;
 
-    // Read header line: n SP m LF (Spec §2)
-    line_buf.clear();
-    reader
-        .read_until(b'\n', &mut line_buf)
-        .expect("failed to read graph.txt header");
-    let mut pos = 0;
-    let n = parse_u32_field(&line_buf, &mut pos) as usize;
-    let m = parse_u32_field(&line_buf, &mut pos) as usize;
+    let default_threads = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1)
+        .min(12);
+    let num_threads = std::env::var("THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default_threads)
+        .clamp(1, 12);
 
-    // Pass 1: count outgoing degree per node into compact u32 CSR offsets array of size n + 1 (saves ~7 MB vs usize)
+    let workers = num_threads.min(m.div_ceil(100_000)).max(1);
+    let data_len = file_len - data_start;
+
+    let mut bounds = vec![data_start; workers + 1];
+    let mut snap_buf = [0u8; 1024];
+    for w in 1..workers {
+        let mut pos = data_start + data_len * w / workers;
+        while let Ok(n) = file.read_at(&mut snap_buf[..1024.min(file_len - pos)], pos as u64) {
+            if let Some(i) = snap_buf[..n].iter().position(|&b| b == b'\n') {
+                pos += i + 1;
+                break;
+            }
+            pos += n;
+        }
+        bounds[w] = pos;
+    }
+    bounds[workers] = file_len;
+    bounds.dedup();
+    let actual_workers = bounds.len() - 1;
+
+    // Pass 1 (D1/D2): parallel count of outgoing degrees and D6a incoming presence bitset
+    let out_degrees: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
+    let has_incoming_words = (n + 63) / 64;
+    let has_incoming: Vec<AtomicU64> = (0..has_incoming_words).map(|_| AtomicU64::new(0)).collect();
+
+    std::thread::scope(|scope| {
+        for w in 0..actual_workers {
+            let start = bounds[w];
+            let end = bounds[w + 1];
+            let out_deg = &out_degrees;
+            let has_in = &has_incoming;
+            let f = &file;
+            scope.spawn(move || {
+                let mut buf = [0u8; CHUNK_SIZE];
+                let mut carried = 0;
+                let mut cur = start;
+                while cur < end {
+                    let to_read = (CHUNK_SIZE - carried).min(end - cur);
+                    let n = f.read_at(&mut buf[carried..carried + to_read], cur as u64).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    let valid = carried + n;
+                    let last_nl = match buf[..valid].iter().rposition(|&b| b == b'\n') {
+                        Some(nl) => nl,
+                        None => {
+                            carried = valid;
+                            cur += n;
+                            continue;
+                        }
+                    };
+                    let mut pos = 0;
+                    while pos <= last_nl {
+                        let u = parse_u32(&buf, &mut pos);
+                        let v = parse_u32(&buf, &mut pos);
+                        let _w = parse_u32(&buf, &mut pos);
+                        out_deg[u as usize].fetch_add(1, Ordering::Relaxed);
+                        has_in[(v as usize) >> 6].fetch_or(1 << ((v as usize) & 63), Ordering::Relaxed);
+                        while pos <= last_nl && buf[pos] != b'\n' {
+                            pos += 1;
+                        }
+                        pos += 1;
+                    }
+                    buf.copy_within(last_nl + 1..valid, 0);
+                    carried = valid - (last_nl + 1);
+                    cur += n;
+                }
+            });
+        }
+    });
+
+    let has_incoming_bits: Vec<u64> = has_incoming.into_iter().map(|a| a.into_inner()).collect();
+
+    // Prefix sum to compute offsets and cursor slots
     let mut offsets = vec![0u32; n + 1];
-
-    for _ in 0..m {
-        line_buf.clear();
-        let bytes_read = reader
-            .read_until(b'\n', &mut line_buf)
-            .expect("I/O error reading edge in graph.txt pass 1");
-        if bytes_read == 0 {
-            break;
-        }
-        let mut p = 0;
-        let u = parse_u32_field(&line_buf, &mut p) as usize;
-        // Safe index: u < n guaranteed by Spec §2; u + 1 < n + 1
-        offsets[u + 1] += 1;
-    }
-
-    // Prefix sum over offsets: offsets[i] becomes starting index of node i's edges
+    let mut cursors: Vec<AtomicU32> = Vec::with_capacity(n);
+    let mut sum = 0u32;
     for i in 0..n {
-        // Safe index: i + 1 < offsets.len() guaranteed by loop boundary
-        offsets[i + 1] += offsets[i];
+        offsets[i] = sum;
+        cursors.push(AtomicU32::new(sum));
+        sum += out_degrees[i].load(Ordering::Relaxed);
     }
+    offsets[n] = sum;
+    drop(out_degrees);
 
-    // Allocate CSR target and weight arrays of exact size m
-    let mut targets = vec![0u32; m];
-    let mut weights = vec![0u32; m];
-    // Working cursor for edge slot placement
-    let mut cur_offsets = offsets.clone();
+    assert_eq!(offsets[0], 0);
+    assert_eq!(offsets[n] as usize, m);
 
-    // Reopen graph file for pass 2 (cached in OS page cache; avoids storing raw edge tuples)
-    let file2 = File::open(&graph_path).expect("failed to reopen graph.txt for pass 2");
-    let mut reader2 = BufReader::with_capacity(256 * 1024, file2);
+    // Pass 2 (D1/D2/D9): parallel fill of packed edges (w << 32 | v)
+    let edges: Vec<AtomicU64> = (0..m).map(|_| AtomicU64::new(0)).collect();
 
-    // Skip header line in pass 2
-    line_buf.clear();
-    reader2
-        .read_until(b'\n', &mut line_buf)
-        .expect("failed to skip graph.txt header in pass 2");
-
-    // Pass 2: populate targets and weights into CSR layout
-    for _ in 0..m {
-        line_buf.clear();
-        let bytes_read = reader2
-            .read_until(b'\n', &mut line_buf)
-            .expect("I/O error reading edge in graph.txt pass 2");
-        if bytes_read == 0 {
-            break;
+    std::thread::scope(|scope| {
+        for w in 0..actual_workers {
+            let start = bounds[w];
+            let end = bounds[w + 1];
+            let cur_slots = &cursors;
+            let edg = &edges;
+            let f = &file;
+            scope.spawn(move || {
+                let mut buf = [0u8; CHUNK_SIZE];
+                let mut carried = 0;
+                let mut cur = start;
+                while cur < end {
+                    let to_read = (CHUNK_SIZE - carried).min(end - cur);
+                    let n = f.read_at(&mut buf[carried..carried + to_read], cur as u64).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    let valid = carried + n;
+                    let last_nl = match buf[..valid].iter().rposition(|&b| b == b'\n') {
+                        Some(nl) => nl,
+                        None => {
+                            carried = valid;
+                            cur += n;
+                            continue;
+                        }
+                    };
+                    let mut pos = 0;
+                    while pos <= last_nl {
+                        let u = parse_u32(&buf, &mut pos);
+                        let v = parse_u32(&buf, &mut pos);
+                        let w = parse_u32(&buf, &mut pos);
+                        let slot = cur_slots[u as usize].fetch_add(1, Ordering::Relaxed);
+                        edg[slot as usize].store(((w as u64) << 32) | (v as u64), Ordering::Relaxed);
+                        while pos <= last_nl && buf[pos] != b'\n' {
+                            pos += 1;
+                        }
+                        pos += 1;
+                    }
+                    buf.copy_within(last_nl + 1..valid, 0);
+                    carried = valid - (last_nl + 1);
+                    cur += n;
+                }
+            });
         }
-        let mut p = 0;
-        let u = parse_u32_field(&line_buf, &mut p) as usize;
-        let v = parse_u32_field(&line_buf, &mut p);
-        let w = parse_u32_field(&line_buf, &mut p);
+    });
+    drop(cursors);
 
-        // Safe index: u < n guaranteed; slot < m guaranteed by degree prefix sums
-        let slot = cur_offsets[u] as usize;
-        cur_offsets[u] += 1;
-        targets[slot] = v;
-        weights[slot] = w;
-    }
-    drop(cur_offsets);
-
-    // Open queries file
+    // Read queries
     let qfile = match File::open(&queries_path) {
         Ok(f) => f,
         Err(e) => {
@@ -276,23 +447,22 @@ fn main() {
     };
     let mut qreader = BufReader::with_capacity(64 * 1024, qfile);
     let mut queries = Vec::with_capacity(2048);
+    let mut line_buf = Vec::new();
 
-    // Read all query pairs into memory before parallel search
     loop {
         line_buf.clear();
         let bytes_read = qreader
             .read_until(b'\n', &mut line_buf)
-            .expect("I/O error reading queries.txt");
+            .expect("read queries.txt");
         if bytes_read == 0 {
             break;
         }
         if line_buf.iter().all(|&b| b.is_ascii_whitespace()) {
             continue;
         }
-
         let mut p = 0;
-        let s = parse_u32_field(&line_buf, &mut p);
-        let t = parse_u32_field(&line_buf, &mut p);
+        let s = parse_u32(&line_buf, &mut p);
+        let t = parse_u32(&line_buf, &mut p);
         queries.push((s, t));
     }
 
@@ -300,26 +470,13 @@ fn main() {
     let mut results = vec![-1i64; total_queries];
 
     if total_queries > 0 {
-        // At most 12 threads per competition rules; configurable via THREADS env var
-        let default_threads = std::thread::available_parallelism()
-            .map(|p| p.get())
-            .unwrap_or(1)
-            .min(12);
-        let num_threads = std::env::var("THREADS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(default_threads)
-            .clamp(1, 12);
-
         let query_counter = AtomicUsize::new(0);
 
         std::thread::scope(|scope| {
             let mut handles = Vec::with_capacity(num_threads);
             for _ in 0..num_threads {
                 handles.push(scope.spawn(|| {
-                    // Pre-allocate thread-local query state buffers
-                    let mut dist = vec![u64::MAX; n];
-                    let mut touched = Vec::with_capacity(16 * 1024);
+                    let mut dist_table = DistTable::with_power(16);
                     let mut heap = QuadHeap::with_capacity(16 * 1024);
                     let mut local_results = Vec::with_capacity(total_queries / num_threads + 16);
 
@@ -328,16 +485,14 @@ fn main() {
                         if idx >= total_queries {
                             break;
                         }
-                        // Safe index: idx < total_queries verified by atomic loop check
                         let (s, t) = queries[idx];
                         let ans = shortest_path(
                             &offsets,
-                            &targets,
-                            &weights,
+                            &edges,
+                            &has_incoming_bits,
                             s,
                             t,
-                            &mut dist,
-                            &mut touched,
+                            &mut dist_table,
                             &mut heap,
                         );
                         local_results.push((idx, ans));
@@ -347,23 +502,18 @@ fn main() {
             }
 
             for handle in handles {
-                // Collect results from worker threads and assign to output order
                 for (idx, ans) in handle.join().expect("worker thread panicked") {
-                    // Safe index: idx < results.len() guaranteed by query index bounds
                     results[idx] = ans;
                 }
             }
         });
     }
 
-    // In-memory output buffer for single atomic write (PLAN §6 item 3)
     let mut out_buf = Vec::with_capacity(32 * 1024);
     for ans in results {
-        // Format decimal integer distance or -1 followed by LF (Spec §4)
-        writeln!(out_buf, "{}", ans).expect("writing to in-memory Vec<u8> cannot fail");
+        writeln!(out_buf, "{}", ans).expect("formatting into Vec<u8> cannot fail");
     }
 
-    // Write output file once, flush, and close (Spec §4, PLAN §6 item 3, GR-C8)
     let mut out_file = File::create(&output_path).expect("cannot create /out/distances.txt");
     out_file
         .write_all(&out_buf)
