@@ -9,11 +9,13 @@ use std::thread;
 
 const MAX_THREADS: usize = 12;
 const NAME_SLOTS: usize = 1 << 17;
+const ID_MASK: u64 = (NAME_SLOTS as u64) - 1;
 const INIT_AGG: [i64; 8] = [0, 0, 0, i64::MAX, i64::MIN, 0, 0, 0];
 
 // SAFETY: standard POSIX mmap ABI linked via libc.
 unsafe extern "C" {
-    fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut c_void;
+    fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64)
+        -> *mut c_void;
 }
 
 fn mmap_file(path: &str) -> io::Result<&'static [u8]> {
@@ -51,26 +53,32 @@ unsafe fn hash_name_fast(p: *const u8, len: usize) -> u64 {
                 b ^= wymix(p.add(16).cast::<u64>().read_unaligned(), len as u64);
             }
         }
-        wymix(a ^ 0x9e37_79b9_7f4a_7c15, b ^ ((len as u64) << 32) ^ 0x517c_c1b7_2722_0a95) | 1
+        wymix(
+            a ^ 0x9e37_79b9_7f4a_7c15,
+            b ^ ((len as u64) << 32) ^ 0x517c_c1b7_2722_0a95,
+        ) | 1
     }
 }
 
 #[inline(always)]
-fn insert_name(keys: &[AtomicU64], masks: &[AtomicU64], h: u64, country: usize) {
-    let bit = 1u64 << (country & 63);
-    let w_off = country >> 6;
+fn insert_name(keys: &[AtomicU64], masks: &[AtomicU64], next_id: &AtomicU64, h: u64, c: usize) {
+    let tag = (h & !ID_MASK).max(ID_MASK + 1);
+    let (bit, w_off) = (1u64 << (c & 63), c >> 6);
     let mut idx = (h as usize) & (NAME_SLOTS - 1);
     loop {
-        // SAFETY: idx < NAME_SLOTS and masks has length NAME_SLOTS * 4.
+        // SAFETY: idx < NAME_SLOTS and dense id * 4 + w_off < masks.len().
         let k_slot = unsafe { keys.get_unchecked(idx) };
         let mut cur = k_slot.load(Ordering::Relaxed);
         if cur == 0 {
-            cur = k_slot
-                .compare_exchange(0, h, Ordering::Relaxed, Ordering::Relaxed)
-                .unwrap_or_else(|v| v);
+            let new_val = tag | next_id.fetch_add(1, Ordering::Relaxed);
+            cur = match k_slot.compare_exchange(0, new_val, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => new_val,
+                Err(v) => v,
+            };
         }
-        if cur == h {
-            let m = unsafe { masks.get_unchecked((idx << 2) + w_off) };
+        if (cur & !ID_MASK) == tag {
+            let id = (cur & ID_MASK) as usize;
+            let m = unsafe { masks.get_unchecked((id << 2) + w_off) };
             if (m.load(Ordering::Relaxed) & bit) == 0 {
                 m.fetch_or(bit, Ordering::Relaxed);
             }
@@ -94,7 +102,10 @@ fn load_regions(path: &str) -> io::Result<(Vec<&'static [u8]>, Vec<u8>)> {
     let raw = mmap_file(path)?;
     let mut countries: Vec<&'static [u8]> = vec![b"_UNMATCHED"];
     let (mut c_keys, mut c_ids, mut rmap) = ([0u64; 512], [0u8; 512], vec![0u8; 1_000_000]);
-    let mut i = raw.iter().position(|&b| b == b'\n').map_or(raw.len(), |p| p + 1);
+    let mut i = raw
+        .iter()
+        .position(|&b| b == b'\n')
+        .map_or(raw.len(), |p| p + 1);
     while i < raw.len() {
         let mut rid = 0usize;
         while i < raw.len() && raw[i] >= b'0' {
@@ -146,7 +157,10 @@ fn is_record_end(b: &[u8], nl: usize) -> bool {
     }
     p -= usize::from(p > 0 && b[p - 1] == b'-');
     let nxt = nl + 1 + 3 * usize::from(b.get(nl + 1..nl + 4) == Some(b"\xEF\xBB\xBF"));
-    p >= 2 && b[p - 1] == b',' && b[p - 2].is_ascii_digit() && b.get(nxt).is_some_and(u8::is_ascii_digit)
+    p >= 2
+        && b[p - 1] == b','
+        && b[p - 2].is_ascii_digit()
+        && b.get(nxt).is_some_and(u8::is_ascii_digit)
 }
 
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt,pclmulqdq")]
@@ -156,26 +170,23 @@ unsafe fn parse_chunk(
     num_countries: usize,
     keys: &[AtomicU64],
     masks: &[AtomicU64],
+    next_id: &AtomicU64,
 ) -> Vec<[i64; 8]> {
     let mut aggs = vec![INIT_AGG; num_countries];
     let mut ubuf = vec![0u8; 512];
-    let (mut d_pos, mut d_q) = ([0u32; 320], [0u32; 320]);
+    let (mut d_pos, mut d_q, mut tail) = ([0u32; 320], [0u32; 320], [0u8; 64]);
     let (mut n_delims, mut prev_in_quote, mut q_prefix, mut rec_start, mut blk_start) =
         (0usize, 0u64, 0u32, 0usize, 0usize);
-    let (qv, cv, nv, ones) = (
-        _mm256_set1_epi8(b'"' as i8),
-        _mm256_set1_epi8(b',' as i8),
-        _mm256_set1_epi8(b'\n' as i8),
-        _mm_set1_epi8(-1),
-    );
+    let (qv, cv) = (_mm256_set1_epi8(b'"' as i8), _mm256_set1_epi8(b',' as i8));
+    let (nv, ones) = (_mm256_set1_epi8(b'\n' as i8), _mm_set1_epi8(-1));
     let bp = bytes.as_ptr();
     while blk_start < bytes.len() {
         let rem = bytes.len() - blk_start;
-        let mut tail = [0u8; 64];
         let ptr = if rem >= 64 {
             unsafe { bp.add(blk_start) }
         } else {
             tail[..rem].copy_from_slice(&bytes[blk_start..]);
+            tail[rem..].fill(0);
             tail.as_ptr()
         };
         let v0 = unsafe { _mm256_loadu_si256(ptr.cast::<__m256i>()) };
@@ -184,10 +195,9 @@ unsafe fn parse_chunk(
         let q1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, qv)) as u32 as u64;
         let cn0 = _mm256_or_si256(_mm256_cmpeq_epi8(v0, cv), _mm256_cmpeq_epi8(v0, nv));
         let cn1 = _mm256_or_si256(_mm256_cmpeq_epi8(v1, cv), _mm256_cmpeq_epi8(v1, nv));
-        let (q_mask, cn_mask) = (
-            q0 | (q1 << 32),
-            (_mm256_movemask_epi8(cn0) as u32 as u64) | ((_mm256_movemask_epi8(cn1) as u32 as u64) << 32),
-        );
+        let q_mask = q0 | (q1 << 32);
+        let cn_mask = (_mm256_movemask_epi8(cn0) as u32 as u64)
+            | ((_mm256_movemask_epi8(cn1) as u32 as u64) << 32);
         let clmul = _mm_clmulepi64_si128(_mm_cvtsi64_si128(q_mask as i64), ones, 0);
         let in_quote = (_mm_cvtsi128_si64(clmul) as u64) ^ prev_in_quote;
         prev_in_quote = ((in_quote as i64) >> 63) as u64;
@@ -198,7 +208,7 @@ unsafe fn parse_chunk(
             // SAFETY: Stage 2 drains whenever n_delims >= 250, so n_delims + 64 <= 313 < 320.
             unsafe {
                 *d_pos.get_unchecked_mut(n_delims) = (blk_start + bit as usize) as u32;
-                *d_q.get_unchecked_mut(n_delims) = q_prefix + (q_mask & ((1u64 << bit) - 1)).count_ones();
+                *d_q.get_unchecked_mut(n_delims) = q_prefix + _bzhi_u64(q_mask, bit).count_ones();
             }
             n_delims += 1;
         }
@@ -209,13 +219,8 @@ unsafe fn parse_chunk(
             while idx + 5 <= n_delims {
                 // SAFETY: idx + 4 < n_delims < 320 and all delimiter positions lie inside bytes.
                 unsafe {
-                    let (c1, c2, c3, c4, nl) = (
-                        *d_pos.get_unchecked(idx) as usize,
-                        *d_pos.get_unchecked(idx + 1) as usize,
-                        *d_pos.get_unchecked(idx + 2) as usize,
-                        *d_pos.get_unchecked(idx + 3) as usize,
-                        *d_pos.get_unchecked(idx + 4) as usize,
-                    );
+                    let pos = |k: usize| *d_pos.get_unchecked(idx + k) as usize;
+                    let (c1, c2, c3, c4, nl) = (pos(0), pos(1), pos(2), pos(3), pos(4));
                     let (q1, q2, q3) = (
                         *d_q.get_unchecked(idx),
                         *d_q.get_unchecked(idx + 1),
@@ -224,12 +229,21 @@ unsafe fn parse_chunk(
                     let rs = rec_start + 3 * usize::from(*bp.add(rec_start) == 0xEF);
                     let id = parse_swar(bp.add(c1), c1 - rs);
                     let rid = parse_swar(bp.add(c4), c4 - c3 - 1) as usize;
-                    let country = if rid < 1_000_000 { *region_map.get_unchecked(rid) as usize } else { 0 };
+                    let country = if rid < 1_000_000 {
+                        *region_map.get_unchecked(rid) as usize
+                    } else {
+                        0
+                    };
                     let a_end = nl - usize::from(*bp.add(nl - 1) == b'\r');
                     let neg = usize::from(*bp.add(c4 + 1) == b'-');
                     let whole = parse_swar(bp.add(a_end - 3), a_end - c4 - 4 - neg);
-                    let frac = (*bp.add(a_end - 2) - b'0') as i64 * 10 + (*bp.add(a_end - 1) - b'0') as i64;
-                    let cents = if neg != 0 { -(whole * 100 + frac) } else { whole * 100 + frac };
+                    let frac = (*bp.add(a_end - 2) - b'0') as i64 * 10
+                        + (*bp.add(a_end - 1) - b'0') as i64;
+                    let cents = if neg != 0 {
+                        -(whole * 100 + frac)
+                    } else {
+                        whole * 100 + frac
+                    };
                     let q_note = (q3 - q2) as usize;
                     let note_len = ((c3 - c2 - 1) - (q_note >> 1) - usize::from(q_note > 0)) as i64;
                     let q_name = (q2 - q1) as usize;
@@ -253,7 +267,7 @@ unsafe fn parse_chunk(
                     if n_len == 0 {
                         agg[7] = 1;
                     } else {
-                        insert_name(keys, masks, hash_name_fast(n_ptr, n_len), country);
+                        insert_name(keys, masks, next_id, hash_name_fast(n_ptr, n_len), country);
                     }
                     agg[0] += 1;
                     agg[1] += id;
@@ -280,23 +294,31 @@ fn fmt_cents(c: i64) -> String {
 }
 
 fn main() -> io::Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).filter(|a| !a.starts_with("--")).collect();
+    let args: Vec<String> = std::env::args()
+        .skip(1)
+        .filter(|a| !a.starts_with("--"))
+        .collect();
     let data_dir = args.first().map_or("/data", String::as_str);
     let out_dir = args.get(1).map_or("/out", String::as_str);
-    let (countries, region_map) = load_regions(&format!("{}/regions.csv", data_dir))?;
+    let (countries, region_map) = load_regions(&format!("{data_dir}/regions.csv"))?;
     let num_countries = countries.len();
-    let mmap_slice = mmap_file(&format!("{}/records.csv", data_dir))?;
-    let header_end = mmap_slice.iter().position(|&b| b == b'\n').map_or(mmap_slice.len(), |p| p + 1);
+    let mmap_slice = mmap_file(&format!("{data_dir}/records.csv"))?;
+    let header_end = mmap_slice
+        .iter()
+        .position(|&b| b == b'\n')
+        .map_or(mmap_slice.len(), |p| p + 1);
     let body = &mmap_slice[header_end..];
     if body.is_empty() {
         fs::create_dir_all(out_dir)?;
-        File::create(format!("{}/aggregates.txt", out_dir))?;
+        File::create(format!("{out_dir}/aggregates.txt"))?;
         return Ok(());
     }
     let threads = if body.len() < 512 * 1024 {
         1
     } else {
-        thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, MAX_THREADS)
+        thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .clamp(1, MAX_THREADS)
     };
     let mut bounds = vec![0usize; threads + 1];
     for t in 1..threads {
@@ -307,24 +329,35 @@ fn main() -> io::Result<()> {
         bounds[t] = (pos + 1).min(body.len());
     }
     bounds[threads] = body.len();
-    let (raw_keys, raw_masks) = (vec![0u64; NAME_SLOTS], vec![0u64; NAME_SLOTS * 4]);
+    let mask_cap = (NAME_SLOTS + 4096) * 4;
+    let (raw_keys, raw_masks, next_id) = (
+        vec![0u64; NAME_SLOTS],
+        vec![0u64; mask_cap],
+        AtomicU64::new(0),
+    );
     // SAFETY: AtomicU64 has identical layout and alignment as u64.
     let (keys, masks) = unsafe {
         (
             std::slice::from_raw_parts(raw_keys.as_ptr().cast::<AtomicU64>(), NAME_SLOTS),
-            std::slice::from_raw_parts(raw_masks.as_ptr().cast::<AtomicU64>(), NAME_SLOTS * 4),
+            std::slice::from_raw_parts(raw_masks.as_ptr().cast::<AtomicU64>(), mask_cap),
         )
     };
     let thread_aggs: Vec<Vec<[i64; 8]>> = thread::scope(|s| {
-        let handles: Vec<_> = bounds
-            .windows(2)
-            .filter(|w| w[0] < w[1])
-            .map(|w| {
-                // SAFETY: x86-64-v3 + pclmul is available on the target CPU.
-                s.spawn(|| unsafe { parse_chunk(&body[w[0]..w[1]], &region_map, num_countries, keys, masks) })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
+        let mut hs = Vec::with_capacity(threads);
+        for w in bounds.windows(2).filter(|w| w[0] < w[1]) {
+            // SAFETY: x86-64-v3 + pclmulqdq is available on the target CPU.
+            hs.push(s.spawn(|| unsafe {
+                parse_chunk(
+                    &body[w[0]..w[1]],
+                    &region_map,
+                    num_countries,
+                    keys,
+                    masks,
+                    &next_id,
+                )
+            }));
+        }
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
     let mut final_aggs = vec![INIT_AGG; num_countries];
     for t_agg in thread_aggs {
@@ -338,14 +371,13 @@ fn main() -> io::Result<()> {
         }
     }
     let mut distinct_counts: Vec<i64> = final_aggs.iter().map(|a| a[7]).collect();
-    for (idx, k) in keys.iter().enumerate() {
-        if k.load(Ordering::Relaxed) != 0 {
-            for w_idx in 0..4 {
-                let mut w = masks[(idx << 2) + w_idx].load(Ordering::Relaxed);
-                while w != 0 {
-                    distinct_counts[w_idx * 64 + w.trailing_zeros() as usize] += 1;
-                    w &= w - 1;
-                }
+    let used_ids = (next_id.load(Ordering::Relaxed) as usize).min(NAME_SLOTS + 4096);
+    for id in 0..used_ids {
+        for w_idx in 0..4 {
+            let mut w = masks[(id << 2) + w_idx].load(Ordering::Relaxed);
+            while w != 0 {
+                distinct_counts[w_idx * 64 + w.trailing_zeros() as usize] += 1;
+                w &= w - 1;
             }
         }
     }
@@ -357,22 +389,21 @@ fn main() -> io::Result<()> {
         let agg = &final_aggs[c];
         if agg[0] > 0 {
             let cname = std::str::from_utf8(countries[c]).unwrap();
-            let _ = writeln!(
-                out,
-                "{cname} {} {} {} {} {} {} {} {}",
-                agg[0],
-                agg[1],
+            let (s, mn, mx, dc) = (
                 fmt_cents(agg[2]),
                 fmt_cents(agg[3]),
                 fmt_cents(agg[4]),
                 distinct_counts[c],
-                agg[5],
-                agg[6]
+            );
+            let _ = writeln!(
+                out,
+                "{cname} {} {} {s} {mn} {mx} {dc} {} {}",
+                agg[0], agg[1], agg[5], agg[6]
             );
         }
     }
     fs::create_dir_all(out_dir)?;
-    let mut file = File::create(format!("{}/aggregates.txt", out_dir))?;
+    let mut file = File::create(format!("{out_dir}/aggregates.txt"))?;
     file.write_all(&out)?;
     file.flush()?;
     std::process::exit(0);

@@ -7,7 +7,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 0 | The reference, unchanged | - | 14.444 | 367.44 | 108 | 0.980 | 0.000 | Baseline Python reference |
 | 1 | C1: Two-pass SIMD quote-parity CSV scanner, PCLMULQDQ structural delimiter indexing, 1 MB region lookup array, and shared lock-free 128-bit hash to 256-bit country bitmask table | a3f64b1 | 0.168 | 29 | 622 | 11.828 | 53.646 | Kept (first board baseline) |
 | 2 | C2: Single-pass grammar-snapped chunking, zero-allocation mmap region interning, Port-0 fused AVX2 delimiter mask, and unaligned wyhash + demand-zeroed 64-bit name table | 080c956 | 0.074 | 10 | 509 | 22.754 | 67.853 | Kept (2.27x faster, -65% M) |
-| 3 | C3/C4: Explicit `+pclmul` VEX inlining, single-pass pointer `load_regions`, bounds-check-free L1 structural tape, branchless SWAR integer parsing, race-free SoA name table, `[i64; 8]` cache-line accumulators, and S compaction (~192 lines) | pending | pending | pending | ~192 | pending | pending | Candidate ready for board push (`--track c` or `--all-tracks`) |
+| 3 | C3: Unchecked L1 structural tape and SWAR integer parsing (had `compare_exchange` `Ok(0)` infinite loop in `insert_name`) | board-timeout | >43.3 | - | ~260 | 0.000 | 0.000 | Reverted / fixed in C4 |
+| 4 | C4: Fix `insert_name` CAS `Ok(0)` return value, add dense 17-bit name-ID indirection for L2-resident country bitmasks, BMI2 `_bzhi_u64` quote popcount, VEX `vpclmulqdq` inlining, and `rustfmt`-compact source (~188 lines) | pending | pending | pending | ~188 | pending | pending | Candidate ready for board push |
 
 ### Experiment Log
 
@@ -18,19 +19,13 @@ Every step from the reference to your final version, each with the live-board ru
 - **Step 2 (C2 — Single-pass record boundary snapping & zero-allocation region loader, board run `080c956`):**
   - *Hypothesis:* Eliminating the 400,000 heap `Vec<u8>` allocations in `load_regions` via `mmap` + a 512-slot stack hash table drops peak RSS from 29 MB to ~10 MB and saves ~50 ms of single-threaded startup. Replacing the 202 MB Pass 1 quote-counting scan with $O(1)$ grammar-verified record boundary snapping (`is_record_end`) halves memory bandwidth.
   - *Board result (`080c956`):* Passed correctness gate. Runtime dropped **2.27x** (`0.168 s -> 0.074 s`), peak memory dropped **65.5%** (`29 MB -> 10 MB`), and $K$ nearly doubled (`11.828 -> 22.754`, `53.646 -> 67.853 pts`).
-  - *Note on board commit `4d1311a`:* That push isolated Track B (`board_push.sh --track b`), so Track C was marked `unchanged` and retained `080c956`.
 
-- **Step 3 (C3/C4 — VEX `vpclmulqdq` inlining, single-pass `load_regions`, unchecked L1 structural tape, SWAR integer parsing, race-free SoA `NameTable`, and `[i64; 8]` S compaction):**
-  - *Post-mortem of `080c956` (`0.074 s`, `S = 509`):*
-    1. **Missing `+pclmul` target feature caused 3.15M out-of-line SSE calls:** `-C target-cpu=x86-64-v3` does not enable `pclmul` in LLVM. Without `#[target_feature(enable = "pclmul")]`, `_mm_clmulepi64_si128` was not inlined into `parse_chunk`, causing register spills and AVX-to-SSE transition stalls on every 64-byte block.
-    2. **Single-threaded iterator overhead in `load_regions`:** Calling `split('\n')`, `strip_suffix('\r')`, and `position(',')` across 200,000 lines cost ~8–10 ms on the main thread before workers launched.
-    3. **43M+ dynamic bounds checks & state-machine branching in `parse_chunk`:** Slice indexing on `d_pos`, `d_q`, and `bytes` emitted ~15 bounds checks per record across 3.32M records.
-    4. **Concurrent empty-slot CAS race in `insert_name`:** Two threads simultaneously hashing the same new name (`cur == 0`) could cause the CAS loser to advance to `idx + 1` and insert a duplicate key.
-    5. **Formatted line count (`S = 509`):** Boilerplate struct definitions and formatting loops cost `(108 / 509)^0.15 = 0.792`.
+- **Step 3 (C3 — Board timeout post-mortem):**
+  - *What failed:* In `insert_name`, `k_slot.compare_exchange(0, h, ...).unwrap_or_else(|v| v)` unwrapped `Ok(0)` (the previous slot value) to `0` instead of `h`. Because `h` is always odd (`| 1`), `cur == h` (`0 == h`) evaluated to `false` on every successful insertion into an empty slot. The first non-empty name filled all 131,072 slots of `keys`, causing the second distinct name to spin forever until the 43.3 s board timeout.
+
+- **Step 4 (C4 — CAS fix, dense 17-bit name-ID indirection, BMI2 `_bzhi_u64`, VEX `vpclmulqdq`, and S compaction):**
   - *Changes in C4:*
-    1. **Explicit `#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt,pclmul")]` + hoisted `_mm_cvtsi64_si128`:** Inlines `vpclmulqdq` directly into the 64-byte loop and removes redundant tail bitmasking (since zero-padded tail bytes never match `'"'`, `','`, or `'\n'`).
-    2. **Single-pass pointer loop in `load_regions`:** Scans `rid` and the packed country key in one pass with zero iterator allocations (< 1 ms).
-    3. **Two-stage unchecked L1 structural tape + unified `q_name <= 2` fast path:** Removes ~43M slice bounds checks and merges `q_name == 0` and `q_name == 2` into a single branchless pointer/length calculation `(bp.add(c1 + 1 + (q_name >> 1)), c2 - c1 - 1 - q_name)`.
-    4. **8-byte SWAR integer & cent parsing + race-free SoA `NameTable`:** Parses 1-to-8-digit integers in 6 cycles without loops and resolves concurrent empty-slot CAS races via `unwrap_or_else(|v| v)`.
-    5. **64-byte `[i64; 8]` accumulators & S compaction (`S`: 509 $\to$ ~192 lines, +15.8% $K$):** Enables AVX2 auto-vectorized aggregation and shrinks total track code lines by 62%.
-  - *Verdict:* Ready for board verification via `--track c` or `--all-tracks`.
+    1. **Fix `compare_exchange` return handling:** Evaluates `Ok(_)` to `new_val` and `Err(v)` to `v` so empty-slot insertions succeed on the first probe.
+    2. **Dense 17-bit Name-ID Indirection (`next_id: AtomicU64`):** Previously, indexing `masks` directly by the open-addressing slot `idx in 0..131,072` scattered country bitmask accesses across 4 MiB (1,024 pages), exceeding each P-core's 1.25 MiB L2 cache and faulting all 4 MiB into physical RAM. Storing `(tag | dense_id)` in `keys[idx]` and indexing `masks` by `dense_id` restricts physical page faults and cache footprint in `masks` to `0..num_distinct_names` (~150–400 KiB), keeping bitmasks L2-resident and shrinking the final reduction loop in `main`.
+    3. **VEX `vpclmulqdq` inlining & BMI2 `_bzhi_u64`:** Explicit `#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt,pclmulqdq")]` inlines carry-less multiplication without AVX-to-SSE transition stalls, while `_bzhi_u64(q_mask, bit).count_ones()` replaces multi-instruction shift-masking in the 16.6M-delimiter loop.
+    4. **Single-pass `load_regions`, 8-byte SWAR integer parsing, and S compaction (`S`: 509 $\to$ ~188 lines, +16.1% $K$):** Eliminates bounds checks and digit loops while compacting formatted `scc` lines by 63%.
