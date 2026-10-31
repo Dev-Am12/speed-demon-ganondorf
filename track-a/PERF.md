@@ -11,6 +11,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 4 | A3: parallel line-snapped streaming parse and chronological assembly | pending | 1.004 | 52 | 11.45 |
 | 5 | A4: FNV-1a interning and line count reduction (S=287) | pending | 1.010 | 52 | 11.15 |
 | 6 | A5: structure-of-arrays records and direct streamed output | pending | 0.213 | 39 | 18.39 |
+| 7 | A6: single-pass forward line parser | pending | 0.205 | 39 | 18.86 |
 
 ### Experiment Log
 - **Step 2 (A1 - Positional parsing & integer hour index):**
@@ -32,4 +33,8 @@ Every step from the reference to your final version, each with the live-board ru
 - **Step 6 (A5 - Structure-of-arrays records and direct streamed output):**
   - *Hypothesis:* Packing latency (u32) and endpoint+err (u16) into separate parallel Vecs achieves true 6 B per record without 2 B struct alignment padding (saving ~6.2 MB across 3.1M records). Streaming formatted hourly buffers directly to output eliminates the 10.1 MB `concat()` heap allocation.
   - *Local relative result:* Hyperfine 10 runs on full: a_v1c 228.8 ms ± 19.3 ms -> A5 213.2 ms ± 16.5 ms (1.07x faster). Peak RSS dropped from 52.5 MB to 39.2 MB (-13.3 MB, 25.3% reduction). S = 299 lines.
+  - *Verdict:* Kept. Correctness verified on tiny, sample, full, 49/49 fuzz seeds, and threads 1/2/6/12.
+- **Step 7 (A6 - Single-pass forward line parser):**
+  - *Hypothesis:* Replacing per-line subslice splitting (`split('\n')`) and multi-pass space scanning (`position(' ')`) with a single forward scan loop traversing directly from timestamp to LF touches each byte in the 64 KiB buffer once, eliminating intermediate Option checks and slice bounds checks.
+  - *Local relative result:* Hyperfine 10 runs on full: A5 217.2 ms ± 21.2 ms -> A6 205.3 ms ± 16.7 ms (1.06x faster, min 191.5 ms). Peak RSS: 39,168 KB (~39.2 MB). S = 306 lines.
   - *Verdict:* Kept. Correctness verified on tiny, sample, full, 49/49 fuzz seeds, and threads 1/2/6/12.

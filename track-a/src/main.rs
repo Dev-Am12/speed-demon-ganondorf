@@ -76,29 +76,30 @@ struct Local {
 }
 
 #[inline(always)]
-fn hour_index(line: &[u8]) -> usize {
-    let day = (line[8] - b'0') as usize * 10 + (line[9] - b'0') as usize;
-    let day_idx = if line[6] == b'0' { day - 30 } else { 1 + day };
-    let hour = ((line[11] - b'0') * 10 + line[12] - b'0') as usize;
-    day_idx * 24 + hour - 18
-}
+fn parse_line(buf: &[u8], pos: usize, local: &mut Local) -> usize {
+    let day = (buf[pos + 8] - b'0') as usize * 10 + (buf[pos + 9] - b'0') as usize;
+    let day_idx = if buf[pos + 6] == b'0' { day - 30 } else { 1 + day };
+    let hour = day_idx * 24 + ((buf[pos + 11] - b'0') * 10 + buf[pos + 12] - b'0') as usize - 18;
 
-#[inline(always)]
-fn parse_line(line: &[u8], local: &mut Local) {
-    let method_end = 28 + line[28..].iter().position(|&b| b == b' ').unwrap();
-    let ep_start = method_end + 1;
-    let ep_end = ep_start + line[ep_start..].iter().position(|&b| b == b' ').unwrap();
+    let mut i = pos + 28;
+    while buf[i] != b' ' { i += 1; }
+    let ep_start = i + 1;
+    i = ep_start;
+    while buf[i] != b' ' { i += 1; }
+    let ep_end = i;
+    let err = (buf[ep_end + 1] == b'5') as u16;
     let mut latency = 0u32;
-    for &d in &line[ep_end + 5..] {
-        latency = latency * 10 + (d - b'0') as u32;
+    i = ep_end + 5;
+    while buf[i] != b'\n' {
+        latency = latency * 10 + (buf[i] - b'0') as u32;
+        i += 1;
     }
-    let hour = hour_index(line);
-    let id = local.table.intern(&line[ep_start..ep_end]);
-    let err = (line[ep_end + 1] == b'5') as u16;
+    let id = local.table.intern(&buf[ep_start..ep_end]);
     let hd = &mut local.hours[hour];
     hd.lats.push(latency);
     // Spec §2: catalogue has exactly 1,842 endpoints (<= 32,767); fits in 15 bits, bit 15 is 5xx flag.
     hd.id_errs.push((id & 0x7FFF) | (err << 15));
+    i + 1
 }
 
 fn parse_worker_range(file: &File, mut start: usize, end: usize) -> Local {
@@ -129,10 +130,8 @@ fn parse_worker_range(file: &File, mut start: usize, end: usize) -> Local {
             }
         };
         let mut pos = 0;
-        while pos <= last_nl {
-            let nl = pos + buf[pos..=last_nl].iter().position(|&b| b == b'\n').unwrap();
-            parse_line(&buf[pos..nl], &mut local);
-            pos = nl + 1;
+        while pos < last_nl {
+            pos = parse_line(&buf, pos, &mut local);
         }
         buf.copy_within(last_nl + 1..valid, 0);
         carried = valid - (last_nl + 1);
