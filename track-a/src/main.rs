@@ -65,15 +65,14 @@ impl Table {
     }
 }
 
-#[derive(Clone, Copy)]
-struct Record {
-    latency: u32,
-    id_err: u16,
+struct HourData {
+    lats: Vec<u32>,
+    id_errs: Vec<u16>,
 }
 
 struct Local {
     table: Table,
-    hours: Vec<Vec<Record>>,
+    hours: Vec<HourData>,
 }
 
 #[inline(always)]
@@ -96,16 +95,19 @@ fn parse_line(line: &[u8], local: &mut Local) {
     let hour = hour_index(line);
     let id = local.table.intern(&line[ep_start..ep_end]);
     let err = (line[ep_end + 1] == b'5') as u16;
-    local.hours[hour].push(Record {
-        latency,
-        id_err: (id & 0x7FFF) | (err << 15),
-    });
+    let hd = &mut local.hours[hour];
+    hd.lats.push(latency);
+    // Spec §2: catalogue has exactly 1,842 endpoints (<= 32,767); fits in 15 bits, bit 15 is 5xx flag.
+    hd.id_errs.push((id & 0x7FFF) | (err << 15));
 }
 
 fn parse_worker_range(file: &File, mut start: usize, end: usize) -> Local {
     let mut local = Local {
         table: Table::new(),
-        hours: (0..HOURS).map(|_| Vec::with_capacity(1024)).collect(),
+        hours: (0..HOURS).map(|_| HourData {
+            lats: Vec::with_capacity(4096),
+            id_errs: Vec::with_capacity(4096),
+        }).collect(),
     };
     let mut buf = [0u8; CHUNK_SIZE];
     let mut carried = 0;
@@ -249,10 +251,12 @@ fn main() {
 
                     for (w, local) in locals.iter().enumerate() {
                         let w_remap = &remaps[w];
-                        for r in &local.hours[hour] {
-                            let gid = w_remap[(r.id_err & 0x7FFF) as usize] as usize;
-                            hour_lats[gid].push(r.latency);
-                            if (r.id_err & 0x8000) != 0 {
+                        let hd = &local.hours[hour];
+                        for i in 0..hd.lats.len() {
+                            let r = hd.id_errs[i];
+                            let gid = w_remap[(r & 0x7FFF) as usize] as usize;
+                            hour_lats[gid].push(hd.lats[i]);
+                            if (r & 0x8000) != 0 {
                                 hour_errs[gid] += 1;
                             }
                         }
@@ -292,11 +296,12 @@ fn main() {
             hour_outputs[hour] = out;
         }
     }
-    let output_bytes = hour_outputs.concat();
 
     let out = File::create(output).expect("cannot create summary.txt");
     let mut writer = BufWriter::with_capacity(256 * 1024, out);
-    writer.write_all(&output_bytes).expect("write summary.txt");
+    for h in 0..HOURS {
+        writer.write_all(&hour_outputs[h]).expect("write summary.txt");
+    }
     writer.flush().expect("flush output");
     drop(writer);
 }

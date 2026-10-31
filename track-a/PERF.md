@@ -10,6 +10,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 3 | A2: open-addressed compact endpoint table with word-wise hash | pending | 2.180 | 36 | 8.85 |
 | 4 | A3: parallel line-snapped streaming parse and chronological assembly | pending | 1.004 | 52 | 11.45 |
 | 5 | A4: FNV-1a interning and line count reduction (S=287) | pending | 1.010 | 52 | 11.15 |
+| 6 | A5: structure-of-arrays records and direct streamed output | pending | 0.213 | 39 | 18.39 |
 
 ### Experiment Log
 - **Step 2 (A1 - Positional parsing & integer hour index):**
@@ -28,3 +29,7 @@ Every step from the reference to your final version, each with the live-board ru
   - *Hypothesis:* Replacing word-wise hashing with 64-bit FNV-1a, merging formatted timestamp output into the summary line writer, and eliminating redundant helper functions reduces source code lines $S$ towards $\le 300$ while maintaining identical throughput and cache locality.
   - *Local relative result:* Hyperfine 10 runs on full: 1.010 s ± 0.067 s (2.66x faster than v0 2.684 s). Peak RSS: 52,708 KB (~52.7 MB). Source lines $S = 287$ (Rust 280, Dockerfile 7), $D = 1$. Estimated $K = 11.15$ (vs baseline 7.92).
   - *Verdict:* Kept. Passed L0-L3, 5 identical runs, 49/49 fuzz seeds, and thread count invariance.
+- **Step 6 (A5 - Structure-of-arrays records and direct streamed output):**
+  - *Hypothesis:* Packing latency (u32) and endpoint+err (u16) into separate parallel Vecs achieves true 6 B per record without 2 B struct alignment padding (saving ~6.2 MB across 3.1M records). Streaming formatted hourly buffers directly to output eliminates the 10.1 MB `concat()` heap allocation.
+  - *Local relative result:* Hyperfine 10 runs on full: a_v1c 228.8 ms ± 19.3 ms -> A5 213.2 ms ± 16.5 ms (1.07x faster). Peak RSS dropped from 52.5 MB to 39.2 MB (-13.3 MB, 25.3% reduction). S = 299 lines.
+  - *Verdict:* Kept. Correctness verified on tiny, sample, full, 49/49 fuzz seeds, and threads 1/2/6/12.
