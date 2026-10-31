@@ -31,10 +31,9 @@ impl Table {
     fn hash(name: &[u8]) -> usize {
         let len = name.len();
         if len >= 8 {
-            let first = u64::from_ne_bytes(name[..8].try_into().unwrap());
-            let last = u64::from_ne_bytes(name[len - 8..].try_into().unwrap());
-            let mut h = first ^ last.rotate_left(31) ^ (len as u64);
-            h = (h ^ (h >> 33)).wrapping_mul(0xff51afd7ed558ccd);
+            let first = u64::from_le_bytes(name[0..8].try_into().unwrap());
+            let last = u64::from_le_bytes(name[len - 8..len].try_into().unwrap());
+            let h = first.wrapping_mul(0x517cc1b727220a95) ^ last.rotate_left(17) ^ (len as u64);
             h as usize
         } else {
             let mut h = len as u64;
@@ -46,19 +45,21 @@ impl Table {
     }
 
     fn intern(&mut self, name: &[u8]) -> u16 {
-        if (self.names.len() + 1) * 2 >= self.slots.len() {
+        let mut mask = self.slots.len() - 1;
+        if self.names.len() * 2 >= self.slots.len() {
             let mut next = vec![0u16; self.slots.len() * 2];
-            let mask = next.len() - 1;
+            let next_mask = next.len() - 1;
             for (id, n) in self.names.iter().enumerate() {
-                let mut i = Self::hash(n) & mask;
+                let mut i = Self::hash(n) & next_mask;
                 while next[i] != 0 {
-                    i = (i + 1) & mask;
+                    i = (i + 1) & next_mask;
                 }
                 next[i] = (id + 1) as u16;
             }
             self.slots = next;
+            mask = self.slots.len() - 1;
         }
-        let mask = self.slots.len() - 1;
+
         let mut i = Self::hash(name) & mask;
         loop {
             let slot = self.slots[i];
@@ -87,6 +88,26 @@ struct Local {
 }
 
 #[inline(always)]
+fn find_space_swar(buf: &[u8], mut i: usize) -> usize {
+    loop {
+        if i + 8 <= buf.len() {
+            let w = u64::from_le_bytes(buf[i..i + 8].try_into().unwrap());
+            let x = w ^ 0x2020202020202020;
+            let m = x.wrapping_sub(0x0101010101010101) & !x & 0x8080808080808080;
+            if m != 0 {
+                return i + (m.trailing_zeros() as usize >> 3);
+            }
+            i += 8;
+        } else {
+            while buf[i] != b' ' {
+                i += 1;
+            }
+            return i;
+        }
+    }
+}
+
+#[inline(always)]
 fn parse_line(buf: &[u8], pos: usize, local: &mut Local) -> usize {
     let day = (buf[pos + 8] - b'0') as usize * 10 + (buf[pos + 9] - b'0') as usize;
     let day_idx = if buf[pos + 6] == b'0' {
@@ -101,11 +122,7 @@ fn parse_line(buf: &[u8], pos: usize, local: &mut Local) -> usize {
         i += 1;
     }
     let ep_start = i + 1;
-    i = ep_start;
-    while buf[i] != b' ' {
-        i += 1;
-    }
-    let ep_end = i;
+    let ep_end = find_space_swar(buf, ep_start);
     let err = (buf[ep_end + 1] == b'5') as u16;
     let mut latency = 0u32;
     i = ep_end + 5;

@@ -16,6 +16,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 9 | A11: 12-thread default worker pool | pending | 0.214 | 39 | 19.58 |
 | 10 | A15: per-hour counting sort gather into flat Vec | pending | 0.139 | 44 | 20.25 |
 | 11 | A10: pipelined streaming output via mpsc channel | pending | 0.149 | 42 | 21.35 |
+| 12 | A16: SWAR 8-byte word scan for endpoint boundaries | pending | 0.135 | 41 | 22.84 |
 
 ### Experiment Log
 - **Step 2 (A1 - Positional parsing & integer hour index):**
@@ -67,4 +68,9 @@ Every step from the reference to your final version, each with the live-board ru
   - *Hypothesis:* Streaming completed hours to the main writer thread via a safe standard library channel allows immediate sequential writing and per-hour buffer reclamation, overlapping disk I/O with worker compute and eliminating all 72 formatted hour buffers from peak memory.
   - *Local relative result:* Peak RSS dropped from 44.5 MB to 42.1 MB (-2.4 MB). Under cgroup v2 measurement, `memory.peak` dropped from 55.4 MB to 45.9 MB (-9.5 MB reduction in peak kernel footprint). Source lines reduced from 334 to 331 (-3 lines).
   - *K-accounting:* Evaluated at target (T ~40 ms, S ~330): $\Delta S = -3 \implies \times 1.0014$; memory saving $\Delta M \approx -9.5\text{ MB} \implies \times 1.066$; net gain = $+6.8\% \ge 1\%$.
+  - *Verdict:* Kept. Correctness verified on full, sample, tiny, 49/49 fuzz seeds, and threads 1/2/6/12.
+- **Step 14 (A16 - SWAR 8-byte word scan for endpoint boundaries):**
+  - *Hypothesis:* Scanning 8 bytes per iteration via safe 64-bit integer arithmetic (`u64::from_le_bytes` with zero-byte detection) replaces scalar byte-by-byte scanning for endpoint path delimiters, significantly speeding up the parse loop.
+  - *Local relative result:* Hyperfine 10 runs on full: 149.9 ms ± 13.0 ms -> 135.4 ms ± 8.0 ms (saving 14.5 ms, 1.11x speedup, range min 124.5 ms). Peak RSS: 41,192 KB (~41.2 MB). Minor page faults dropped to 11,125. S = 346 lines (+15 lines).
+  - *K-accounting:* Evaluated at target (T ~40 ms, S ~330): $\Delta T \approx -3.87\text{ ms} \implies \times 1.0522$; $\Delta S = +15 \implies \times 0.9934$; net gain = $+4.52\% \ge 1\%$.
   - *Verdict:* Kept. Correctness verified on full, sample, tiny, 49/49 fuzz seeds, and threads 1/2/6/12.
