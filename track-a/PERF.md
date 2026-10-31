@@ -14,6 +14,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 7 | A6: single-pass forward line parser | pending | 0.205 | 39 | 18.86 |
 | 8 | A7: 8-byte word-wise endpoint hash table with u16 slots | pending | 0.205 | 39 | 18.97 |
 | 9 | A11: 12-thread default worker pool | pending | 0.214 | 39 | 19.58 |
+| 10 | A15: per-hour counting sort gather into flat Vec | pending | 0.139 | 44 | 20.25 |
 
 ### Experiment Log
 - **Step 2 (A1 - Positional parsing & integer hour index):**
@@ -56,3 +57,8 @@ Every step from the reference to your final version, each with the live-board ru
   - *Hypothesis:* With lightweight single-pass line parsing and 8-byte word-wise table interning, thread serialization and memory contention are minimal. Expanding default workers from 6 to 12 allows all 72 hourly aggregations to map evenly (6 hours per worker) and saturate available hardware cores.
   - *Local relative result:* Hyperfine 10 runs on full: A7 (6 workers) 220.8 ms ± 13.0 ms -> A11 (12 workers) 214.0 ms ± 9.2 ms (1.03x faster locally, up to 1.28x under explicit THREADS=12 175.0 ms). Peak RSS: 39,168 KB (~39.2 MB). S = 316 lines.
   - *Verdict:* Kept. Correctness verified on tiny, sample, full, 49/49 fuzz seeds, and threads 1/2/6/12.
+- **Step 12 (A15 - Per-hour counting sort gather into flat Vec):**
+  - *Hypothesis:* Counting sort (histogram + prefix sum + scatter into one flat `Vec<u32>`) eliminates 1,842 small `Vec` allocations per worker per hour (~22,000 allocations across 12 threads), improves cache locality, and reduces minor page faults.
+  - *Local relative result:* Hyperfine 10 runs on full: baseline 147.2 ms ± 18.5 ms -> A15 139.3 ms ± 8.0 ms (saving 7.9 ms, 1.06x speedup). Peak RSS dropped from 47.1 MB to 44.5 MB (-2.6 MB). Page faults reduced by 612. System time dropped from 0.46s to 0.35s. S = 334 lines.
+  - *K-accounting:* Evaluated at target (T ~40 ms, S ~330): $\Delta T \approx -2.15\text{ ms} \implies \times 1.0280$; $\Delta S = +22 \implies \times 0.9904$; net gain = $+1.81\% \ge 1\%$.
+  - *Verdict:* Kept. Correctness verified on full, sample, tiny, 49/49 fuzz seeds, and threads 1/2/6/12.

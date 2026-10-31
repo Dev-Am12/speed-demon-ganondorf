@@ -20,7 +20,10 @@ struct Table {
 
 impl Table {
     fn new() -> Self {
-        Self { slots: vec![0u16; 4096], names: Vec::with_capacity(2048) }
+        Self {
+            slots: vec![0u16; 4096],
+            names: Vec::with_capacity(2048),
+        }
     }
 
     #[inline(always)]
@@ -34,7 +37,9 @@ impl Table {
             h as usize
         } else {
             let mut h = len as u64;
-            for &b in name { h = (h ^ b as u64).wrapping_mul(0x100000001b3); }
+            for &b in name {
+                h = (h ^ b as u64).wrapping_mul(0x100000001b3);
+            }
             h as usize
         }
     }
@@ -45,7 +50,9 @@ impl Table {
             let mask = next.len() - 1;
             for (id, n) in self.names.iter().enumerate() {
                 let mut i = Self::hash(n) & mask;
-                while next[i] != 0 { i = (i + 1) & mask; }
+                while next[i] != 0 {
+                    i = (i + 1) & mask;
+                }
                 next[i] = (id + 1) as u16;
             }
             self.slots = next;
@@ -60,7 +67,9 @@ impl Table {
                 self.slots[i] = (id + 1) as u16;
                 return id as u16;
             }
-            if self.names[(slot - 1) as usize] == name { return slot - 1; }
+            if self.names[(slot - 1) as usize] == name {
+                return slot - 1;
+            }
             i = (i + 1) & mask;
         }
     }
@@ -79,14 +88,22 @@ struct Local {
 #[inline(always)]
 fn parse_line(buf: &[u8], pos: usize, local: &mut Local) -> usize {
     let day = (buf[pos + 8] - b'0') as usize * 10 + (buf[pos + 9] - b'0') as usize;
-    let day_idx = if buf[pos + 6] == b'0' { day - 30 } else { 1 + day };
+    let day_idx = if buf[pos + 6] == b'0' {
+        day - 30
+    } else {
+        1 + day
+    };
     let hour = day_idx * 24 + ((buf[pos + 11] - b'0') * 10 + buf[pos + 12] - b'0') as usize - 18;
 
     let mut i = pos + 28;
-    while buf[i] != b' ' { i += 1; }
+    while buf[i] != b' ' {
+        i += 1;
+    }
     let ep_start = i + 1;
     i = ep_start;
-    while buf[i] != b' ' { i += 1; }
+    while buf[i] != b' ' {
+        i += 1;
+    }
     let ep_end = i;
     let err = (buf[ep_end + 1] == b'5') as u16;
     let mut latency = 0u32;
@@ -106,10 +123,12 @@ fn parse_line(buf: &[u8], pos: usize, local: &mut Local) -> usize {
 fn parse_worker_range(file: &File, mut start: usize, end: usize) -> Local {
     let mut local = Local {
         table: Table::new(),
-        hours: (0..HOURS).map(|_| HourData {
-            lats: Vec::with_capacity(4096),
-            id_errs: Vec::with_capacity(4096),
-        }).collect(),
+        hours: (0..HOURS)
+            .map(|_| HourData {
+                lats: Vec::with_capacity(4096),
+                id_errs: Vec::with_capacity(4096),
+            })
+            .collect(),
     };
     let mut buf = [0u8; CHUNK_SIZE];
     let mut carried = 0;
@@ -153,8 +172,14 @@ fn percentile_values(latencies: &mut [u32]) -> (u32, u32, u32) {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let input = args.get(1).map(String::as_str).unwrap_or("/data/requests.log");
-    let output = args.get(2).map(String::as_str).unwrap_or("/out/summary.txt");
+    let input = args
+        .get(1)
+        .map(String::as_str)
+        .unwrap_or("/data/requests.log");
+    let output = args
+        .get(2)
+        .map(String::as_str)
+        .unwrap_or("/out/summary.txt");
     let file = File::open(input).expect("cannot open requests.log");
     let len = file.metadata().expect("cannot stat requests.log").len() as usize;
     if len == 0 {
@@ -236,18 +261,41 @@ fn main() {
             let remaps = Arc::clone(&remaps);
             handles.push(scope.spawn(move || {
                 let mut my_hours = Vec::new();
-                let mut hour_lats: Vec<Vec<u32>> = (0..num_endpoints).map(|_| Vec::new()).collect();
-                let mut hour_errs = vec![0u32; num_endpoints];
+                let mut flat_lats: Vec<u32> = Vec::with_capacity(65536);
+                let mut counts = vec![0u32; num_endpoints + 1];
+                let mut offsets = vec![0u32; num_endpoints + 1];
+                let mut err_counts = vec![0u32; num_endpoints];
+                let mut cursors = vec![0u32; num_endpoints];
 
                 loop {
                     let hour = next.fetch_add(1, Ordering::Relaxed);
                     if hour >= HOURS {
                         break;
                     }
-                    for lats in hour_lats.iter_mut() {
-                        lats.clear();
+                    counts.fill(0);
+                    err_counts.fill(0);
+
+                    for (w, local) in locals.iter().enumerate() {
+                        let w_remap = &remaps[w];
+                        for &r in &local.hours[hour].id_errs {
+                            let gid = w_remap[(r & 0x7FFF) as usize] as usize;
+                            counts[gid] += 1;
+                            if (r & 0x8000) != 0 {
+                                err_counts[gid] += 1;
+                            }
+                        }
                     }
-                    hour_errs.fill(0);
+
+                    let mut sum = 0u32;
+                    for i in 0..num_endpoints {
+                        offsets[i] = sum;
+                        cursors[i] = sum;
+                        sum += counts[i];
+                    }
+                    offsets[num_endpoints] = sum;
+                    if flat_lats.len() < sum as usize {
+                        flat_lats.resize(sum as usize, 0);
+                    }
 
                     for (w, local) in locals.iter().enumerate() {
                         let w_remap = &remaps[w];
@@ -255,10 +303,9 @@ fn main() {
                         for i in 0..hd.lats.len() {
                             let r = hd.id_errs[i];
                             let gid = w_remap[(r & 0x7FFF) as usize] as usize;
-                            hour_lats[gid].push(hd.lats[i]);
-                            if (r & 0x8000) != 0 {
-                                hour_errs[gid] += 1;
-                            }
+                            let slot = cursors[gid] as usize;
+                            cursors[gid] += 1;
+                            flat_lats[slot] = hd.lats[i];
                         }
                     }
 
@@ -266,13 +313,15 @@ fn main() {
                     let (h, d) = ((hour + 18) % 24, (hour + 18) / 24);
                     let date_str = DATES[d];
                     for ep in 0..num_endpoints {
-                        let lats = &mut hour_lats[ep];
-                        let n = lats.len();
+                        let start = offsets[ep] as usize;
+                        let end = offsets[ep + 1] as usize;
+                        let n = end - start;
                         if n == 0 {
                             continue;
                         }
-                        let (p50, p95, p99) = percentile_values(lats);
-                        let errors = hour_errs[ep];
+                        let ep_lats = &mut flat_lats[start..end];
+                        let (p50, p95, p99) = percentile_values(ep_lats);
+                        let errors = err_counts[ep];
                         let ep_name = std::str::from_utf8(&names[ep]).unwrap();
                         let _ = write!(
                             out,
@@ -300,7 +349,9 @@ fn main() {
     let out = File::create(output).expect("cannot create summary.txt");
     let mut writer = BufWriter::with_capacity(256 * 1024, out);
     for h in 0..HOURS {
-        writer.write_all(&hour_outputs[h]).expect("write summary.txt");
+        writer
+            .write_all(&hour_outputs[h])
+            .expect("write summary.txt");
     }
     writer.flush().expect("flush output");
     drop(writer);
