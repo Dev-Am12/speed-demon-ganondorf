@@ -1,10 +1,65 @@
-// Track A (Ingest): single-threaded baseline (v0) with fixed-offset parsing (A1).
+// Track A (Ingest): single-threaded baseline with compact endpoint table (A2).
 // Implements the contract defined in specs/a-ingest.md (hackathon-raptors/speed-demon-2026).
-// No threads, no unsafe, no SIMD, no mmap, no custom hashers (GR-P2, PLAN §6, §7.1, §11).
+// No threads, no unsafe, no SIMD, no mmap (GR-P2, PLAN §6, §7.1, §11).
 
-use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
+
+struct Table {
+    slots: Vec<usize>,
+    names: Vec<Vec<u8>>,
+}
+
+impl Table {
+    fn new() -> Self {
+        Self {
+            slots: vec![0; 4096],
+            names: Vec::with_capacity(2048),
+        }
+    }
+
+    fn hash(name: &[u8]) -> u64 {
+        let mut h = 0x9e3779b97f4a7c15u64 ^ name.len() as u64;
+        for part in name.chunks(8) {
+            let mut word = [0u8; 8];
+            word[..part.len()].copy_from_slice(part);
+            let x = u64::from_le_bytes(word).wrapping_add(0x9e3779b97f4a7c15);
+            h ^= (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+            h = h.rotate_left(27).wrapping_mul(5).wrapping_add(0x52dce729);
+        }
+        h ^ (h >> 33)
+    }
+
+    fn intern(&mut self, name: &[u8]) -> usize {
+        if (self.names.len() + 1) * 10 >= self.slots.len() * 7 {
+            let mut next = vec![0; self.slots.len() * 2];
+            let mask = next.len() - 1;
+            for (id, n) in self.names.iter().enumerate() {
+                let mut i = Self::hash(n) as usize & mask;
+                while next[i] != 0 {
+                    i = (i + 1) & mask;
+                }
+                next[i] = id + 1;
+            }
+            self.slots = next;
+        }
+        let mask = self.slots.len() - 1;
+        let mut i = Self::hash(name) as usize & mask;
+        loop {
+            let slot = self.slots[i];
+            if slot == 0 {
+                let id = self.names.len();
+                self.names.push(name.to_vec());
+                self.slots[i] = id + 1;
+                return id;
+            }
+            if self.names[slot - 1].as_slice() == name {
+                return slot - 1;
+            }
+            i = (i + 1) & mask;
+        }
+    }
+}
 
 /// Per-(hour, endpoint) statistics accumulator.
 struct Group {
@@ -74,8 +129,7 @@ fn main() {
         })
         .collect();
 
-    let mut endpoint_to_id: HashMap<Vec<u8>, usize> = HashMap::new();
-    let mut endpoints: Vec<Vec<u8>> = Vec::new();
+    let mut table = Table::new();
     let mut groups: Vec<Vec<Group>> = (0..NUM_HOURS).map(|_| Vec::new()).collect();
 
     loop {
@@ -110,21 +164,16 @@ fn main() {
         }
         let is_error = line[ep_end + 1] == b'5';
 
-        let endpoint_id = match endpoint_to_id.get(endpoint) {
-            Some(&id) => id,
-            None => {
-                let id = endpoints.len();
-                endpoints.push(endpoint.to_vec());
-                endpoint_to_id.insert(endpoint.to_vec(), id);
-                for h in 0..NUM_HOURS {
-                    groups[h].push(Group {
-                        latencies: Vec::new(),
-                        errors: 0,
-                    });
-                }
-                id
+        let count_before = table.names.len();
+        let endpoint_id = table.intern(endpoint);
+        if table.names.len() > count_before {
+            for h in 0..NUM_HOURS {
+                groups[h].push(Group {
+                    latencies: Vec::new(),
+                    errors: 0,
+                });
             }
-        };
+        }
 
         let grp = &mut groups[hour_idx][endpoint_id];
         grp.latencies.push(latency);
@@ -133,8 +182,8 @@ fn main() {
         }
     }
 
-    let mut sorted_endpoint_ids: Vec<usize> = (0..endpoints.len()).collect();
-    sorted_endpoint_ids.sort_unstable_by(|&a, &b| endpoints[a].cmp(&endpoints[b]));
+    let mut sorted_endpoint_ids: Vec<usize> = (0..table.names.len()).collect();
+    sorted_endpoint_ids.sort_unstable_by(|&a, &b| table.names[a].cmp(&table.names[b]));
 
     let mut out_buf: Vec<u8> = Vec::with_capacity(12 * 1024 * 1024);
 
@@ -155,7 +204,7 @@ fn main() {
 
             let errors = grp.errors;
             let error_ppm = (errors as u64 * 1_000_000 / count as u64) as u32;
-            let ep_bytes = &endpoints[ep_id];
+            let ep_bytes = &table.names[ep_id];
 
             write!(out_buf, "{} ", hour_str).expect("in-memory write to Vec<u8> cannot fail");
             out_buf.extend_from_slice(ep_bytes);
