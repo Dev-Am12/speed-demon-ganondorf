@@ -93,6 +93,7 @@ fn parse_u32(buf: &[u8], pos: &mut usize) -> u32 {
 fn shortest_path(
     offsets: &[u32],
     edges: &[AtomicU64],
+    has_incoming: &[u64],
     s: u32,
     t: u32,
     dist: &mut [u64],
@@ -101,6 +102,17 @@ fn shortest_path(
 ) -> i64 {
     if s == t {
         return 0;
+    }
+
+    // D6a: degree-zero short-circuit check.
+    // If s has out-degree 0 or t has in-degree 0 (and s != t), t is provably unreachable.
+    if offsets[s as usize] == offsets[s as usize + 1] {
+        return -1;
+    }
+    let t_word = (t as usize) >> 6;
+    let t_bit = 1u64 << ((t as usize) & 63);
+    if (has_incoming[t_word] & t_bit) == 0 {
+        return -1;
     }
 
     dist[s as usize] = 0;
@@ -206,14 +218,17 @@ fn main() {
     bounds.dedup();
     let actual_workers = bounds.len() - 1;
 
-    // Pass 1 (D1/D2): parallel count of outgoing degrees
+    // Pass 1 (D1/D2): parallel count of outgoing degrees and D6a incoming presence bitset
     let out_degrees: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
+    let has_incoming_words = (n + 63) / 64;
+    let has_incoming: Vec<AtomicU64> = (0..has_incoming_words).map(|_| AtomicU64::new(0)).collect();
 
     std::thread::scope(|scope| {
         for w in 0..actual_workers {
             let start = bounds[w];
             let end = bounds[w + 1];
             let out_deg = &out_degrees;
+            let has_in = &has_incoming;
             let f = &file;
             scope.spawn(move || {
                 let mut buf = [0u8; CHUNK_SIZE];
@@ -237,9 +252,10 @@ fn main() {
                     let mut pos = 0;
                     while pos <= last_nl {
                         let u = parse_u32(&buf, &mut pos);
-                        let _v = parse_u32(&buf, &mut pos);
+                        let v = parse_u32(&buf, &mut pos);
                         let _w = parse_u32(&buf, &mut pos);
                         out_deg[u as usize].fetch_add(1, Ordering::Relaxed);
+                        has_in[(v as usize) >> 6].fetch_or(1 << ((v as usize) & 63), Ordering::Relaxed);
                         while pos <= last_nl && buf[pos] != b'\n' {
                             pos += 1;
                         }
@@ -252,6 +268,8 @@ fn main() {
             });
         }
     });
+
+    let has_incoming_bits: Vec<u64> = has_incoming.into_iter().map(|a| a.into_inner()).collect();
 
     // Prefix sum to compute offsets and cursor slots
     let mut offsets = vec![0u32; n + 1];
@@ -371,6 +389,7 @@ fn main() {
                         let ans = shortest_path(
                             &offsets,
                             &edges,
+                            &has_incoming_bits,
                             s,
                             t,
                             &mut dist,
