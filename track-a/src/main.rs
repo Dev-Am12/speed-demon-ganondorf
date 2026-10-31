@@ -16,49 +16,88 @@ const AGG_WORKERS: usize = 12;
 const DATES: [&str; 4] = ["2026-10-30", "2026-10-31", "2026-11-01", "2026-11-02"];
 
 struct Table {
-    slots: Vec<u16>,
-    names: Vec<Vec<u8>>,
+    slots: Vec<u64>,
+    arena: Vec<u8>,
+    offsets: Vec<(u32, u16)>,
 }
 
 impl Table {
     fn new() -> Self {
         Self {
-            slots: vec![0u16; 4096],
-            names: Vec::with_capacity(2048),
+            slots: vec![0u64; 4096],
+            arena: Vec::with_capacity(65536),
+            offsets: Vec::with_capacity(2048),
         }
     }
 
     #[inline(always)]
-    fn hash(name: &[u8]) -> usize {
+    fn hash(name: &[u8]) -> (u32, usize) {
         let len = name.len();
-        if len >= 8 {
+        let h = if len >= 8 {
             let first = u64::from_le_bytes(name[0..8].try_into().unwrap());
             let last = u64::from_le_bytes(name[len - 8..len].try_into().unwrap());
-            let h = first.wrapping_mul(0x517cc1b727220a95) ^ last.rotate_left(17) ^ (len as u64);
-            h as usize
+            first.wrapping_mul(0x517cc1b727220a95) ^ last.rotate_left(17) ^ (len as u64)
         } else {
             let mut h = len as u64;
             for &b in name {
                 h = (h ^ b as u64).wrapping_mul(0x100000001b3);
             }
-            h as usize
+            h
+        };
+        let tag = (h >> 32) as u32 ^ (h as u32);
+        (tag, h as usize)
+    }
+
+    fn grow(&mut self) {
+        let mask = self.slots.len() * 2 - 1;
+        let mut new_slots = vec![0u64; mask + 1];
+        for &s in &self.slots {
+            if s != 0 {
+                let mut i = Self::hash(self.get_name((s as u32 - 1) as u16)).1 & mask;
+                while new_slots[i] != 0 {
+                    i = (i + 1) & mask;
+                }
+                new_slots[i] = s;
+            }
         }
+        self.slots = new_slots;
+    }
+
+    #[inline(always)]
+    fn get_name(&self, id: u16) -> &[u8] {
+        let (start, len) = self.offsets[id as usize];
+        &self.arena[start as usize..start as usize + len as usize]
     }
 
     fn intern(&mut self, name: &[u8]) -> u16 {
-        let mut i = Self::hash(name) & 4095;
+        let (tag, h) = Self::hash(name);
+        let mut mask = self.slots.len() - 1;
+        let mut i = h & mask;
         loop {
             let slot = self.slots[i];
             if slot == 0 {
-                let id = self.names.len();
-                self.names.push(name.to_vec());
-                self.slots[i] = (id + 1) as u16;
-                return id as u16;
+                if self.offsets.len() * 2 >= self.slots.len() {
+                    self.grow();
+                    mask = self.slots.len() - 1;
+                    i = h & mask;
+                    while self.slots[i] != 0 {
+                        i = (i + 1) & mask;
+                    }
+                }
+                let id = self.offsets.len() as u16;
+                self.offsets
+                    .push((self.arena.len() as u32, name.len() as u16));
+                self.arena.extend_from_slice(name);
+                self.slots[i] = ((tag as u64) << 32) | (id as u64 + 1);
+                return id;
             }
-            if self.names[(slot - 1) as usize] == name {
-                return slot - 1;
+            if (slot >> 32) as u32 == tag {
+                let id = (slot as u32 - 1) as u16;
+                if self.get_name(id) == name {
+                    return id;
+                }
             }
-            i = (i + 1) & 4095;
+            i = (i + 1) & mask;
         }
     }
 }
@@ -251,9 +290,11 @@ fn main() {
             .collect()
     });
 
-    let mut names = Vec::new();
+    let mut names = Vec::with_capacity(2048 * locals.len());
     for local in &locals {
-        names.extend_from_slice(&local.table.names);
+        for id in 0..local.table.offsets.len() as u16 {
+            names.push(local.table.get_name(id));
+        }
     }
     names.sort_unstable();
     names.dedup();
@@ -264,11 +305,8 @@ fn main() {
         for local in &locals {
             let names = &names;
             tasks.push(scope.spawn(move || {
-                local
-                    .table
-                    .names
-                    .iter()
-                    .map(|n| names.binary_search(n).unwrap() as u16)
+                (0..local.table.offsets.len() as u16)
+                    .map(|id| names.binary_search(&local.table.get_name(id)).unwrap() as u16)
                     .collect()
             }));
         }
@@ -360,7 +398,7 @@ fn main() {
                         let (p50, p95, p99) = percentile_values(ep_lats);
                         let errors = err_counts[ep];
                         out.extend_from_slice(&prefixes[hour]);
-                        out.extend_from_slice(&names[ep]);
+                        out.extend_from_slice(names[ep]);
                         out.push(b' ');
                         push_field(&mut out, n as u64, b' ');
                         push_field(&mut out, p50 as u64, b' ');
