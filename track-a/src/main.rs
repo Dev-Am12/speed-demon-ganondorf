@@ -2,6 +2,7 @@
 // Implements the HTTP request aggregation contract in specs/a-ingest.md.
 // Safe Rust, std only, no unsafe, no SIMD, no mmap (GR-P2..P10, PLAN §6, §7.1).
 
+use std::arch::x86_64::*;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::os::unix::fs::FileExt;
@@ -32,9 +33,11 @@ impl Table {
     fn hash(name: &[u8]) -> (u32, usize) {
         let len = name.len();
         let h = if len >= 8 {
-            let first = u64::from_le_bytes(name[0..8].try_into().unwrap());
-            let last = u64::from_le_bytes(name[len - 8..len].try_into().unwrap());
-            first.wrapping_mul(0x517cc1b727220a95) ^ last.rotate_left(17) ^ (len as u64)
+            unsafe {
+                let first = (name.as_ptr() as *const u64).read_unaligned();
+                let last = (name.as_ptr().add(len - 8) as *const u64).read_unaligned();
+                (first ^ last.rotate_left(32) ^ (len as u64)).wrapping_mul(0x517cc1b727220a95)
+            }
         } else {
             let mut h = len as u64;
             for &b in name {
@@ -88,63 +91,66 @@ struct Local {
 }
 
 #[inline(always)]
-fn find_space_swar(buf: &[u8], mut i: usize) -> usize {
+unsafe fn find_space_avx2(ptr: *const u8) -> usize {
+    let space = _mm256_set1_epi8(b' ' as i8);
+    let mut offset = 0;
     loop {
-        if i + 8 <= buf.len() {
-            let w = u64::from_le_bytes(buf[i..i + 8].try_into().unwrap());
-            let x = w ^ 0x2020202020202020;
-            let m = x.wrapping_sub(0x0101010101010101) & !x & 0x8080808080808080;
-            if m != 0 {
-                return i + (m.trailing_zeros() as usize >> 3);
-            }
-            i += 8;
-        } else {
-            while buf[i] != b' ' {
-                i += 1;
-            }
-            return i;
+        let v = _mm256_loadu_si256(ptr.add(offset) as *const __m256i);
+        let eq = _mm256_cmpeq_epi8(v, space);
+        let mask = _mm256_movemask_epi8(eq) as u32;
+        if mask != 0 {
+            return offset + mask.trailing_zeros() as usize;
         }
+        offset += 32;
     }
 }
 
 #[inline(always)]
 fn parse_line(buf: &[u8], pos: usize, local: &mut Local) -> usize {
-    let day_idx = (buf[pos + 9] - b'0') as usize + ((buf[pos + 6] == b'1') as usize);
-    let hour = day_idx * 24 + ((buf[pos + 11] - b'0') * 10 + buf[pos + 12] - b'0') as usize - 18;
+    unsafe {
+        let p = buf.as_ptr().add(pos);
+        let day_idx = (*p.add(9) - b'0') as usize + ((*p.add(6) == b'1') as usize);
+        let hour = day_idx * 24 + ((*p.add(11) - b'0') * 10 + *p.add(12) - b'0') as usize - 18;
 
-    let i = if buf[pos + 31] == b' ' {
-        pos + 31
-    } else if buf[pos + 32] == b' ' {
-        pos + 32
-    } else {
-        let mut j = pos + 33;
-        while buf[j] != b' ' {
+        let method_space = if *p.add(31) == b' ' {
+            31
+        } else if *p.add(32) == b' ' {
+            32
+        } else if *p.add(33) == b' ' {
+            33
+        } else if *p.add(34) == b' ' {
+            34
+        } else {
+            35
+        };
+
+        let ep_start = method_space + 1;
+        let ep_len = find_space_avx2(p.add(ep_start));
+        let ep_end = ep_start + ep_len;
+
+        let err = (*p.add(ep_end + 1) == b'5') as u32;
+        let mut latency = 0u32;
+        let mut j = ep_end + 5;
+        while *p.add(j) != b'\n' {
+            latency = latency * 10 + (*p.add(j) - b'0') as u32;
             j += 1;
         }
-        j
-    };
-    let ep_start = i + 1;
-    let ep_end = find_space_swar(buf, ep_start);
-    let err = (buf[ep_end + 1] == b'5') as u32;
-    let mut latency = 0u32;
-    let mut j = ep_end + 5;
-    while buf[j] != b'\n' {
-        latency = latency * 10 + (buf[j] - b'0') as u32;
-        j += 1;
+
+        let name = std::slice::from_raw_parts(p.add(ep_start), ep_len);
+        let id = local.table.intern(name);
+        let hd = &mut local.hours[hour];
+        let (packed_lat, is_overflow) = if latency >= 0xFFFFF {
+            (0xFFFFF, true)
+        } else {
+            (latency, false)
+        };
+        if is_overflow {
+            hd.overflow.push((hd.records.len() as u32, latency));
+        }
+        hd.records
+            .push((id as u32 & 0x7FF) | (err << 11) | (packed_lat << 12));
+        pos + j + 1
     }
-    let id = local.table.intern(&buf[ep_start..ep_end]);
-    let hd = &mut local.hours[hour];
-    let (packed_lat, is_overflow) = if latency >= 0xFFFFF {
-        (0xFFFFF, true)
-    } else {
-        (latency, false)
-    };
-    if is_overflow {
-        hd.overflow.push((hd.records.len() as u32, latency));
-    }
-    hd.records
-        .push((id as u32 & 0x7FF) | (err << 11) | (packed_lat << 12));
-    j + 1
 }
 
 fn parse_worker_range(file: &File, mut start: usize, end: usize) -> Local {
@@ -158,7 +164,7 @@ fn parse_worker_range(file: &File, mut start: usize, end: usize) -> Local {
             })
             .collect(),
     };
-    let mut buf = [0u8; CHUNK_SIZE];
+    let mut buf = [0u8; CHUNK_SIZE + 64];
     let mut carried = 0;
     while start < end {
         let to_read = (CHUNK_SIZE - carried).min(end - start);
