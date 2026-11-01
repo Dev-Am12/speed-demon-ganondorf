@@ -297,8 +297,8 @@ unsafe fn token_key(t: &[u8], s: usize) -> Option<(u64, u64)> {
                 _mm_cmpgt_epi8(v, _mm_set1_epi8(0x2F)),
                 _mm_cmpgt_epi8(_mm_set1_epi8(0x3A), v),
             );
-            let alnum = (_mm_movemask_epi8(_mm_or_si128(up, _mm_or_si128(lo_c, dg))) as u32)
-                & 0xFFFF;
+            let alnum =
+                (_mm_movemask_epi8(_mm_or_si128(up, _mm_or_si128(lo_c, dg))) as u32) & 0xFFFF;
             if alnum != 0xFFFF {
                 let len = (!alnum).trailing_zeros() as usize; // 1..=15
                 let lowered = _mm_or_si128(v, _mm_and_si128(up, _mm_set1_epi8(0x20)));
@@ -306,14 +306,25 @@ unsafe fn token_key(t: &[u8], s: usize) -> Option<(u64, u64)> {
                 _mm_storeu_si128(b.as_mut_ptr().cast::<__m128i>(), lowered);
                 let w0 = u64::from_le_bytes(b[0..8].try_into().unwrap());
                 let w1 = u64::from_le_bytes(b[8..16].try_into().unwrap());
-                let lo = if len >= 8 { w0 } else { w0 & ((1u64 << (8 * len)) - 1) };
-                let hi = if len <= 8 { 0 } else { w1 & ((1u64 << (8 * (len - 8))) - 1) };
+                let lo = if len >= 8 {
+                    w0
+                } else {
+                    w0 & ((1u64 << (8 * len)) - 1)
+                };
+                let hi = if len <= 8 {
+                    0
+                } else {
+                    w1 & ((1u64 << (8 * (len - 8))) - 1)
+                };
                 return Some((lo, hi));
             }
         }
     }
     // Exact scalar path for long tokens and the last few bytes of the buffer.
-    let end = s + t[s..].iter().take_while(|&&c| BYTE_MAP[c as usize] != 0).count();
+    let end = s + t[s..]
+        .iter()
+        .take_while(|&&c| BYTE_MAP[c as usize] != 0)
+        .count();
     let mut key = None;
     scan(&t[s..end], 0, |_, k| {
         key = k;
@@ -348,7 +359,11 @@ unsafe fn scan_avx2<F: FnMut(usize, Option<(u64, u64)>) -> bool>(
         let starts = alnum & !((alnum << 1) | prev);
         prev = alnum >> 63;
         let limit = if lf != 0 { lf.trailing_zeros() } else { 64 };
-        let mut bits = if limit >= 64 { starts } else { starts & ((1u64 << limit) - 1) };
+        let mut bits = if limit >= 64 {
+            starts
+        } else {
+            starts & ((1u64 << limit) - 1)
+        };
         while bits != 0 {
             let b = bits.trailing_zeros() as usize;
             bits &= bits - 1;
@@ -708,23 +723,6 @@ struct Acc10 {
     ids: [u32; 10],
 }
 
-/// Position weights: POS[k] has bit p set when bit k of p is set.
-const POS: [u64; 6] = {
-    let mut m = [0u64; 6];
-    let mut k = 0usize;
-    while k < 6 {
-        let mut p = 0usize;
-        while p < 64 {
-            if (p >> k) & 1 == 1 {
-                m[k] |= 1u64 << p;
-            }
-            p += 1;
-        }
-        k += 1;
-    }
-    m
-};
-
 impl Acc10 {
     #[inline(always)]
     fn push(&mut self, id: u32) {
@@ -736,20 +734,11 @@ impl Acc10 {
         }
     }
 
-    /// Adds every set bit p of `w` as id base + p.
+    /// Adds every set bit p of `w` as id base + p, in ascending order.
     fn push_word(&mut self, mut w: u64, base: u32) {
-        if self.len < 10 {
-            while w != 0 {
-                self.push(base + w.trailing_zeros());
-                w &= w - 1;
-            }
-        } else {
-            self.count += w.count_ones() as u64;
-            let mut s = base as u64 * w.count_ones() as u64;
-            for (k, m) in POS.iter().enumerate() {
-                s += ((w & m).count_ones() as u64) << k;
-            }
-            self.sum += s;
+        while w != 0 {
+            self.push(base + w.trailing_zeros());
+            w &= w - 1;
         }
     }
 
@@ -793,22 +782,8 @@ struct Scratch {
 #[derive(Clone, Copy)]
 enum Cur {
     Term(u32),
-    List(bool), // whether the current scratch list is non-empty
-    Bits(bool), // whether the current scratch bitset is non-empty
-}
-
-#[inline(always)]
-fn term_nonempty(sh: &Shard, term: u32) -> bool {
-    let len = sh.refs[term as usize].len;
-    len != SKIP && (if len & DENSE != 0 { len & !DENSE != 0 } else { len != 0 })
-}
-
-#[inline(always)]
-fn cur_nonempty(cur: Cur, sh: &Shard) -> bool {
-    match cur {
-        Cur::Term(t) => term_nonempty(sh, t),
-        Cur::List(nonempty) | Cur::Bits(nonempty) => nonempty,
-    }
+    List,
+    Bits,
 }
 
 fn mark(view: SetView<'_>, out: &mut [u64], set: bool) {
@@ -838,19 +813,6 @@ fn mark(view: SetView<'_>, out: &mut [u64], set: bool) {
 /// Finds the first value >= target at or after `start` using exponential/galloping
 /// search followed by a bounded binary search. The caller supplies nondecreasing targets.
 #[inline]
-fn gallop_lower_bound(a: &[u16], start: usize, target: u16) -> usize {
-    if start >= a.len() || a[start] >= target {
-        return start;
-    }
-    let mut step = 1usize;
-    while start + step < a.len() && a[start + step] < target {
-        step = step.saturating_mul(2);
-    }
-    let lo = start + step / 2 + 1;
-    let hi = (start + step + 1).min(a.len());
-    lo + a[lo..hi].partition_point(|&value| value < target)
-}
-
 /// Merge of two sorted lists: intersection, or union when `union` is set.
 fn merge(a: &[u16], b: &[u16], out: &mut Vec<u16>, union: bool) {
     let (mut i, mut j) = (0, 0);
@@ -873,13 +835,11 @@ fn merge(a: &[u16], b: &[u16], out: &mut Vec<u16>, union: bool) {
 /// One left-to-right BOOL step: (current result) op (term rhs), inside one shard.
 fn step(cur: Cur, rhs: u32, op: Op, sh: &Shard, sc: &mut Scratch) -> Cur {
     let words = sh.words();
-    let left_nonempty = cur_nonempty(cur, sh);
-    let right_nonempty = term_nonempty(sh, rhs);
     let right = sh.view(rhs);
     let left = match cur {
         Cur::Term(t) => sh.view(t),
-        Cur::List(_) => SetView::List(&sc.cl),
-        Cur::Bits(_) => SetView::Bits(&sc.cb[..words]),
+        Cur::List => SetView::List(&sc.cl),
+        Cur::Bits => SetView::Bits(&sc.cb[..words]),
     };
     let bits = match op {
         Op::And => left.is_bits() && right.is_bits(),
@@ -892,37 +852,31 @@ fn step(cur: Cur, rhs: u32, op: Op, sh: &Shard, sc: &mut Scratch) -> Cur {
         let t = &mut sc.tb[..words];
         // Track emptiness while producing the result. This lets eval skip the rest of an
         // AND/NOT run on an empty accumulator without rescanning a dense bitset.
-        let mut nonempty = matches!(op, Op::Or) && (left_nonempty || right_nonempty);
         match (op, left, right) {
             (Op::And, SetView::Bits(a), SetView::Bits(b)) => {
                 for ((d, &x), &y) in t.iter_mut().zip(a).zip(b) {
                     *d = x & y;
-                    nonempty |= *d != 0;
                 }
             }
             (Op::Not, SetView::Bits(a), SetView::Bits(b)) => {
                 for ((d, &x), &y) in t.iter_mut().zip(a).zip(b) {
                     *d = x & !y;
-                    nonempty |= *d != 0;
                 }
             }
             _ => {
                 t.fill(0);
                 mark(left, t, true);
                 mark(right, t, matches!(op, Op::Or));
-                if matches!(op, Op::Not) {
-                    nonempty = t.iter().any(|&word| word != 0);
-                }
             }
         }
         std::mem::swap(&mut sc.cb, &mut sc.tb);
-        return Cur::Bits(nonempty);
+        return Cur::Bits;
     }
     let out = &mut sc.tl;
     out.clear();
     match (op, left) {
         (Op::And, _) => {
-            // At least one operand is a list here; filter the shorter one (or merge equals).
+            // At least one operand is a list here; intersect sorted lists or filter by bits.
             let (s, o) = match (left, right) {
                 (SetView::List(a), SetView::List(b)) if a.len() > b.len() => (b, left),
                 (SetView::List(a), _) => (a, right),
@@ -930,22 +884,8 @@ fn step(cur: Cur, rhs: u32, op: Op, sh: &Shard, sc: &mut Scratch) -> Cur {
                 _ => unreachable!(),
             };
             match o {
-                SetView::List(b) if b.len() <= 16 * s.len() => merge(s, b, out, false),
-                SetView::List(b) => {
-                    let (small, large) = if s.len() <= b.len() { (s, b) } else { (b, s) };
-                    let mut j = 0usize;
-                    for &x in small {
-                        j = gallop_lower_bound(large, j, x);
-                        if j < large.len() && large[j] == x {
-                            out.push(x);
-                            j += 1;
-                        }
-                        if j == large.len() {
-                            break;
-                        }
-                    }
-                }
-                _ => out.extend(s.iter().copied().filter(|&x| o.contains(x))),
+                SetView::List(b) => merge(s, b, out, false),
+                SetView::Bits(_) => out.extend(s.iter().copied().filter(|&x| o.contains(x))),
             }
         }
         (Op::Or, SetView::List(a)) => {
@@ -963,9 +903,8 @@ fn step(cur: Cur, rhs: u32, op: Op, sh: &Shard, sc: &mut Scratch) -> Cur {
         }
         _ => {}
     }
-    let nonempty = !out.is_empty();
     std::mem::swap(&mut sc.cl, &mut sc.tl);
-    Cur::List(nonempty)
+    Cur::List
 }
 
 /// Evaluates one query on one shard and folds the result into `a`.
@@ -976,39 +915,13 @@ fn eval(q: &Query, plans: &[PhrasePlan], docs: &[u8], sh: &Shard, sc: &mut Scrat
             let mut cur = Cur::Term(terms[0]);
             let mut i = 1usize;
             while i < m {
-                if !cur_nonempty(cur, sh) {
-                    // Empty AND/NOT results remain empty. The first subsequent OR can
-                    // restart directly from its right-hand term: empty OR S(t) == S(t).
-                    while i < m && !matches!(ops[i - 1], Op::Or) {
-                        i += 1;
-                    }
-                    if i == m {
-                        break;
-                    }
-                    cur = Cur::Term(terms[i]);
-                    i += 1;
-                } else {
-                    let rhs = terms[i];
-                    let op = ops[i - 1];
-                    if !term_nonempty(sh, rhs) {
-                        // Algebraic identities avoid scanning a potentially large current
-                        // set when the right-hand posting is empty. BOOL terms are all
-                        // retained by the index planner, so this is an exact emptiness test.
-                        if matches!(op, Op::And) {
-                            sc.cl.clear();
-                            cur = Cur::List(false);
-                        }
-                        // x OR ∅ = x and x NOT ∅ = x.
-                    } else {
-                        cur = step(cur, rhs, op, sh, sc);
-                    }
-                    i += 1;
-                }
+                cur = step(cur, terms[i], ops[i - 1], sh, sc);
+                i += 1;
             }
             let view = match cur {
                 Cur::Term(t) => sh.view(t),
-                Cur::List(_) => SetView::List(&sc.cl),
-                Cur::Bits(_) => SetView::Bits(&sc.cb[..sh.words()]),
+                Cur::List => SetView::List(&sc.cl),
+                Cur::Bits => SetView::Bits(&sc.cb[..sh.words()]),
             };
             a.add(view, sh.base);
         }
@@ -1271,7 +1184,8 @@ fn run(docs: &[u8]) -> io::Result<()> {
         },
     );
     let mut shards = Vec::with_capacity(n);
-    for (i, ((arena, bits, positions), (refs, _, _))) in bodies.into_iter().zip(layouts).enumerate() {
+    for (i, ((arena, bits, positions), (refs, _, _))) in bodies.into_iter().zip(layouts).enumerate()
+    {
         let pos_refs = make_pos_refs(&positions);
         shards.push(Shard {
             base: bases[i],
