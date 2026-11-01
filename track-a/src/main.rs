@@ -1,6 +1,5 @@
 // Track A (Ingest): parallelized solution in safe standard-library Rust.
 // Implements the HTTP request aggregation contract in specs/a-ingest.md.
-// Safe Rust, std only, no unsafe, no SIMD, no mmap (GR-P2..P10, PLAN §6, §7.1).
 
 use std::arch::x86_64::*;
 use std::fs::File;
@@ -62,18 +61,15 @@ impl Table {
             let slot = self.slots[i];
             if slot == 0 {
                 let id = self.offsets.len() as u16;
-                assert!(id < 2048, "endpoint catalogue exceeds 2047 limit");
+                assert!(id < 2048, "endpoints > 2047");
                 self.offsets
                     .push((self.arena.len() as u32, name.len() as u16));
                 self.arena.extend_from_slice(name);
                 self.slots[i] = ((tag as u64) << 32) | (id as u64 + 1);
                 return id;
             }
-            if (slot >> 32) as u32 == tag {
-                let id = (slot as u32 - 1) as u16;
-                if self.get_name(id) == name {
-                    return id;
-                }
+            if (slot >> 32) as u32 == tag && self.get_name((slot as u32 - 1) as u16) == name {
+                return (slot as u32 - 1) as u16;
             }
             i = (i + 1) & 4095;
         }
@@ -96,8 +92,7 @@ unsafe fn find_space_avx2(ptr: *const u8) -> usize {
     let mut offset = 0;
     loop {
         let v = _mm256_loadu_si256(ptr.add(offset) as *const __m256i);
-        let eq = _mm256_cmpeq_epi8(v, space);
-        let mask = _mm256_movemask_epi8(eq) as u32;
+        let mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, space)) as u32;
         if mask != 0 {
             return offset + mask.trailing_zeros() as usize;
         }
@@ -112,17 +107,10 @@ fn parse_line(buf: &[u8], pos: usize, local: &mut Local) -> usize {
         let day_idx = (*p.add(9) - b'0') as usize + ((*p.add(6) == b'1') as usize);
         let hour = day_idx * 24 + ((*p.add(11) - b'0') * 10 + *p.add(12) - b'0') as usize - 18;
 
-        let method_space = if *p.add(31) == b' ' {
-            31
-        } else if *p.add(32) == b' ' {
-            32
-        } else if *p.add(33) == b' ' {
-            33
-        } else if *p.add(34) == b' ' {
-            34
-        } else {
-            35
-        };
+        let mut method_space = 31;
+        while *p.add(method_space) != b' ' {
+            method_space += 1;
+        }
 
         let ep_start = method_space + 1;
         let ep_len = find_space_avx2(p.add(ep_start));
@@ -139,16 +127,11 @@ fn parse_line(buf: &[u8], pos: usize, local: &mut Local) -> usize {
         let name = std::slice::from_raw_parts(p.add(ep_start), ep_len);
         let id = local.table.intern(name);
         let hd = &mut local.hours[hour];
-        let (packed_lat, is_overflow) = if latency >= 0xFFFFF {
-            (0xFFFFF, true)
-        } else {
-            (latency, false)
-        };
-        if is_overflow {
+        if latency >= 0xFFFFF {
             hd.overflow.push((hd.records.len() as u32, latency));
         }
         hd.records
-            .push((id as u32 & 0x7FF) | (err << 11) | (packed_lat << 12));
+            .push((id as u32 & 0x7FF) | (err << 11) | (latency.min(0xFFFFF) << 12));
         pos + j + 1
     }
 }
@@ -217,10 +200,11 @@ fn percentile_values(latencies: &mut [u32]) -> (u32, u32, u32) {
         return (latencies[0], latencies[0], latencies[0]);
     }
     if n == 2 {
-        if latencies[0] > latencies[1] {
-            latencies.swap(0, 1);
-        }
-        return (latencies[0], latencies[1], latencies[1]);
+        return (
+            latencies[0].min(latencies[1]),
+            latencies[0].max(latencies[1]),
+            latencies[0].max(latencies[1]),
+        );
     }
     let a = (50 * n + 99) / 100 - 1;
     let b = (95 * n + 99) / 100 - 1;
@@ -231,19 +215,14 @@ fn percentile_values(latencies: &mut [u32]) -> (u32, u32, u32) {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let input = args
-        .get(1)
-        .map(String::as_str)
-        .unwrap_or("/data/requests.log");
-    let output = args
-        .get(2)
-        .map(String::as_str)
-        .unwrap_or("/out/summary.txt");
-    let file = File::open(input).expect("cannot open requests.log");
-    let len = file.metadata().expect("cannot stat requests.log").len() as usize;
+    let (input, output) = (
+        args.get(1).map_or("/data/requests.log", |s| s.as_str()),
+        args.get(2).map_or("/out/summary.txt", |s| s.as_str()),
+    );
+    let file = File::open(input).expect("open input");
+    let len = file.metadata().expect("stat").len() as usize;
     if len == 0 {
-        let out = File::create(output).expect("cannot create summary.txt");
-        out.sync_all().expect("flush output");
+        File::create(output).expect("create output");
         return;
     }
 
@@ -252,8 +231,7 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(12)
         .clamp(1, 12);
-    let parse_workers = workers.min(len.div_ceil(CHUNK_SIZE));
-    let agg_workers = workers;
+    let (parse_workers, agg_workers) = (workers.min(len.div_ceil(CHUNK_SIZE)), workers);
 
     let mut bounds = vec![0; parse_workers + 1];
     let mut buf = [0u8; 1024];
@@ -277,8 +255,7 @@ fn main() {
             .map(|w| {
                 let (start, end) = (w[0], w[1]);
                 s.spawn(move || {
-                    let src = File::open(input).expect("open input");
-                    let loc = parse_worker_range(&src, start, end);
+                    let loc = parse_worker_range(&File::open(input).expect("open"), start, end);
                     (loc.table, loc.hours)
                 })
             })
@@ -286,33 +263,68 @@ fn main() {
         tasks.into_iter().map(|t| t.join().unwrap()).unzip()
     });
 
-    let mut names = Vec::with_capacity(2048 * tables.len());
-    for table in &tables {
-        for id in 0..table.offsets.len() as u16 {
-            names.push(table.get_name(id));
+    let mut names: Vec<&[u8]> = Vec::with_capacity(2048);
+    let mut slots = [0u64; 4096];
+    for t in &tables {
+        for id in 0..t.offsets.len() as u16 {
+            let name = t.get_name(id);
+            let (tag, h) = Table::hash(name);
+            let mut i = h & 4095;
+            loop {
+                let slot = slots[i];
+                if slot == 0 {
+                    assert!(names.len() < 2048, "endpoints > 2047");
+                    slots[i] = ((tag as u64) << 32) | ((names.len() + 1) as u64);
+                    names.push(name);
+                    break;
+                }
+                if (slot >> 32) as u32 == tag && names[(slot as u32 - 1) as usize] == name {
+                    break;
+                }
+                i = (i + 1) & 4095;
+            }
         }
     }
     names.sort_unstable();
-    names.dedup();
     let num_endpoints = names.len();
-    assert!(
-        num_endpoints <= 2047,
-        "endpoint catalogue exceeds 2047 limit"
-    );
+
+    slots.fill(0);
+    for (gid, &name) in names.iter().enumerate() {
+        let (tag, h) = Table::hash(name);
+        let mut i = h & 4095;
+        loop {
+            if slots[i] == 0 {
+                slots[i] = ((tag as u64) << 32) | ((gid + 1) as u64);
+                break;
+            }
+            i = (i + 1) & 4095;
+        }
+    }
 
     let remaps: Vec<Vec<u16>> = tables
         .iter()
         .map(|t| {
             (0..t.offsets.len() as u16)
-                .map(|id| names.binary_search(&t.get_name(id)).unwrap() as u16)
+                .map(|id| {
+                    let name = t.get_name(id);
+                    let (tag, h) = Table::hash(name);
+                    let mut i = h & 4095;
+                    loop {
+                        let slot = slots[i];
+                        if (slot >> 32) as u32 == tag {
+                            let cand = (slot as u32 - 1) as usize;
+                            if names[cand] == name {
+                                return cand as u16;
+                            }
+                        }
+                        i = (i + 1) & 4095;
+                    }
+                })
                 .collect()
         })
         .collect();
 
-    let num_workers = hours_by_worker.len();
-    let mut hourly: Vec<Option<Vec<HourData>>> = (0..HOURS)
-        .map(|_| Some(Vec::with_capacity(num_workers)))
-        .collect();
+    let mut hourly: Vec<_> = (0..HOURS).map(|_| Some(Vec::new())).collect();
     for hours in hours_by_worker {
         for (h, hd) in hours.into_iter().enumerate() {
             hourly[h].as_mut().unwrap().push(hd);
@@ -423,9 +435,9 @@ fn main() {
         }
         drop(tx);
 
-        let out = File::create(output).expect("cannot create summary.txt");
+        let out = File::create(output).expect("create output");
         let mut writer = BufWriter::with_capacity(256 * 1024, out);
-        let mut pending: Vec<Option<Vec<u8>>> = (0..HOURS).map(|_| None).collect();
+        let mut pending = vec![None; HOURS];
         let mut next_to_write = 0;
 
         while next_to_write < HOURS {
