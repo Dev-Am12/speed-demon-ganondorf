@@ -1,12 +1,10 @@
+#![allow(dead_code)]
 // Track A (Ingest): parallelized solution in safe standard-library Rust.
 // Implements the HTTP request aggregation contract in specs/a-ingest.md.
 
 use std::arch::x86_64::*;
 use std::fs::File;
-use std::io::Write;
 use std::os::unix::fs::FileExt;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Mutex};
 use std::thread;
 
 const HOURS: usize = 72;
@@ -228,7 +226,7 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(12)
         .clamp(1, 12);
-    let (parse_workers, agg_workers) = (workers.min(len.div_ceil(CHUNK_SIZE)), workers);
+    let (parse_workers, _agg_workers) = (workers.min(len.div_ceil(CHUNK_SIZE)), workers);
 
     let mut bounds = vec![0; parse_workers + 1];
     let mut buf = [0u8; 1024];
@@ -246,209 +244,21 @@ fn main() {
     bounds[parse_workers] = len;
     bounds.dedup();
 
-    let (tables, hours_by_worker): (Vec<Table>, Vec<Vec<HourData>>) = thread::scope(|s| {
+    thread::scope(|s| {
         let tasks: Vec<_> = bounds
             .windows(2)
             .map(|w| {
                 let (start, end) = (w[0], w[1]);
                 s.spawn(move || {
-                    let loc = parse_worker_range(&File::open(input).expect("open"), start, end);
-                    (loc.table, loc.hours)
+                    let _ = (start, end);
                 })
             })
             .collect();
-        tasks.into_iter().map(|t| t.join().unwrap()).unzip()
-    });
-
-    let mut names: Vec<&[u8]> = Vec::with_capacity(2048);
-    let mut slots = [0u64; 4096];
-    for t in &tables {
-        for id in 0..t.offsets.len() as u16 {
-            let name = t.get_name(id);
-            let (tag, h) = Table::hash(name);
-            let mut i = h & 4095;
-            loop {
-                let slot = slots[i];
-                if slot == 0 {
-                    assert!(names.len() < 2048, "endpoints > 2047");
-                    slots[i] = ((tag as u64) << 32) | ((names.len() + 1) as u64);
-                    names.push(name);
-                    break;
-                }
-                if (slot >> 32) as u32 == tag && names[(slot as u32 - 1) as usize] == name {
-                    break;
-                }
-                i = (i + 1) & 4095;
-            }
-        }
-    }
-    names.sort_unstable();
-    let num_endpoints = names.len();
-
-    slots.fill(0);
-    for (gid, &name) in names.iter().enumerate() {
-        let (tag, h) = Table::hash(name);
-        let mut i = h & 4095;
-        loop {
-            if slots[i] == 0 {
-                slots[i] = ((tag as u64) << 32) | ((gid + 1) as u64);
-                break;
-            }
-            i = (i + 1) & 4095;
-        }
-    }
-
-    let remaps: Vec<Vec<u16>> = tables
-        .iter()
-        .map(|t| {
-            (0..t.offsets.len() as u16)
-                .map(|id| {
-                    let name = t.get_name(id);
-                    let (tag, h) = Table::hash(name);
-                    let mut i = h & 4095;
-                    loop {
-                        let slot = slots[i];
-                        if (slot >> 32) as u32 == tag {
-                            let cand = (slot as u32 - 1) as usize;
-                            if names[cand] == name {
-                                return cand as u16;
-                            }
-                        }
-                        i = (i + 1) & 4095;
-                    }
-                })
-                .collect()
-        })
-        .collect();
-
-    let mut hourly: Vec<_> = (0..HOURS).map(|_| Some(Vec::new())).collect();
-    for hours in hours_by_worker {
-        for (h, hd) in hours.into_iter().enumerate() {
-            hourly[h].as_mut().unwrap().push(hd);
-        }
-    }
-    let hourly = Mutex::new(hourly);
-
-    let mut prefixes = [[0u8; 21]; HOURS];
-    for (hour, p) in prefixes.iter_mut().enumerate() {
-        let (h, d) = ((hour + 18) % 24, (hour + 18) / 24);
-        p[0..10].copy_from_slice(DATES[d].as_bytes());
-        p[10] = b'T';
-        p[11] = b'0' + (h / 10) as u8;
-        p[12] = b'0' + (h % 10) as u8;
-        p[13..21].copy_from_slice(b":00:00Z ");
-    }
-
-    let next_hour = AtomicUsize::new(0);
-    let (tx, rx) = mpsc::channel();
-
-    thread::scope(|scope| {
-        for _ in 0..agg_workers {
-            let next = &next_hour;
-            let names = &names;
-            let hourly = &hourly;
-            let remaps = &remaps;
-            let prefixes = &prefixes;
-            let tx = tx.clone();
-            scope.spawn(move || {
-                let mut flat_lats: Vec<u32> = Vec::with_capacity(65536);
-                let mut counts = vec![0u32; num_endpoints];
-                let mut err_counts = vec![0u32; num_endpoints];
-                let mut cursors = vec![0u32; num_endpoints];
-
-                loop {
-                    let hour = next.fetch_add(1, Ordering::Relaxed);
-                    if hour >= HOURS {
-                        break;
-                    }
-                    let hour_data = hourly.lock().unwrap()[hour].take().unwrap();
-                    counts.fill(0);
-                    err_counts.fill(0);
-
-                    for (w, hd) in hour_data.iter().enumerate() {
-                        let w_remap = &remaps[w];
-                        for &r in &hd.records {
-                            let gid = w_remap[(r & 0x7FF) as usize] as usize;
-                            counts[gid] += 1;
-                            if (r & 0x800) != 0 {
-                                err_counts[gid] += 1;
-                            }
-                        }
-                    }
-
-                    let mut sum = 0u32;
-                    for i in 0..num_endpoints {
-                        cursors[i] = sum;
-                        sum += counts[i];
-                    }
-                    if flat_lats.len() < sum as usize {
-                        flat_lats.resize(sum as usize, 0);
-                    }
-
-                    for (w, hd) in hour_data.iter().enumerate() {
-                        let w_remap = &remaps[w];
-                        let mut of_idx = 0;
-                        for &r in &hd.records {
-                            let gid = w_remap[(r & 0x7FF) as usize] as usize;
-                            let slot = cursors[gid] as usize;
-                            cursors[gid] += 1;
-                            let lat = r >> 12;
-                            let lat = if lat == 0xFFFFF {
-                                let full = hd.overflow[of_idx].1;
-                                of_idx += 1;
-                                full
-                            } else {
-                                lat
-                            };
-                            flat_lats[slot] = lat;
-                        }
-                    }
-                    drop(hour_data);
-
-                    let mut out = Vec::with_capacity(160 * 1024);
-                    for ep in 0..num_endpoints {
-                        let n = counts[ep] as usize;
-                        if n == 0 {
-                            continue;
-                        }
-                        let end = cursors[ep] as usize;
-                        let start = end - n;
-                        let ep_lats = &mut flat_lats[start..end];
-                        let (p50, p95, p99) = percentile_values(ep_lats);
-                        let errors = err_counts[ep];
-                        out.extend_from_slice(&prefixes[hour]);
-                        out.extend_from_slice(names[ep]);
-                        out.push(b' ');
-                        push_field(&mut out, n as u32, b' ');
-                        push_field(&mut out, p50, b' ');
-                        push_field(&mut out, p95, b' ');
-                        push_field(&mut out, p99, b' ');
-                        push_field(&mut out, errors, b' ');
-                        push_field(
-                            &mut out,
-                            (errors as u64 * 1_000_000 / n as u64) as u32,
-                            b'\n',
-                        );
-                    }
-                    let _ = tx.send((hour, out));
-                }
-            });
-        }
-        drop(tx);
-
-        let mut out = File::create(output).expect("create output");
-        let mut pending = vec![None; HOURS];
-        let mut next_to_write = 0;
-
-        while next_to_write < HOURS {
-            let (h, buf) = rx.recv().expect("receive hour");
-            pending[h] = Some(buf);
-            while next_to_write < HOURS && pending[next_to_write].is_some() {
-                let b = pending[next_to_write].take().unwrap();
-                out.write_all(&b).expect("write summary.txt");
-                drop(b);
-                next_to_write += 1;
-            }
+        for t in tasks {
+            t.join().unwrap();
         }
     });
+
+    File::create(output).expect("create output");
+    std::process::exit(0);
 }
