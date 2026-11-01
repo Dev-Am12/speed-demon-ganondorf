@@ -380,7 +380,7 @@ impl SetView<'_> {
     fn contains(self, id: u16) -> bool {
         match self {
             Self::List(l) => l.binary_search(&id).is_ok(),
-            Self::Bits(w) => unsafe { w.get_unchecked(id as usize >> 6) } & (1u64 << (id & 63)) != 0,
+            Self::Bits(w) => unsafe { *w.get_unchecked(id as usize >> 6) } & (1u64 << (id & 63)) != 0,
         }
     }
     #[inline(always)]
@@ -936,14 +936,18 @@ fn run(docs: &[u8]) -> std::io::Result<()> {
         total += k as u32;
     }
 
-    let (mut spans, counts1): (Vec<_>, Vec<_>) = par_map(
+    let pairs: Vec<(Vec<(u32, u32)>, Vec<u16>)> = par_map(
         threads,
         n,
         || vec![0u16; v],
         |i, last| pass1(docs, (cuts[i], cuts[i + 1]), &vocab, last, counts[i]),
-    )
-    .into_iter()
-    .unzip();
+    );
+    let mut spans = Vec::with_capacity(n);
+    let mut counts1 = Vec::with_capacity(n);
+    for (s, cnt) in pairs {
+        spans.push(s);
+        counts1.push(cnt);
+    }
 
     let mut df = vec![0u32; v];
     for cnt in &counts1 {
