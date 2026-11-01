@@ -1,4 +1,4 @@
-// Track A (Ingest): parallelized solution (v1) in safe standard-library Rust.
+// Track A (Ingest): parallelized solution in safe standard-library Rust.
 // Implements the HTTP request aggregation contract in specs/a-ingest.md.
 // Safe Rust, std only, no unsafe, no SIMD, no mmap (GR-P2..P10, PLAN §6, §7.1).
 
@@ -11,8 +11,6 @@ use std::thread;
 
 const HOURS: usize = 72;
 const CHUNK_SIZE: usize = 64 * 1024;
-const PARSE_WORKERS: usize = 12;
-const AGG_WORKERS: usize = 12;
 const DATES: [&str; 4] = ["2026-10-30", "2026-10-31", "2026-11-01", "2026-11-02"];
 
 struct Table {
@@ -48,21 +46,6 @@ impl Table {
         (tag, h as usize)
     }
 
-    fn grow(&mut self) {
-        let mask = self.slots.len() * 2 - 1;
-        let mut new_slots = vec![0u64; mask + 1];
-        for &s in &self.slots {
-            if s != 0 {
-                let mut i = Self::hash(self.get_name((s as u32 - 1) as u16)).1 & mask;
-                while new_slots[i] != 0 {
-                    i = (i + 1) & mask;
-                }
-                new_slots[i] = s;
-            }
-        }
-        self.slots = new_slots;
-    }
-
     #[inline(always)]
     fn get_name(&self, id: u16) -> &[u8] {
         let (start, len) = self.offsets[id as usize];
@@ -71,20 +54,12 @@ impl Table {
 
     fn intern(&mut self, name: &[u8]) -> u16 {
         let (tag, h) = Self::hash(name);
-        let mut mask = self.slots.len() - 1;
-        let mut i = h & mask;
+        let mut i = h & 4095;
         loop {
             let slot = self.slots[i];
             if slot == 0 {
-                if self.offsets.len() * 2 >= self.slots.len() {
-                    self.grow();
-                    mask = self.slots.len() - 1;
-                    i = h & mask;
-                    while self.slots[i] != 0 {
-                        i = (i + 1) & mask;
-                    }
-                }
                 let id = self.offsets.len() as u16;
+                assert!(id < 2048, "endpoint catalogue exceeds 2047 limit");
                 self.offsets
                     .push((self.arena.len() as u32, name.len() as u16));
                 self.arena.extend_from_slice(name);
@@ -97,7 +72,7 @@ impl Table {
                     return id;
                 }
             }
-            i = (i + 1) & mask;
+            i = (i + 1) & 4095;
         }
     }
 }
@@ -134,26 +109,28 @@ fn find_space_swar(buf: &[u8], mut i: usize) -> usize {
 
 #[inline(always)]
 fn parse_line(buf: &[u8], pos: usize, local: &mut Local) -> usize {
-    let day = (buf[pos + 8] - b'0') as usize * 10 + (buf[pos + 9] - b'0') as usize;
-    let day_idx = if buf[pos + 6] == b'0' {
-        day - 30
-    } else {
-        1 + day
-    };
+    let day_idx = (buf[pos + 9] - b'0') as usize + ((buf[pos + 6] == b'1') as usize);
     let hour = day_idx * 24 + ((buf[pos + 11] - b'0') * 10 + buf[pos + 12] - b'0') as usize - 18;
 
-    let mut i = pos + 28;
-    while buf[i] != b' ' {
-        i += 1;
-    }
+    let i = if buf[pos + 31] == b' ' {
+        pos + 31
+    } else if buf[pos + 32] == b' ' {
+        pos + 32
+    } else {
+        let mut j = pos + 33;
+        while buf[j] != b' ' {
+            j += 1;
+        }
+        j
+    };
     let ep_start = i + 1;
     let ep_end = find_space_swar(buf, ep_start);
     let err = (buf[ep_end + 1] == b'5') as u32;
     let mut latency = 0u32;
-    i = ep_end + 5;
-    while buf[i] != b'\n' {
-        latency = latency * 10 + (buf[i] - b'0') as u32;
-        i += 1;
+    let mut j = ep_end + 5;
+    while buf[j] != b'\n' {
+        latency = latency * 10 + (buf[j] - b'0') as u32;
+        j += 1;
     }
     let id = local.table.intern(&buf[ep_start..ep_end]);
     let hd = &mut local.hours[hour];
@@ -165,16 +142,12 @@ fn parse_line(buf: &[u8], pos: usize, local: &mut Local) -> usize {
     if is_overflow {
         hd.overflow.push((hd.records.len() as u32, latency));
     }
-    // Spec §2: Catalogue has exactly 1,842 endpoints (<= 2047); fits in 11 bits.
-    // Bit 11 is 5xx error flag. Bits 12..31 (20 bits) store packed latency or 0xFFFFF overflow sentinel.
     hd.records
         .push((id as u32 & 0x7FF) | (err << 11) | (packed_lat << 12));
-    i + 1
+    j + 1
 }
 
 fn parse_worker_range(file: &File, mut start: usize, end: usize) -> Local {
-    // Estimate one hour's share of the worker's chunk rather than worst case;
-    // vectors grow normally if an hour is bigger than this initial capacity.
     let cap = ((end - start) / 40 / HOURS).max(64);
     let mut local = Local {
         table: Table::new(),
@@ -234,6 +207,15 @@ fn push_field(buf: &mut Vec<u8>, mut n: u64, delim: u8) {
 #[inline(always)]
 fn percentile_values(latencies: &mut [u32]) -> (u32, u32, u32) {
     let n = latencies.len();
+    if n == 1 {
+        return (latencies[0], latencies[0], latencies[0]);
+    }
+    if n == 2 {
+        if latencies[0] > latencies[1] {
+            latencies.swap(0, 1);
+        }
+        return (latencies[0], latencies[1], latencies[1]);
+    }
     let a = (50 * n + 99) / 100 - 1;
     let b = (95 * n + 99) / 100 - 1;
     let c = (99 * n + 99) / 100 - 1;
@@ -259,17 +241,13 @@ fn main() {
         return;
     }
 
-    let parse_workers = std::env::var("THREADS")
+    let workers = std::env::var("THREADS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(PARSE_WORKERS)
-        .min(len.div_ceil(CHUNK_SIZE))
+        .unwrap_or(12)
         .clamp(1, 12);
-    let agg_workers = std::env::var("THREADS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(AGG_WORKERS)
-        .clamp(1, 12);
+    let parse_workers = workers.min(len.div_ceil(CHUNK_SIZE));
+    let agg_workers = workers;
 
     let mut bounds = vec![0; parse_workers + 1];
     let mut buf = [0u8; 1024];
@@ -287,27 +265,19 @@ fn main() {
     bounds[parse_workers] = len;
     bounds.dedup();
 
-    let (tables, hours_by_worker): (Vec<Table>, Vec<Vec<HourData>>) = thread::scope(|scope| {
-        let mut tasks = Vec::new();
-        for pair in bounds.windows(2) {
-            let (start, end) = (pair[0], pair[1]);
-            tasks.push(scope.spawn(move || {
-                let source = File::open(input).expect("reopen requests.log");
-                let local = parse_worker_range(&source, start, end);
-                (local.table, local.hours)
-            }));
-        }
-        let results: Vec<(Table, Vec<HourData>)> = tasks
-            .into_iter()
-            .map(|t| t.join().expect("parser worker panicked"))
+    let (tables, hours_by_worker): (Vec<Table>, Vec<Vec<HourData>>) = thread::scope(|s| {
+        let tasks: Vec<_> = bounds
+            .windows(2)
+            .map(|w| {
+                let (start, end) = (w[0], w[1]);
+                s.spawn(move || {
+                    let src = File::open(input).expect("open input");
+                    let loc = parse_worker_range(&src, start, end);
+                    (loc.table, loc.hours)
+                })
+            })
             .collect();
-        let mut tables = Vec::with_capacity(results.len());
-        let mut hours = Vec::with_capacity(results.len());
-        for (t, h) in results {
-            tables.push(t);
-            hours.push(h);
-        }
-        (tables, hours)
+        tasks.into_iter().map(|t| t.join().unwrap()).unzip()
     });
 
     let mut names = Vec::with_capacity(2048 * tables.len());
@@ -319,22 +289,19 @@ fn main() {
     names.sort_unstable();
     names.dedup();
     let num_endpoints = names.len();
+    assert!(
+        num_endpoints <= 2047,
+        "endpoint catalogue exceeds 2047 limit"
+    );
 
-    let remaps: Vec<Vec<u16>> = thread::scope(|scope| {
-        let mut tasks = Vec::new();
-        for table in &tables {
-            let names = &names;
-            tasks.push(scope.spawn(move || {
-                (0..table.offsets.len() as u16)
-                    .map(|id| names.binary_search(&table.get_name(id)).unwrap() as u16)
-                    .collect()
-            }));
-        }
-        tasks
-            .into_iter()
-            .map(|t| t.join().expect("remap worker panicked"))
-            .collect()
-    });
+    let remaps: Vec<Vec<u16>> = tables
+        .iter()
+        .map(|t| {
+            (0..t.offsets.len() as u16)
+                .map(|id| names.binary_search(&t.get_name(id)).unwrap() as u16)
+                .collect()
+        })
+        .collect();
 
     let num_workers = hours_by_worker.len();
     let mut hourly: Vec<Option<Vec<HourData>>> = (0..HOURS)
@@ -370,8 +337,7 @@ fn main() {
             let tx = tx.clone();
             scope.spawn(move || {
                 let mut flat_lats: Vec<u32> = Vec::with_capacity(65536);
-                let mut counts = vec![0u32; num_endpoints + 1];
-                let mut offsets = vec![0u32; num_endpoints + 1];
+                let mut counts = vec![0u32; num_endpoints];
                 let mut err_counts = vec![0u32; num_endpoints];
                 let mut cursors = vec![0u32; num_endpoints];
 
@@ -397,11 +363,9 @@ fn main() {
 
                     let mut sum = 0u32;
                     for i in 0..num_endpoints {
-                        offsets[i] = sum;
                         cursors[i] = sum;
                         sum += counts[i];
                     }
-                    offsets[num_endpoints] = sum;
                     if flat_lats.len() < sum as usize {
                         flat_lats.resize(sum as usize, 0);
                     }
@@ -428,12 +392,12 @@ fn main() {
 
                     let mut out = Vec::with_capacity(160 * 1024);
                     for ep in 0..num_endpoints {
-                        let start = offsets[ep] as usize;
-                        let end = offsets[ep + 1] as usize;
-                        let n = end - start;
+                        let n = counts[ep] as usize;
                         if n == 0 {
                             continue;
                         }
+                        let end = cursors[ep] as usize;
+                        let start = end - n;
                         let ep_lats = &mut flat_lats[start..end];
                         let (p50, p95, p99) = percentile_values(ep_lats);
                         let errors = err_counts[ep];
