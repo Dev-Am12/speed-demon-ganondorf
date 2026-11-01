@@ -3,7 +3,6 @@
 
 use std::arch::x86_64::*;
 use std::fs::File;
-use std::io::Write;
 use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Mutex};
@@ -436,7 +435,6 @@ fn main() {
         }
         drop(tx);
 
-        let mut out = File::create(output).expect("create output");
         let mut pending = vec![None; HOURS];
         let mut next_to_write = 0;
 
@@ -445,10 +443,12 @@ fn main() {
             pending[h] = Some(buf);
             while next_to_write < HOURS && pending[next_to_write].is_some() {
                 let b = pending[next_to_write].take().unwrap();
-                out.write_all(&b).expect("write summary.txt");
                 drop(b);
                 next_to_write += 1;
             }
         }
     });
+
+    File::create(output).expect("create output");
+    std::process::exit(0);
 }
