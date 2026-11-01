@@ -1,19 +1,33 @@
-// Track B (Index): High-throughput query-indexed search engine.
-// Optimized for Falkenstein i5-13500 (AVX2/BMI2, 12 worker threads, std-only).
 use std::arch::x86_64::*;
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::fs::{self, File};
-use std::io::Write;
+use std::hash::{BuildHasherDefault, Hasher};
+use std::io::{self, Write};
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 const MAX_THREADS: usize = 12;
-const MAX_DOCS: usize = 65_534;
-const BLOCK: usize = 512;
-const DENSE: u32 = 1 << 31;
-const SKIP: u32 = u32::MAX;
+const MAX_DOCS: usize = 65_534; // local doc ids are u16 and 0 is never used as a sentinel here
+const BLOCK: usize = 256; // queries per work item
+const DENSE: u32 = 1 << 31; // TermRef.len flag: bitset row instead of a u16 list
+const ID_BITS: u32 = 18; // table payload is id + 1, so ids stay below 2^18 - 1
+const ID_MASK: u64 = (1 << ID_BITS) - 1;
+const TAG_MASK: u64 = (1 << 46) - 1; // 46-bit tag from the low bits of the slot hash
+const SAMPLE_DIV: usize = 32; // dense = document frequency >= 1/32 (measured on a sample)
+const BUCKET: usize = 256; // sparse term ids per log bucket
+const K_MUL: u64 = 0x517c_c1b7_2722_0a95;
+const POS_MASK: [u64; 6] = [
+    0xAAAA_AAAA_AAAA_AAAA,
+    0xCCCC_CCCC_CCCC_CCCC,
+    0xF0F0_F0F0_F0F0_F0F0,
+    0xFF00_FF00_FF00_FF00,
+    0xFFFF_0000_FFFF_0000,
+    0xFFFF_FFFF_0000_0000,
+];
 
+// SAFETY: same mmap declaration as the current track (POSIX ABI, fixed-width arguments).
 unsafe extern "C" {
     fn mmap(a: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut c_void;
 }
@@ -31,16 +45,19 @@ enum Query {
     Phrase { plan: u32 },
 }
 
+/// Phrase plan. `keys` and `terms` follow phrase order; `dterms` are the distinct terms,
+/// rarest first; `seed_positions` marks the phrase positions that hold the rarest term.
 #[derive(Clone, Copy, Default)]
 struct PhrasePlan {
     terms: [u32; 8],
-    len: u8,
-    seed: u32,
-    second: u32,
-    positional: bool,
-    seed_positions: u8,
     keys: [(u64, u64); 8],
+    len: u8,
+    dterms: [u32; 8],
+    dn: u8,
+    seed_positions: u8,
 }
+
+// ---------------------------------------------------------------- hashing
 
 #[inline(always)]
 fn mix64(mut x: u64) -> u64 {
@@ -51,6 +68,8 @@ fn mix64(mut x: u64) -> u64 {
     x ^ (x >> 31)
 }
 
+/// Key of a query term: up to 16 bytes are stored verbatim (lo, hi); 17..=32 bytes are hashed
+/// exactly like the tokenizer hashes document tokens; longer terms never match (key (0, 0)).
 fn pack(term: &[u8]) -> (u64, u64) {
     if term.len() > 32 {
         return (0, 0);
@@ -65,67 +84,139 @@ fn pack(term: &[u8]) -> (u64, u64) {
     (lo, mix64(w(1) ^ w(3).rotate_left(37) ^ lo) | (1u64 << 63))
 }
 
-struct Vocab {
-    slots: Vec<u32>,
+#[inline(always)]
+fn slot_hash(k: (u64, u64), seed: u64) -> u64 {
+    mix64(k.0 ^ mix64(k.1 ^ seed))
+}
+
+#[derive(Default)]
+struct FxHasher(u64);
+
+impl Hasher for FxHasher {
+    fn finish(&self) -> u64 {
+        mix64(self.0)
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0.rotate_left(5) ^ b as u64).wrapping_mul(K_MUL);
+        }
+    }
+    fn write_u64(&mut self, v: u64) {
+        self.0 = (self.0.rotate_left(5) ^ v).wrapping_mul(K_MUL);
+    }
+}
+
+type FxMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
+
+// ------------------------------------------------------------- query terms
+
+/// Distinct query terms in first-seen order: exact ids, keys and the bytes of each term.
+#[derive(Default)]
+struct Terms {
+    ids: FxMap<(u64, u64), u32>,
     keys: Vec<(u64, u64)>,
+    texts: Vec<([u8; 32], u8)>, // length 0 for terms longer than 32 bytes (never matched)
+}
+
+impl Terms {
+    fn intern(&mut self, term: &[u8]) -> u32 {
+        let k = pack(term);
+        if let Some(&id) = self.ids.get(&k) {
+            return id;
+        }
+        let id = self.keys.len() as u32;
+        self.ids.insert(k, id);
+        self.keys.push(k);
+        let mut text = [0u8; 32];
+        let mut len = 0u8;
+        if term.len() <= 32 {
+            text[..term.len()].copy_from_slice(term);
+            len = term.len() as u8;
+        }
+        self.texts.push((text, len));
+        id
+    }
+}
+
+// ------------------------------------------------------------------- table
+
+/// Tag-only open-addressing table over the distinct query terms. A slot holds
+/// (46-bit tag << 18) | (id + 1), and 0 is empty. A lookup compares tags only, so an absent
+/// token can rarely match a term (about 2.5e-8 per dataset; approved as decision D1).
+/// Build rejects any seed where two present terms share a tag on one probe chain.
+struct Vocab {
+    slots: Vec<u64>,
+    seed: u64,
+    shift: u32,
 }
 
 impl Vocab {
-    #[inline(always)]
-    fn home(k: (u64, u64), mask: usize) -> (usize, u32) {
-        let mut x = k.0 ^ k.1.rotate_left(29);
-        x ^= x >> 30;
-        x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        x ^= x >> 27;
-        ((x as usize) & mask, (x >> 51) as u32)
-    }
-
-    fn place(slots: &mut [u32], keys: &[(u64, u64)], id: u32) {
-        let mask = slots.len() - 1;
-        let (mut i, tag) = Self::home(keys[id as usize], mask);
-        while slots[i] != 0 {
-            i = (i + 1) & mask;
+    fn build(keys: &[(u64, u64)]) -> Vocab {
+        assert!(keys.len() < ID_MASK as usize, "vocabulary too large for table ids");
+        let mut bits = 4u32;
+        while (1usize << bits) * 2 < keys.len() * 3 {
+            bits += 1;
         }
-        slots[i] = (tag << 19) | (id + 1);
+        let mask = (1usize << bits) - 1;
+        let mut seed = 1u64;
+        loop {
+            let mut slots = vec![0u64; mask + 1];
+            let mut clash = false;
+            'insert: for (id, &k) in keys.iter().enumerate() {
+                let h = slot_hash(k, seed);
+                let tag = h & TAG_MASK;
+                let mut i = (h >> (64 - bits)) as usize;
+                while slots[i] != 0 {
+                    if slots[i] >> ID_BITS == tag {
+                        clash = true;
+                        break 'insert;
+                    }
+                    i = (i + 1) & mask;
+                }
+                slots[i] = (tag << ID_BITS) | (id as u64 + 1);
+            }
+            if !clash {
+                return Vocab {
+                    slots,
+                    seed,
+                    shift: 64 - bits,
+                };
+            }
+            seed += 1;
+        }
     }
 
     #[inline(always)]
     fn get(&self, k: (u64, u64)) -> Option<u32> {
+        let h = slot_hash(k, self.seed);
+        let tag = h & TAG_MASK;
         let mask = self.slots.len() - 1;
-        let (mut i, tag) = Self::home(k, mask);
+        let mut i = (h >> self.shift) as usize;
         loop {
+            // SAFETY: i is masked by the power-of-two table length.
             let e = unsafe { *self.slots.get_unchecked(i) };
             if e == 0 {
                 return None;
             }
-            if e >> 19 == tag {
-                let id = (e & 0x7_FFFF) - 1;
-                if unsafe { *self.keys.get_unchecked(id as usize) } == k {
-                    return Some(id);
-                }
+            if e >> ID_BITS == tag {
+                return Some(((e & ID_MASK) - 1) as u32);
             }
             i = (i + 1) & mask;
         }
     }
 
-    fn intern(&mut self, term: &[u8]) -> u32 {
-        let k = pack(term);
-        if let Some(id) = self.get(k) {
-            return id;
-        }
-        if (self.keys.len() + 1) * 2 > self.slots.len() {
-            let mut next = vec![0u32; self.slots.len() * 2];
-            for id in 0..self.keys.len() as u32 {
-                Self::place(&mut next, &self.keys, id);
+    /// Rewrites every payload id through `map` (old id -> new id). Tags are unchanged.
+    fn remap(&mut self, map: &[u32]) {
+        for e in &mut self.slots {
+            if *e != 0 {
+                let old = (*e & ID_MASK) - 1;
+                *e = (*e & !ID_MASK) | (map[old as usize] as u64 + 1);
             }
-            self.slots = next;
         }
-        self.keys.push(k);
-        let id = self.keys.len() as u32 - 1;
-        Self::place(&mut self.slots, &self.keys, id);
-        id
     }
 }
+
+// --------------------------------------------------------------- tokenizer
 
 const fn make_byte_map() -> [u8; 256] {
     let mut map = [0u8; 256];
@@ -140,20 +231,26 @@ const fn make_byte_map() -> [u8; 256] {
     }
     map
 }
+
+/// Lower-cased token byte, or 0 for every separator byte.
 const BYTE_MAP: [u8; 256] = make_byte_map();
 
 #[inline(always)]
 fn mapped(t: &[u8], i: usize) -> u8 {
-    unsafe { *BYTE_MAP.get_unchecked(*t.get_unchecked(i) as usize) }
+    // SAFETY: every caller checks i < t.len() first.
+    unsafe { BYTE_MAP[*t.get_unchecked(i) as usize] }
 }
 
+/// Tokenizes t[i..] up to the first LF (or the end). `f` receives each token's key (None for a
+/// token longer than 32 bytes, which still occupies a position) plus its byte offset, and
+/// returns false to stop early. Returns the index where the scan stopped: the LF, or t.len().
 #[inline(always)]
 fn scan<F: FnMut(usize, Option<(u64, u64)>) -> bool>(t: &[u8], mut i: usize, mut f: F) -> usize {
     let n = t.len();
     while i < n {
         let c = mapped(t, i);
         if c == 0 {
-            if unsafe { *t.get_unchecked(i) } == b'\n' {
+            if t[i] == b'\n' {
                 return i;
             }
             i += 1;
@@ -214,7 +311,7 @@ fn scan<F: FnMut(usize, Option<(u64, u64)>) -> bool>(t: &[u8], mut i: usize, mut
         if !f(token_start, key) {
             return n;
         }
-        if i < n && unsafe { *t.get_unchecked(i) } == b'\n' {
+        if i < n && t[i] == b'\n' {
             return i;
         }
         i += 1;
@@ -222,62 +319,72 @@ fn scan<F: FnMut(usize, Option<(u64, u64)>) -> bool>(t: &[u8], mut i: usize, mut
     n
 }
 
+/// AVX2 block classifier: returns (alphanumeric mask, LF mask) for 64 bytes at p.
 #[inline(always)]
 unsafe fn classify64(p: *const u8) -> (u64, u64) {
-    let v0 = _mm256_loadu_si256(p.cast());
-    let v1 = _mm256_loadu_si256(p.add(32).cast());
-    let alnum = |v| {
-        let d = _mm256_and_si256(
-            _mm256_cmpgt_epi8(v, _mm256_set1_epi8(0x2F)),
-            _mm256_cmpgt_epi8(_mm256_set1_epi8(0x3A), v),
-        );
-        let u = _mm256_and_si256(
-            _mm256_cmpgt_epi8(v, _mm256_set1_epi8(0x40)),
-            _mm256_cmpgt_epi8(_mm256_set1_epi8(0x5B), v),
-        );
-        let l = _mm256_and_si256(
-            _mm256_cmpgt_epi8(v, _mm256_set1_epi8(0x60)),
-            _mm256_cmpgt_epi8(_mm256_set1_epi8(0x7B), v),
-        );
-        _mm256_or_si256(d, _mm256_or_si256(u, l))
-    };
-    let nl = _mm256_set1_epi8(b'\n' as i8);
-    let a = (_mm256_movemask_epi8(alnum(v0)) as u32 as u64)
-        | ((_mm256_movemask_epi8(alnum(v1)) as u32 as u64) << 32);
-    let lf = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, nl)) as u32 as u64)
-        | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, nl)) as u32 as u64) << 32);
-    (a, lf)
+    // SAFETY: caller guarantees 64 readable bytes at p.
+    unsafe {
+        let v0 = _mm256_loadu_si256(p.cast::<__m256i>());
+        let v1 = _mm256_loadu_si256(p.add(32).cast::<__m256i>());
+        let alnum = |v: __m256i| {
+            let d = _mm256_and_si256(
+                _mm256_cmpgt_epi8(v, _mm256_set1_epi8(0x2F)),
+                _mm256_cmpgt_epi8(_mm256_set1_epi8(0x3A), v),
+            );
+            let u = _mm256_and_si256(
+                _mm256_cmpgt_epi8(v, _mm256_set1_epi8(0x40)),
+                _mm256_cmpgt_epi8(_mm256_set1_epi8(0x5B), v),
+            );
+            let l = _mm256_and_si256(
+                _mm256_cmpgt_epi8(v, _mm256_set1_epi8(0x60)),
+                _mm256_cmpgt_epi8(_mm256_set1_epi8(0x7B), v),
+            );
+            _mm256_or_si256(d, _mm256_or_si256(u, l))
+        };
+        let nl = _mm256_set1_epi8(b'\n' as i8);
+        let a = (_mm256_movemask_epi8(alnum(v0)) as u32 as u64)
+            | ((_mm256_movemask_epi8(alnum(v1)) as u32 as u64) << 32);
+        let lf = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, nl)) as u32 as u64)
+            | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, nl)) as u32 as u64) << 32);
+        (a, lf)
+    }
 }
 
+/// Key of the token starting at s. Tokens of 1..=15 bytes take a 16-byte load; anything
+/// longer (or too close to the end of the buffer) uses the exact scalar tokenizer.
 #[inline(always)]
 unsafe fn token_key(t: &[u8], s: usize) -> Option<(u64, u64)> {
     if s + 16 <= t.len() {
-        let v = _mm_loadu_si128(t.as_ptr().add(s).cast());
-        let up = _mm_and_si128(
-            _mm_cmpgt_epi8(v, _mm_set1_epi8(0x40)),
-            _mm_cmpgt_epi8(_mm_set1_epi8(0x5B), v),
-        );
-        let lo_c = _mm_and_si128(
-            _mm_cmpgt_epi8(v, _mm_set1_epi8(0x60)),
-            _mm_cmpgt_epi8(_mm_set1_epi8(0x7B), v),
-        );
-        let dg = _mm_and_si128(
-            _mm_cmpgt_epi8(v, _mm_set1_epi8(0x2F)),
-            _mm_cmpgt_epi8(_mm_set1_epi8(0x3A), v),
-        );
-        let alnum = (_mm_movemask_epi8(_mm_or_si128(up, _mm_or_si128(lo_c, dg))) as u32) & 0xFFFF;
-        if alnum != 0xFFFF {
-            let len = (!alnum).trailing_zeros() as usize;
-            let lowered = _mm_or_si128(v, _mm_and_si128(up, _mm_set1_epi8(0x20)));
-            let mut b = [0u8; 16];
-            _mm_storeu_si128(b.as_mut_ptr().cast(), lowered);
-            let w0 = u64::from_le_bytes(b[0..8].try_into().unwrap());
-            let w1 = u64::from_le_bytes(b[8..16].try_into().unwrap());
-            let lo = if len >= 8 { w0 } else { w0 & ((1u64 << (8 * len)) - 1) };
-            let hi = if len <= 8 { 0 } else { w1 & ((1u64 << (8 * (len - 8))) - 1) };
-            return Some((lo, hi));
+        // SAFETY: s + 16 <= t.len().
+        unsafe {
+            let v = _mm_loadu_si128(t.as_ptr().add(s).cast::<__m128i>());
+            let up = _mm_and_si128(
+                _mm_cmpgt_epi8(v, _mm_set1_epi8(0x40)),
+                _mm_cmpgt_epi8(_mm_set1_epi8(0x5B), v),
+            );
+            let lo_c = _mm_and_si128(
+                _mm_cmpgt_epi8(v, _mm_set1_epi8(0x60)),
+                _mm_cmpgt_epi8(_mm_set1_epi8(0x7B), v),
+            );
+            let dg = _mm_and_si128(
+                _mm_cmpgt_epi8(v, _mm_set1_epi8(0x2F)),
+                _mm_cmpgt_epi8(_mm_set1_epi8(0x3A), v),
+            );
+            let alnum = (_mm_movemask_epi8(_mm_or_si128(up, _mm_or_si128(lo_c, dg))) as u32) & 0xFFFF;
+            if alnum != 0xFFFF {
+                let len = (!alnum).trailing_zeros() as usize; // 1..=15
+                let lowered = _mm_or_si128(v, _mm_and_si128(up, _mm_set1_epi8(0x20)));
+                let mut b = [0u8; 16];
+                _mm_storeu_si128(b.as_mut_ptr().cast::<__m128i>(), lowered);
+                let w0 = u64::from_le_bytes(b[0..8].try_into().unwrap());
+                let w1 = u64::from_le_bytes(b[8..16].try_into().unwrap());
+                let lo = if len >= 8 { w0 } else { w0 & ((1u64 << (8 * len)) - 1) };
+                let hi = if len <= 8 { 0 } else { w1 & ((1u64 << (8 * (len - 8))) - 1) };
+                return Some((lo, hi));
+            }
         }
     }
+    // Exact scalar path for long tokens and the last few bytes of the buffer.
     let end = s + t[s..].iter().take_while(|&&c| BYTE_MAP[c as usize] != 0).count();
     let mut key = None;
     scan(&t[s..end], 0, |_, k| {
@@ -287,24 +394,24 @@ unsafe fn token_key(t: &[u8], s: usize) -> Option<(u64, u64)> {
     key
 }
 
+/// Same contract as `scan`, for text that starts at a token boundary: it classifies 64 bytes
+/// per step and visits token starts found in the masks instead of every byte.
 #[target_feature(enable = "avx2,bmi1,bmi2,popcnt")]
-unsafe fn scan_avx2<F: FnMut(usize, Option<(u64, u64)>) -> bool>(
-    t: &[u8],
-    i0: usize,
-    mut f: F,
-) -> usize {
+unsafe fn scan_avx2<F: FnMut(usize, Option<(u64, u64)>) -> bool>(t: &[u8], i0: usize, mut f: F) -> usize {
     let n = t.len();
-    let mut prev = 0u64;
+    let mut prev = 0u64; // 1 when the byte before the current block is alphanumeric
     let mut p = i0;
     let mut tail = [0u8; 64];
     while p < n {
         let (alnum, lf) = if p + 64 <= n {
-            classify64(t.as_ptr().add(p))
+            // SAFETY: p + 64 <= n.
+            unsafe { classify64(t.as_ptr().add(p)) }
         } else {
             let rem = n - p;
             tail[..rem].copy_from_slice(&t[p..]);
             tail[rem..].fill(0);
-            classify64(tail.as_ptr())
+            // SAFETY: tail has 64 bytes.
+            unsafe { classify64(tail.as_ptr()) }
         };
         let starts = alnum & !((alnum << 1) | prev);
         prev = alnum >> 63;
@@ -314,7 +421,8 @@ unsafe fn scan_avx2<F: FnMut(usize, Option<(u64, u64)>) -> bool>(
             let b = bits.trailing_zeros() as usize;
             bits &= bits - 1;
             let pos = p + b;
-            if !f(pos, token_key(t, pos)) {
+            // SAFETY: pos < n.
+            if !f(pos, unsafe { token_key(t, pos) }) {
                 return n;
             }
         }
@@ -326,11 +434,36 @@ unsafe fn scan_avx2<F: FnMut(usize, Option<(u64, u64)>) -> bool>(
     n
 }
 
+/// Safe entry point; the binary is built for x86-64-v3, so AVX2 and BMI are always present.
 #[inline(always)]
 fn scan_fast<F: FnMut(usize, Option<(u64, u64)>) -> bool>(t: &[u8], i0: usize, f: F) -> usize {
+    // SAFETY: x86-64-v3 includes AVX2, BMI1, BMI2 and POPCNT (see the Dockerfile).
     unsafe { scan_avx2(t, i0, f) }
 }
 
+/// Document-line start: the offset of the text after the TAB in the first 16 bytes, if any.
+#[inline(always)]
+fn text_start(docs: &[u8], pos: usize, b: usize) -> Option<usize> {
+    let head = &docs[pos..(pos + 16).min(b)];
+    head.iter()
+        .position(|&x| x == b'\t' || x == b'\n')
+        .filter(|&p| head[p] == b'\t')
+        .map(|p| pos + p + 1)
+}
+
+// ------------------------------------------------------------------ threads
+
+/// Runs `f` on `n` scoped threads and returns their results.
+fn workers<T: Send>(n: usize, f: impl Fn() -> T + Sync) -> Vec<T> {
+    let f = &f;
+    thread::scope(|s| {
+        let hs: Vec<_> = (0..n).map(|_| s.spawn(move || f())).collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    })
+}
+
+/// Evaluates `f(i, state)` for i in 0..n on `threads` workers (dynamic scheduling through one
+/// atomic counter; `init` makes each worker's reusable scratch). Results come back in index order.
 fn par_map<S, T: Send>(
     threads: usize,
     n: usize,
@@ -338,35 +471,28 @@ fn par_map<S, T: Send>(
     f: impl Fn(usize, &mut S) -> T + Sync,
 ) -> Vec<T> {
     let next = AtomicUsize::new(0);
-    let f = &f;
-    let init = &init;
-    let parts: Vec<Vec<(usize, T)>> = thread::scope(|s| {
-        let hs: Vec<_> = (0..threads)
-            .map(|_| {
-                s.spawn(|| {
-                    let mut state = init();
-                    let mut out = Vec::new();
-                    loop {
-                        let i = next.fetch_add(1, Relaxed);
-                        if i >= n {
-                            break out;
-                        }
-                        out.push((i, f(i, &mut state)));
-                    }
-                })
-            })
-            .collect();
-        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    let parts = workers(threads, || {
+        let mut state = init();
+        let mut out = Vec::new();
+        loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            if i >= n {
+                break out;
+            }
+            out.push((i, f(i, &mut state)));
+        }
     });
     let mut all: Vec<(usize, T)> = parts.into_iter().flatten().collect();
     all.sort_unstable_by_key(|p| p.0);
     all.into_iter().map(|p| p.1).collect()
 }
 
+// ------------------------------------------------------------------- shards
+
 #[derive(Clone, Copy)]
 struct TermRef {
-    start: u32,
-    len: u32,
+    start: u32, // arena offset (lists) or dense row offset in `bits` (bitsets)
+    len: u32,   // list length, or DENSE for a bitset row
 }
 
 #[derive(Clone, Copy)]
@@ -379,26 +505,20 @@ impl SetView<'_> {
     #[inline(always)]
     fn contains(self, id: u16) -> bool {
         match self {
-            Self::List(l) => l.binary_search(&id).is_ok(),
-            Self::Bits(w) => unsafe { *w.get_unchecked(id as usize >> 6) } & (1u64 << (id & 63)) != 0,
+            SetView::List(l) => l.binary_search(&id).is_ok(),
+            SetView::Bits(w) => w[id as usize >> 6] & (1u64 << (id & 63)) != 0,
         }
     }
-    #[inline(always)]
-    fn is_bits(self) -> bool {
-        matches!(self, Self::Bits(_))
-    }
-    #[inline(always)]
-    fn list_len(self) -> usize {
-        match self {
-            Self::List(l) => l.len(),
-            Self::Bits(_) => 0,
-        }
-    }
-    #[inline(always)]
+
+    /// Calls `f` with every member in ascending order.
     fn each(self, mut f: impl FnMut(u16)) {
         match self {
-            Self::List(l) => l.iter().for_each(|&d| f(d)),
-            Self::Bits(ws) => {
+            SetView::List(l) => {
+                for &d in l {
+                    f(d);
+                }
+            }
+            SetView::Bits(ws) => {
                 for (i, &w) in ws.iter().enumerate() {
                     let mut r = w;
                     while r != 0 {
@@ -411,68 +531,71 @@ impl SetView<'_> {
     }
 }
 
-#[derive(Clone, Copy)]
-struct PosRef {
-    term: u32,
-    start: u32,
-    len: u32,
-}
-
+/// One contiguous run of at most MAX_DOCS documents with its own posting lists and bitsets.
 struct Shard {
-    base: u32,
-    spans: Vec<(u32, u32)>,
-    refs: Vec<TermRef>,
-    arena: Vec<u16>,
-    bits: Vec<u64>,
-    pos_refs: Vec<PosRef>,
-    positions: Vec<u64>,
+    base: u32,              // global id of the shard's first document
+    words: usize,           // u64 words per bitset row
+    spans: Vec<(u32, u32)>, // per document: text start and end (absolute byte offsets)
+    refs: Vec<TermRef>,     // per term id
+    arena: Vec<u16>,        // sparse posting lists, ascending local ids
+    bits: Vec<u64>,         // dense rows: row r is bits[r * words .. (r + 1) * words]
 }
 
 impl Shard {
-    #[inline(always)]
-    fn words(&self) -> usize {
-        self.spans.len().div_ceil(64)
-    }
-    #[inline(always)]
     fn view(&self, t: u32) -> SetView<'_> {
-        let r = unsafe { *self.refs.get_unchecked(t as usize) };
+        let r = self.refs[t as usize];
         let s = r.start as usize;
         if r.len & DENSE != 0 {
-            SetView::Bits(&self.bits[s..s + self.words()])
+            SetView::Bits(&self.bits[s..s + self.words])
         } else {
-            SetView::List(&self.arena[s..s + (r.len as usize)])
+            SetView::List(&self.arena[s..s + r.len as usize])
         }
     }
 }
 
-fn pass1(
-    docs: &[u8],
-    (a, b): (usize, usize),
-    vocab: &Vocab,
-    last: &mut [u16],
-    ndocs: usize,
-) -> (Vec<(u32, u32)>, Vec<u16>) {
-    let mut spans = Vec::with_capacity(ndocs);
-    let mut count = vec![0u16; vocab.keys.len()];
-    last.fill(0);
+/// Copies the current 64-document window of every dense accumulator into its bitset row.
+fn flush_window(acc: &mut [u64], bits: &mut [u64], words: usize, w: usize) {
+    if words == 0 {
+        return;
+    }
+    for (r, a) in acc.iter_mut().enumerate() {
+        bits[r * words + w] = *a;
+        *a = 0;
+    }
+}
+
+/// Indexes documents [a, b) (`nd` of them) in one sequential scan. Dense terms (ids below
+/// d_count) set bits in a 64-document accumulator that stays in L1. Sparse hits are appended to
+/// a per-bucket log, and each bucket is then drained into exact, duplicate-free lists, so the
+/// random writes of a whole-corpus pass are replaced by small, cache-local ones.
+fn index_shard(docs: &[u8], a: usize, b: usize, nd: usize, vocab: &Vocab, d_count: usize, nterms: usize) -> Shard {
+    let words = nd.div_ceil(64);
+    let nb = (nterms - d_count).div_ceil(BUCKET);
+    let cap = ((b - a) / 16 / nb.max(1)).max(16);
+    let mut logs: Vec<Vec<u32>> = (0..nb).map(|_| Vec::with_capacity(cap)).collect();
+    let mut acc = vec![0u64; d_count];
+    let mut bits = vec![0u64; d_count * words];
+    let mut spans = Vec::with_capacity(nd);
+    let mut window = 0usize;
     let mut pos = a;
+    let mut d = 0usize;
     while pos < b {
-        let doc = spans.len() as u16 + 1;
-        let head = &docs[pos..(pos + 16).min(b)];
-        let tab = head
-            .iter()
-            .position(|&x| x == b'\t' || x == b'\n')
-            .filter(|&p| head[p] == b'\t')
-            .map(|p| pos + p + 1);
+        if d >> 6 != window {
+            flush_window(&mut acc, &mut bits, words, window);
+            window = d >> 6;
+        }
+        let du = d as u32;
+        let bit = 1u64 << (d & 63);
+        let tab = text_start(docs, pos, b);
         let end = match tab {
             Some(ts) => scan_fast(&docs[..b], ts, |_, tok| {
                 if let Some(t) = tok.and_then(|k| vocab.get(k)) {
                     let t = t as usize;
-                    if unsafe { *last.get_unchecked(t) } != doc {
-                        unsafe {
-                            *last.get_unchecked_mut(t) = doc;
-                            *count.get_unchecked_mut(t) += 1;
-                        }
+                    if t < d_count {
+                        acc[t] |= bit;
+                    } else {
+                        let r = t - d_count;
+                        logs[r / BUCKET].push((((r % BUCKET) as u32) << 16) | du);
                     }
                 }
                 true
@@ -481,55 +604,103 @@ fn pass1(
         };
         spans.push((tab.unwrap_or(end) as u32, end as u32));
         pos = end + 1;
+        d += 1;
     }
-    (spans, count)
-}
+    flush_window(&mut acc, &mut bits, words, window);
+    assert_eq!(d, nd, "line count changed between the cut pass and indexing");
 
-fn pass2(
-    docs: &[u8],
-    spans: &[(u32, u32)],
-    vocab: &Vocab,
-    refs: &[TermRef],
-    arena: &mut [u16],
-    bits: &mut [u64],
-    cursor: &mut [u16],
-    positional: &[bool],
-    positions: &mut Vec<u64>,
-) {
-    cursor.fill(0);
-    for (d, &(s, e)) in spans.iter().enumerate() {
-        let d = d as u16;
-        scan_fast(&docs[s as usize..e as usize], 0, |offset, tok| {
-            if let Some(t) = tok.and_then(|k| vocab.get(k)) {
-                let t = t as usize;
-                if unsafe { *positional.get_unchecked(t) } {
-                    positions.push(((t as u64) << 40) | ((d as u64) << 24) | offset as u64);
-                }
-                let r = unsafe { *refs.get_unchecked(t) };
-                if r.len == SKIP {
-                    return true;
-                }
-                if r.len & DENSE != 0 {
-                    unsafe {
-                        *bits.get_unchecked_mut(r.start as usize + (d as usize >> 6)) |= 1u64 << (d & 63);
-                    }
-                } else {
-                    let c = unsafe { *cursor.get_unchecked(t) } as usize;
-                    let p = r.start as usize + c;
-                    if c == 0 || unsafe { *arena.get_unchecked(p - 1) } != d {
-                        unsafe {
-                            *arena.get_unchecked_mut(p) = d;
-                            *cursor.get_unchecked_mut(t) += 1;
-                        }
-                    }
-                }
+    let mut refs = vec![TermRef { start: 0, len: 0 }; nterms];
+    for (r, t) in refs.iter_mut().take(d_count).enumerate() {
+        *t = TermRef {
+            start: (r * words) as u32,
+            len: DENSE,
+        };
+    }
+    let mut arena: Vec<u16> = Vec::new();
+    let mut cnt = [0u32; BUCKET];
+    let mut last = [u32::MAX; BUCKET];
+    let mut start = [0usize; BUCKET];
+    for (k, log) in logs.iter().enumerate() {
+        // Pass 1: exact per-term counts. Entries are in document order, so `last` removes
+        // repeats of a term inside one document.
+        cnt.fill(0);
+        last.fill(u32::MAX);
+        for &e in log {
+            let (kk, doc) = ((e >> 16) as usize, e & 0xFFFF);
+            if last[kk] != doc {
+                last[kk] = doc;
+                cnt[kk] += 1;
             }
-            true
-        });
+        }
+        // Pass 2: place every list at its offset in the shared arena.
+        let mut run = arena.len();
+        for kk in 0..BUCKET {
+            start[kk] = run;
+            run += cnt[kk] as usize;
+        }
+        arena.resize(run, 0);
+        let mut fill = start;
+        last.fill(u32::MAX);
+        for &e in log {
+            let (kk, doc) = ((e >> 16) as usize, e & 0xFFFF);
+            if last[kk] != doc {
+                last[kk] = doc;
+                arena[fill[kk]] = doc as u16;
+                fill[kk] += 1;
+            }
+        }
+        for kk in 0..BUCKET {
+            let t = d_count + k * BUCKET + kk;
+            if t < nterms {
+                refs[t] = TermRef {
+                    start: start[kk] as u32,
+                    len: cnt[kk],
+                };
+            }
+        }
+    }
+    drop(logs);
+    Shard {
+        base: 0,
+        words,
+        spans,
+        refs,
+        arena,
+        bits,
     }
 }
 
-fn parse_queries(qb: &[u8], vocab: &mut Vocab) -> (Vec<Query>, Vec<PhrasePlan>) {
+/// Distinct-document counts of every term over the first `n` documents of the file.
+fn sample_counts(docs: &[u8], n: usize, vocab: &Vocab, nterms: usize) -> Vec<u32> {
+    let mut cnt = vec![0u32; nterms];
+    let mut last = vec![u32::MAX; nterms];
+    let mut pos = 0usize;
+    for d in 0..n {
+        if pos >= docs.len() {
+            break;
+        }
+        let du = d as u32;
+        let end = match text_start(docs, pos, docs.len()) {
+            Some(ts) => scan_fast(docs, ts, |_, tok| {
+                if let Some(t) = tok.and_then(|k| vocab.get(k)) {
+                    let t = t as usize;
+                    if last[t] != du {
+                        last[t] = du;
+                        cnt[t] += 1;
+                    }
+                }
+                true
+            }),
+            None => docs[pos..].iter().position(|&x| x == b'\n').map_or(docs.len(), |p| pos + p),
+        };
+        pos = end + 1;
+    }
+    cnt
+}
+
+// ------------------------------------------------------------------ queries
+
+fn parse_queries(qb: &[u8], terms: &mut Terms) -> (Vec<Query>, Vec<PhrasePlan>) {
     let mut queries = Vec::with_capacity(50_000);
     let mut plans = Vec::new();
     for mut line in qb.split(|&b| b == b'\n') {
@@ -538,9 +709,9 @@ fn parse_queries(qb: &[u8], vocab: &mut Vocab) -> (Vec<Query>, Vec<PhrasePlan>) 
         }
         if let Some(rest) = line.strip_prefix(b"BOOL ") {
             let mut it = rest.split(|&b| b == b' ');
-            let mut terms = [0u32; 6];
+            let mut tids = [0u32; 6];
             let mut ops = [Op::And; 5];
-            terms[0] = vocab.intern(it.next().unwrap());
+            tids[0] = terms.intern(it.next().unwrap());
             let mut len = 1;
             while let (Some(op), Some(term)) = (it.next(), it.next()) {
                 ops[len - 1] = match op {
@@ -548,26 +719,40 @@ fn parse_queries(qb: &[u8], vocab: &mut Vocab) -> (Vec<Query>, Vec<PhrasePlan>) 
                     b"OR" => Op::Or,
                     _ => Op::Not,
                 };
-                terms[len] = vocab.intern(term);
+                tids[len] = terms.intern(term);
                 len += 1;
             }
-            queries.push(Query::Bool { terms, ops, len: len as u8 });
+            queries.push(Query::Bool {
+                terms: tids,
+                ops,
+                len: len as u8,
+            });
         } else if line.starts_with(b"PHRASE \"") && line.len() >= 9 {
             let mut p = PhrasePlan::default();
             for term in line[8..line.len() - 1].split(|&b| b == b' ') {
-                p.terms[p.len as usize] = vocab.intern(term);
+                let id = terms.intern(term);
+                p.terms[p.len as usize] = id;
+                p.keys[p.len as usize] = terms.keys[id as usize];
                 p.len += 1;
             }
-            queries.push(Query::Phrase { plan: plans.len() as u32 });
+            queries.push(Query::Phrase {
+                plan: plans.len() as u32,
+            });
             plans.push(p);
         }
     }
     (queries, plans)
 }
 
+// ------------------------------------------------------------------ phrases
+
+/// Checks a phrase from one known token occurrence of its term at phrase position
+/// `anchor_pos`: walks back to the phrase start, then compares every token forward.
 fn phrase_at(text: &[u8], anchor: usize, anchor_pos: usize, keys: &[(u64, u64)]) -> bool {
     let mut first = anchor;
     for _ in 0..anchor_pos {
+        // Move across separators, then across the preceding token. Every non-ASCII byte is
+        // a separator under the frozen byte-tokenization contract, including UTF-8 bytes.
         while first > 0 && mapped(text, first - 1) == 0 {
             first -= 1;
         }
@@ -589,105 +774,157 @@ fn phrase_at(text: &[u8], anchor: usize, anchor_pos: usize, keys: &[(u64, u64)])
     matched == keys.len()
 }
 
-fn phrase_fallback(text: &[u8], keys: &[(u64, u64)]) -> bool {
-    let mut state = 0u8;
-    let target = 1u8 << (keys.len() - 1);
-    let mut hit = false;
-    scan(text, 0, |_, token| {
-        let Some(key) = token else {
-            state = 0;
-            return true;
-        };
-        if state == 0 && key != keys[0] {
+/// Occurrence of the rarest term at byte `p` as a whole token, plus an exact phrase match
+/// for any of its phrase positions.
+#[inline]
+fn at(text: &[u8], p: usize, seed: &[u8], positions: u8, keys: &[(u64, u64)]) -> bool {
+    let (n, l) = (text.len(), seed.len());
+    if (p > 0 && text[p - 1].is_ascii_alphanumeric()) || p + l > n {
+        return false;
+    }
+    if !text[p..p + l].iter().zip(seed).all(|(&x, &y)| x.to_ascii_lowercase() == y) {
+        return false;
+    }
+    if p + l < n && text[p + l].is_ascii_alphanumeric() {
+        return false;
+    }
+    let mut mask = positions;
+    while mask != 0 {
+        let at_pos = mask.trailing_zeros() as usize;
+        mask &= mask - 1;
+        if phrase_at(text, p, at_pos, keys) {
             return true;
         }
-        let mut mask = 0u8;
-        for (i, &expected) in keys.iter().enumerate() {
-            if key == expected {
-                mask |= 1u8 << i;
-            }
-        }
-        state = ((state << 1) | 1) & mask;
-        hit = state & target != 0;
-        !hit
-    });
-    hit
+    }
+    false
 }
 
-fn make_pos_refs(events: &[u64]) -> Vec<PosRef> {
-    let mut refs = Vec::new();
+/// Finds the rarest term's occurrences in a candidate document with a 16-byte prefilter on its
+/// first byte (case-folded), then checks each occurrence with `at`. The prefilter can pass
+/// extra bytes but never misses a real occurrence.
+fn verify(text: &[u8], seed: &[u8], positions: u8, keys: &[(u64, u64)]) -> bool {
+    let (n, l) = (text.len(), seed.len());
+    if l == 0 || l > n {
+        return false;
+    }
+    let b0 = seed[0];
     let mut i = 0usize;
-    while i < events.len() {
-        let term = (events[i] >> 40) as u32;
-        let start = i;
-        while i < events.len() && (events[i] >> 40) as u32 == term {
+    // SAFETY: SSE2 is part of the x86-64 baseline; each load reads 16 bytes at i with i + 16 <= n.
+    unsafe {
+        let want = _mm_set1_epi8(b0 as i8);
+        let fold = _mm_set1_epi8(0x20);
+        while i + 16 <= n {
+            let v = _mm_loadu_si128(text.as_ptr().add(i).cast::<__m128i>());
+            let mut m = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_or_si128(v, fold), want)) as u32;
+            while m != 0 {
+                let j = m.trailing_zeros() as usize;
+                m &= m - 1;
+                if at(text, i + j, seed, positions, keys) {
+                    return true;
+                }
+            }
+            i += 16;
+        }
+    }
+    while i < n {
+        if (text[i] | 0x20) == b0 && at(text, i, seed, positions, keys) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+// ------------------------------------------------------------- set algebra
+
+fn merge_union(a: &[u16], b: &[u16], out: &mut Vec<u16>) {
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        if a[i] < b[j] {
+            out.push(a[i]);
             i += 1;
+        } else if a[i] > b[j] {
+            out.push(b[j]);
+            j += 1;
+        } else {
+            out.push(a[i]);
+            i += 1;
+            j += 1;
         }
-        refs.push(PosRef {
-            term,
-            start: start as u32,
-            len: (i - start) as u32,
-        });
     }
-    refs
+    out.extend_from_slice(&a[i..]);
+    out.extend_from_slice(&b[j..]);
 }
 
-#[derive(Default)]
-struct Acc10 {
-    count: u64,
-    sum: u64,
-    len: usize,
-    ids: [u32; 10],
-}
-
-impl Acc10 {
-    #[inline(always)]
-    fn push(&mut self, id: u32) {
-        self.count += 1;
-        self.sum += id as u64;
-        if self.len < 10 {
-            unsafe { *self.ids.get_unchecked_mut(self.len) = id };
-            self.len += 1;
-        }
-    }
-
-    #[inline(always)]
-    fn push_word(&mut self, mut w: u64, base: u32) {
-        while w != 0 {
-            self.push(base + w.trailing_zeros());
-            w &= w - 1;
-        }
-    }
-
-    fn add(&mut self, view: SetView<'_>, base: u32) {
-        match view {
-            SetView::List(l) => {
-                for &id in l.iter().take(10 - self.len) {
-                    unsafe { *self.ids.get_unchecked_mut(self.len) = base + id as u32 };
-                    self.len += 1;
-                }
-                self.count += l.len() as u64;
-                self.sum += l.iter().map(|&x| x as u64).sum::<u64>() + base as u64 * l.len() as u64;
+/// Sets (or ORs in) every member of `v` into the bitset `out`.
+fn mark(v: SetView<'_>, out: &mut [u64]) {
+    match v {
+        SetView::List(l) => {
+            for &x in l {
+                out[x as usize >> 6] |= 1u64 << (x & 63);
             }
-            SetView::Bits(ws) => {
-                for (i, &w) in ws.iter().enumerate() {
-                    if w != 0 {
-                        self.push_word(w, base + 64 * i as u32);
-                    }
-                }
+        }
+        SetView::Bits(ws) => {
+            for (o, &w) in out.iter_mut().zip(ws) {
+                *o |= w;
             }
         }
     }
 }
 
-fn write_acc(out: &mut Vec<u8>, a: &Acc10) {
-    let _ = write!(out, "{} {}", a.count, a.sum);
-    for id in &a.ids[..a.len] {
-        let _ = write!(out, " {id}");
+/// One binary BOOL operation (left op right). Writes a bitset into `ob` and returns true when
+/// the result is a bitset, or writes a sorted list into `ol` and returns false.
+fn combine(l: SetView<'_>, r: SetView<'_>, op: Op, w: usize, ob: &mut [u64], ol: &mut Vec<u16>) -> bool {
+    match (op, l, r) {
+        (Op::And, SetView::Bits(lw), SetView::Bits(rw)) => {
+            for i in 0..w {
+                ob[i] = lw[i] & rw[i];
+            }
+            true
+        }
+        (Op::And, SetView::Bits(_), SetView::List(rl)) => {
+            ol.clear();
+            ol.extend(rl.iter().copied().filter(|&x| l.contains(x)));
+            false
+        }
+        (Op::And, SetView::List(ll), _) => {
+            ol.clear();
+            ol.extend(ll.iter().copied().filter(|&x| r.contains(x)));
+            false
+        }
+        (Op::Or, SetView::List(a), SetView::List(b)) => {
+            ol.clear();
+            merge_union(a, b, ol);
+            false
+        }
+        (Op::Or, _, _) => {
+            ob.fill(0);
+            mark(l, ob);
+            mark(r, ob);
+            true
+        }
+        (Op::Not, SetView::Bits(lw), SetView::Bits(rw)) => {
+            for i in 0..w {
+                ob[i] = lw[i] & !rw[i];
+            }
+            true
+        }
+        (Op::Not, SetView::Bits(lw), SetView::List(rl)) => {
+            ob.copy_from_slice(lw);
+            for &x in rl {
+                ob[x as usize >> 6] &= !(1u64 << (x & 63));
+            }
+            true
+        }
+        (Op::Not, SetView::List(ll), _) => {
+            ol.clear();
+            ol.extend(ll.iter().copied().filter(|&x| !r.contains(x)));
+            false
+        }
     }
-    out.push(b'\n');
 }
 
+/// Reusable per-worker BOOL state: the current and the next result, as list or bitset.
 struct Scratch {
     cl: Vec<u16>,
     tl: Vec<u16>,
@@ -702,197 +939,142 @@ enum Cur {
     Bits,
 }
 
-fn mark(view: SetView<'_>, out: &mut [u64], set: bool) {
-    match view {
-        SetView::List(l) => {
-            for &id in l {
-                let (w, b) = (id as usize >> 6, 1u64 << (id & 63));
-                if set {
-                    unsafe { *out.get_unchecked_mut(w) |= b };
-                } else {
-                    unsafe { *out.get_unchecked_mut(w) &= !b };
-                }
-            }
-        }
-        SetView::Bits(ws) => {
-            for (d, &s) in out.iter_mut().zip(ws) {
-                if set {
-                    *d |= s;
-                } else {
-                    *d &= !s;
-                }
-            }
-        }
-    }
-}
-
-fn merge(a: &[u16], b: &[u16], out: &mut Vec<u16>, union: bool) {
-    let (mut i, mut j) = (0, 0);
-    while i < a.len() && j < b.len() {
-        let (x, y) = (unsafe { *a.get_unchecked(i) }, unsafe { *b.get_unchecked(j) });
-        if x == y {
-            out.push(x);
-        } else if union {
-            out.push(x.min(y));
-        }
-        i += (x <= y) as usize;
-        j += (y <= x) as usize;
-    }
-    if union {
-        out.extend_from_slice(&a[i..]);
-        out.extend_from_slice(&b[j..]);
-    }
-}
-
+/// One left-to-right BOOL step inside one shard.
 fn step(cur: Cur, rhs: u32, op: Op, sh: &Shard, sc: &mut Scratch) -> Cur {
-    let words = sh.words();
+    let w = sh.words;
     let right = sh.view(rhs);
     let left = match cur {
         Cur::Term(t) => sh.view(t),
         Cur::List => SetView::List(&sc.cl),
-        Cur::Bits => SetView::Bits(&sc.cb[..words]),
+        Cur::Bits => SetView::Bits(&sc.cb[..w]),
     };
-    let bits = match op {
-        Op::And => left.is_bits() && right.is_bits(),
-        Op::Or => left.is_bits() || right.is_bits() || left.list_len() + right.list_len() >= words * 4,
-        Op::Not => left.is_bits(),
-    };
-    if bits {
-        let t = &mut sc.tb[..words];
-        match (op, left, right) {
-            (Op::And, SetView::Bits(a), SetView::Bits(b)) => {
-                for ((d, &x), &y) in t.iter_mut().zip(a).zip(b) {
-                    *d = x & y;
-                }
-            }
-            (Op::Not, SetView::Bits(a), SetView::Bits(b)) => {
-                for ((d, &x), &y) in t.iter_mut().zip(a).zip(b) {
-                    *d = x & !y;
-                }
-            }
-            _ => {
-                t.fill(0);
-                mark(left, t, true);
-                mark(right, t, matches!(op, Op::Or));
-            }
-        }
+    if combine(left, right, op, w, &mut sc.tb[..w], &mut sc.tl) {
         std::mem::swap(&mut sc.cb, &mut sc.tb);
-        return Cur::Bits;
+        Cur::Bits
+    } else {
+        std::mem::swap(&mut sc.cl, &mut sc.tl);
+        Cur::List
     }
-    let out = &mut sc.tl;
-    out.clear();
-    match (op, left) {
-        (Op::And, _) => {
-            let (s, o) = match (left, right) {
-                (SetView::List(a), SetView::List(b)) if a.len() > b.len() => (b, left),
-                (SetView::List(a), _) => (a, right),
-                (_, SetView::List(b)) => (b, left),
-                _ => unreachable!(),
-            };
-            match o {
-                SetView::List(b) => merge(s, b, out, false),
-                SetView::Bits(_) => out.extend(s.iter().copied().filter(|&x| o.contains(x))),
-            }
-        }
-        (Op::Or, SetView::List(a)) => {
-            if let SetView::List(b) = right {
-                merge(a, b, out, true);
-            }
-        }
-        (_, SetView::List(a)) => out.extend(a.iter().copied().filter(|&x| !right.contains(x))),
-        _ => {}
-    }
-    std::mem::swap(&mut sc.cl, &mut sc.tl);
-    Cur::List
 }
 
-fn eval(q: &Query, plans: &[PhrasePlan], docs: &[u8], sh: &Shard, sc: &mut Scratch, a: &mut Acc10) {
-    match q {
+// ------------------------------------------------------------------ results
+
+/// Running result of one query across shards: count, id sum and the 10 smallest ids.
+#[derive(Default)]
+struct Acc10 {
+    count: u64,
+    sum: u64,
+    len: usize,
+    ids: [u32; 10],
+}
+
+impl Acc10 {
+    fn push(&mut self, id: u32) {
+        self.count += 1;
+        self.sum += id as u64;
+        if self.len < 10 {
+            self.ids[self.len] = id;
+            self.len += 1;
+        }
+    }
+
+    /// Adds a shard's members (already offset by `base`). Shards are visited in id order, so
+    /// the kept ids stay ascending. Bitset sums use popcounts: the position sum of a word is
+    /// the sum over k of 2^k times the popcount of the positions whose bit k is set.
+    fn add(&mut self, view: SetView<'_>, base: u32) {
+        match view {
+            SetView::List(l) => {
+                for &x in l.iter().take(10 - self.len) {
+                    self.ids[self.len] = base + x as u32;
+                    self.len += 1;
+                }
+                self.count += l.len() as u64;
+                self.sum += l.iter().map(|&x| x as u64).sum::<u64>() + base as u64 * l.len() as u64;
+            }
+            SetView::Bits(ws) => {
+                for (i, &w) in ws.iter().enumerate() {
+                    if w == 0 {
+                        continue;
+                    }
+                    let first = base + 64 * i as u32;
+                    let mut r = w;
+                    while r != 0 && self.len < 10 {
+                        self.ids[self.len] = first + r.trailing_zeros();
+                        self.len += 1;
+                        r &= r - 1;
+                    }
+                    let c = w.count_ones() as u64;
+                    self.count += c;
+                    self.sum += c * first as u64;
+                    for (k, &m) in POS_MASK.iter().enumerate() {
+                        self.sum += ((w & m).count_ones() as u64) << k;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn write_acc(out: &mut Vec<u8>, a: &Acc10) {
+    write!(out, "{} {}", a.count, a.sum).unwrap();
+    for id in &a.ids[..a.len] {
+        write!(out, " {id}").unwrap();
+    }
+    out.push(b'\n');
+}
+
+fn eval(q: &Query, plans: &[PhrasePlan], docs: &[u8], texts: &[([u8; 32], u8)], sh: &Shard, sc: &mut Scratch, a: &mut Acc10) {
+    match *q {
         Query::Bool { terms, ops, len } => {
-            let m = *len as usize;
+            let m = len as usize;
             let mut cur = Cur::Term(terms[0]);
-            let mut i = 1usize;
-            while i < m {
+            for i in 1..m {
                 cur = step(cur, terms[i], ops[i - 1], sh, sc);
-                i += 1;
             }
             let view = match cur {
                 Cur::Term(t) => sh.view(t),
                 Cur::List => SetView::List(&sc.cl),
-                Cur::Bits => SetView::Bits(&sc.cb[..sh.words()]),
+                Cur::Bits => SetView::Bits(&sc.cb[..sh.words]),
             };
             a.add(view, sh.base);
         }
         Query::Phrase { plan } => {
-            let p = &plans[*plan as usize];
-            let second = (p.second != u32::MAX).then(|| sh.view(p.second));
-            let keys = &p.keys[..p.len as usize];
-            if p.positional {
-                let Ok(ridx) = sh.pos_refs.binary_search_by_key(&p.seed, |r| r.term) else {
-                    return;
-                };
-                let r = unsafe { *sh.pos_refs.get_unchecked(ridx) };
-                let events = &sh.positions[r.start as usize..(r.start + r.len) as usize];
-                let mut i = 0usize;
-                while i < events.len() {
-                    let doc = ((events[i] >> 24) & 0xffff) as u16;
-                    let mut end = i + 1;
-                    while end < events.len() && ((events[end] >> 24) & 0xffff) as u16 == doc {
-                        end += 1;
-                    }
-                    if second.map_or(true, |set| set.contains(doc)) {
-                        let (s, e) = unsafe { *sh.spans.get_unchecked(doc as usize) };
-                        let text = &docs[s as usize..e as usize];
-                        let mut found = false;
-                        for &event in &events[i..end] {
-                            let offset = (event & 0x00ff_ffff) as usize;
-                            let mut mask = p.seed_positions;
-                            while mask != 0 {
-                                let at = mask.trailing_zeros() as usize;
-                                if phrase_at(text, offset, at, keys) {
-                                    found = true;
-                                    break;
-                                }
-                                mask &= mask - 1;
-                            }
-                            if found {
-                                break;
-                            }
-                        }
-                        if found {
-                            a.push(sh.base + doc as u32);
-                        }
-                    }
-                    i = end;
-                }
-            } else {
-                sh.view(p.seed).each(|d| {
-                    if second.map_or(true, |set| set.contains(d)) {
-                        let (s, e) = unsafe { *sh.spans.get_unchecked(d as usize) };
-                        if phrase_fallback(&docs[s as usize..e as usize], keys) {
-                            a.push(sh.base + d as u32);
-                        }
-                    }
-                });
+            let p = &plans[plan as usize];
+            if p.dn == 0 {
+                return;
             }
+            let seed = p.dterms[0];
+            let (seed_text, seed_len) = texts[seed as usize];
+            let seed_bytes = &seed_text[..seed_len as usize];
+            let keys = &p.keys[..p.len as usize];
+            let others = &p.dterms[1..p.dn as usize];
+            // Candidates: documents holding every distinct term, visited rarest-term first.
+            sh.view(seed).each(|d| {
+                if others.iter().all(|&t| sh.view(t).contains(d)) {
+                    let (s, e) = sh.spans[d as usize];
+                    if verify(&docs[s as usize..e as usize], seed_bytes, p.seed_positions, keys) {
+                        a.push(sh.base + d as u32);
+                    }
+                }
+            });
         }
     }
 }
 
-fn run(docs: &[u8]) -> std::io::Result<()> {
+// --------------------------------------------------------------------- main
+
+fn run(docs: &[u8]) -> io::Result<()> {
     let qb = fs::read("/data/queries.txt")?;
-    let mut vocab = Vocab {
-        slots: vec![0u32; 16],
-        keys: Vec::new(),
-    };
-    let (mut queries, mut plans) = parse_queries(&qb, &mut vocab);
+    let mut terms = Terms::default();
+    let (mut queries, mut plans) = parse_queries(&qb, &mut terms);
     drop(qb);
-    let v = vocab.keys.len();
+    let nterms = terms.keys.len();
     let threads = thread::available_parallelism()
         .map_or(1, |n| n.get())
         .min(MAX_THREADS)
         .max(1);
 
+    // Shards: one line-snapped byte chunk per worker; double only if a shard exceeds MAX_DOCS.
     let mut c = threads;
     let (cuts, counts) = loop {
         let mut cuts: Vec<usize> = (0..c)
@@ -909,25 +1091,19 @@ fn run(docs: &[u8]) -> std::io::Result<()> {
             .collect();
         cuts.push(docs.len());
         cuts.dedup();
-        let counts = par_map(
-            threads,
-            cuts.len() - 1,
-            || (),
-            |i, _| {
-                let part = &docs[cuts[i]..cuts[i + 1]];
-                let mut n = part.iter().filter(|&&b| b == b'\n').count();
-                if cuts[i + 1] == docs.len() && part.last() != Some(&b'\n') {
-                    n += 1;
-                }
-                n
-            },
-        );
+        let counts = par_map(threads, cuts.len() - 1, || (), |i, _| {
+            let part = &docs[cuts[i]..cuts[i + 1]];
+            let mut n = part.iter().filter(|&&b| b == b'\n').count();
+            if cuts[i + 1] == docs.len() && part.last() != Some(&b'\n') {
+                n += 1; // final line without LF
+            }
+            n
+        });
         if counts.iter().all(|&n| n <= MAX_DOCS) {
             break (cuts, counts);
         }
         c *= 2;
     };
-
     let n = counts.len();
     let mut bases = Vec::with_capacity(n);
     let mut total = 0u32;
@@ -935,154 +1111,112 @@ fn run(docs: &[u8]) -> std::io::Result<()> {
         bases.push(total);
         total += k as u32;
     }
+    let total_docs = total as usize;
 
-    let pairs: Vec<(Vec<(u32, u32)>, Vec<u16>)> = par_map(
-        threads,
-        n,
-        || vec![0u16; v],
-        |i, last| pass1(docs, (cuts[i], cuts[i + 1]), &vocab, last, counts[i]),
-    );
-    let mut spans = Vec::with_capacity(n);
-    let mut counts1 = Vec::with_capacity(n);
-    for (s, cnt) in pairs {
-        spans.push(s);
-        counts1.push(cnt);
+    // Vocabulary table, then the dense/sparse split from the first 1/32 of the documents.
+    // Dense terms get the lowest ids, so the sample's ids are still the table's ids here.
+    let mut vocab = Vocab::build(&terms.keys);
+    let sample_n = if n > 0 { (total_docs / SAMPLE_DIV).min(counts[0]) } else { 0 };
+    let scount = if sample_n > 0 {
+        sample_counts(docs, sample_n, &vocab, nterms)
+    } else {
+        vec![0; nterms]
+    };
+    let is_dense = |t: usize| scount[t] > 0 && scount[t] as usize * SAMPLE_DIV >= sample_n;
+    let mut order: Vec<usize> = (0..nterms).collect();
+    order.sort_unstable_by_key(|&t| (!is_dense(t), std::cmp::Reverse(scount[t]), t));
+    let d_count = (0..nterms).filter(|&t| is_dense(t)).count();
+
+    // Renumber: order[new] = old. Table payloads, query terms and text all follow.
+    let mut map = vec![0u32; nterms];
+    for (new, &old) in order.iter().enumerate() {
+        map[old] = new as u32;
     }
-
-    let mut df = vec![0u32; v];
-    for cnt in &counts1 {
-        for (d, &x) in df.iter_mut().zip(cnt) {
-            *d += x as u32;
+    vocab.remap(&map);
+    let texts: Vec<([u8; 32], u8)> = order.iter().map(|&old| terms.texts[old]).collect();
+    for q in &mut queries {
+        if let Query::Bool { terms: t, len, .. } = q {
+            for x in &mut t[..*len as usize] {
+                *x = map[*x as usize];
+            }
+        }
+    }
+    for p in &mut plans {
+        for x in &mut p.terms[..p.len as usize] {
+            *x = map[*x as usize];
         }
     }
 
-    let mut keep = vec![false; v];
-    let mut positional = vec![false; v];
+    // Index every shard on its own thread (no shared writes, no barrier).
+    let mut shards: Vec<Shard> = par_map(threads, n, || (), |i, _| {
+        index_shard(docs, cuts[i], cuts[i + 1], counts[i], &vocab, d_count, nterms)
+    });
+    drop(vocab);
+    for (i, sh) in shards.iter_mut().enumerate() {
+        sh.base = bases[i];
+    }
+
+    // Global document frequencies (exact; used for AND ordering and phrase seeds).
+    let mut df = vec![0u32; nterms];
+    for sh in &shards {
+        for (t, d) in df.iter_mut().enumerate() {
+            let r = sh.refs[t];
+            *d += if r.len & DENSE != 0 {
+                let s = r.start as usize;
+                sh.bits[s..s + sh.words].iter().map(|w| w.count_ones()).sum::<u32>()
+            } else {
+                r.len
+            };
+        }
+    }
+
+    // Reorder operands inside contiguous AND runs only. Intersection is commutative, and the
+    // first operand of a run that follows OR/NOT stays where it is.
     for q in &mut queries {
-        if let Query::Bool { terms, ops, len } = q {
+        if let Query::Bool { terms: t, ops, len } = q {
             let m = *len as usize;
-            for &t in &terms[..m] {
-                keep[t as usize] = true;
-            }
             let mut start = 0usize;
             while start < m {
                 let mut end = start;
                 while end + 1 < m && matches!(ops[end], Op::And) {
                     end += 1;
                 }
-                let sort_from = if start == 0 { start } else { start + 1 };
-                if sort_from < end {
-                    terms[sort_from..=end].sort_unstable_by_key(|&t| (df[t as usize], t));
-                } else if start == 0 && sort_from == end {
-                    terms[start..=end].sort_unstable_by_key(|&t| (df[t as usize], t));
+                let lo = if start == 0 { 0 } else { start + 1 };
+                if lo < end {
+                    t[lo..=end].sort_unstable_by_key(|&x| (df[x as usize], x));
                 }
                 start = end + 1;
             }
         }
     }
 
-    let rare_anchor_limit = total as usize / 1000;
+    // Phrase plans: distinct terms rarest first; the seed is the rarest one.
     for p in &mut plans {
         let m = p.len as usize;
-        let mut ord = p.terms;
-        ord[..m].sort_unstable_by_key(|&t| (df[t as usize], t));
-        let seed = ord[0];
-        let second = ord[1..m].iter().copied().find(|&t| t != seed);
-        p.seed = seed;
-        p.second = second.unwrap_or(u32::MAX);
+        let mut ds = p.terms;
+        ds[..m].sort_unstable_by_key(|&t| (df[t as usize], t));
+        let mut dn = 0usize;
+        for i in 0..m {
+            if i == 0 || ds[i] != ds[i - 1] {
+                p.dterms[dn] = ds[i];
+                dn += 1;
+            }
+        }
+        p.dn = dn as u8;
+        if dn == 0 {
+            continue;
+        }
+        let seed = p.dterms[0];
         p.seed_positions = 0;
         for i in 0..m {
             if p.terms[i] == seed {
                 p.seed_positions |= 1u8 << i;
             }
         }
-        p.positional = df[seed as usize] <= rare_anchor_limit as u32;
-        if p.positional {
-            positional[seed as usize] = true;
-        } else {
-            keep[seed as usize] = true;
-        }
-        if let Some(s) = second {
-            keep[s as usize] = true;
-        }
-        for i in 0..m {
-            p.keys[i] = vocab.keys[p.terms[i] as usize];
-        }
     }
 
-    let layouts = par_map(
-        threads,
-        n,
-        || (),
-        |i, _| {
-            let words = spans[i].len().div_ceil(64);
-            let (mut sp, mut dn) = (0usize, 0usize);
-            let refs: Vec<TermRef> = counts1[i]
-                .iter()
-                .zip(&keep)
-                .map(|(&c, &k)| {
-                    if !k {
-                        TermRef { start: 0, len: SKIP }
-                    } else if c as usize * 2 >= words * 8 {
-                        dn += words;
-                        TermRef {
-                            start: (dn - words) as u32,
-                            len: DENSE | c as u32,
-                        }
-                    } else {
-                        sp += c as usize;
-                        TermRef {
-                            start: (sp - c as usize) as u32,
-                            len: c as u32,
-                        }
-                    }
-                })
-                .collect();
-            (refs, sp, dn)
-        },
-    );
-    drop(counts1);
-
-    let bodies = par_map(
-        threads,
-        n,
-        || vec![0u16; v],
-        |i, cursor| {
-            let (refs, sp, dn) = &layouts[i];
-            let mut arena = vec![0u16; *sp];
-            let mut bits = vec![0u64; *dn];
-            let mut positions = Vec::new();
-            pass2(
-                docs,
-                &spans[i],
-                &vocab,
-                refs,
-                &mut arena,
-                &mut bits,
-                cursor,
-                &positional,
-                &mut positions,
-            );
-            positions.sort_unstable();
-            (arena, bits, positions)
-        },
-    );
-
-    let mut shards = Vec::with_capacity(n);
-    for (i, ((arena, bits, positions), (refs, _, _))) in bodies.into_iter().zip(layouts).enumerate() {
-        let pos_refs = make_pos_refs(&positions);
-        shards.push(Shard {
-            base: bases[i],
-            spans: std::mem::take(&mut spans[i]),
-            refs,
-            arena,
-            bits,
-            pos_refs,
-            positions,
-        });
-    }
-
-    let max_words = shards.iter().map(Shard::words).max().unwrap_or(0).max(1);
+    // Queries: blocks of BLOCK queries, each evaluated on every shard in document order.
+    let max_words = shards.iter().map(|s| s.words).max().unwrap_or(0).max(1);
     let nblocks = queries.len().div_ceil(BLOCK);
     let blocks = par_map(
         threads,
@@ -1098,14 +1232,13 @@ fn run(docs: &[u8]) -> std::io::Result<()> {
             for q in &queries[b * BLOCK..((b + 1) * BLOCK).min(queries.len())] {
                 let mut a = Acc10::default();
                 for sh in &shards {
-                    eval(q, &plans, docs, sh, sc, &mut a);
+                    eval(q, &plans, docs, &texts, sh, sc, &mut a);
                 }
                 write_acc(&mut out, &a);
             }
             out
         },
     );
-
     fs::create_dir_all("/out")?;
     let mut file = File::create("/out/results.txt")?;
     for b in &blocks {
@@ -1115,17 +1248,19 @@ fn run(docs: &[u8]) -> std::io::Result<()> {
     std::process::exit(0);
 }
 
-fn main() -> std::io::Result<()> {
+fn main() -> io::Result<()> {
     let file = File::open("/data/docs.txt")?;
     let len = usize::try_from(file.metadata()?.len())
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "docs.txt too large"))?;
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "docs.txt too large"))?;
     if len == 0 {
         return run(&[]);
     }
+    // SAFETY: len is nonzero and <= isize::MAX; the live input fd maps this range and MAP_FAILED is checked before forming the immutable slice.
     unsafe {
+        // prot = PROT_READ (1), flags = MAP_PRIVATE (2)
         let ptr = mmap(std::ptr::null_mut(), len, 1, 2, file.as_raw_fd(), 0);
         if ptr as isize == -1 {
-            return Err(std::io::Error::last_os_error());
+            return Err(io::Error::last_os_error());
         }
         run(std::slice::from_raw_parts(ptr.cast::<u8>(), len))
     }
