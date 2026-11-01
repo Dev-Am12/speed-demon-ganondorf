@@ -3,7 +3,7 @@
 
 use std::arch::x86_64::*;
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::Write;
 use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Mutex};
@@ -84,6 +84,7 @@ struct HourData {
 struct Local {
     table: Table,
     hours: Vec<HourData>,
+    cap: usize,
 }
 
 #[inline(always)]
@@ -126,7 +127,11 @@ fn parse_line(buf: &[u8], pos: usize, local: &mut Local) -> usize {
 
         let name = std::slice::from_raw_parts(p.add(ep_start), ep_len);
         let id = local.table.intern(name);
+        let cap = local.cap;
         let hd = &mut local.hours[hour];
+        if hd.records.capacity() == 0 {
+            hd.records.reserve(cap);
+        }
         if latency >= 0xFFFFF {
             hd.overflow.push((hd.records.len() as u32, latency));
         }
@@ -137,15 +142,16 @@ fn parse_line(buf: &[u8], pos: usize, local: &mut Local) -> usize {
 }
 
 fn parse_worker_range(file: &File, mut start: usize, end: usize) -> Local {
-    let cap = ((end - start) / 40 / HOURS).max(64);
+    let cap = ((end - start) / 100).clamp(64, 50000);
     let mut local = Local {
         table: Table::new(),
         hours: (0..HOURS)
             .map(|_| HourData {
-                records: Vec::with_capacity(cap),
+                records: Vec::new(),
                 overflow: Vec::new(),
             })
             .collect(),
+        cap,
     };
     let mut buf = [0u8; CHUNK_SIZE + 64];
     let mut carried = 0;
@@ -178,9 +184,10 @@ fn parse_worker_range(file: &File, mut start: usize, end: usize) -> Local {
 }
 
 #[inline(always)]
-fn push_field(buf: &mut Vec<u8>, mut n: u64, delim: u8) {
-    let mut temp = [0u8; 20];
-    let mut i = 20;
+fn push_field(buf: &mut Vec<u8>, mut n: u32, delim: u8) {
+    let mut temp = [0u8; 12];
+    let mut i = 11;
+    temp[11] = delim;
     loop {
         i -= 1;
         temp[i] = b'0' + (n % 10) as u8;
@@ -189,28 +196,18 @@ fn push_field(buf: &mut Vec<u8>, mut n: u64, delim: u8) {
             break;
         }
     }
-    buf.extend_from_slice(&temp[i..]);
-    buf.push(delim);
+    buf.extend_from_slice(&temp[i..12]);
 }
 
 #[inline(always)]
 fn percentile_values(latencies: &mut [u32]) -> (u32, u32, u32) {
     let n = latencies.len();
-    if n == 1 {
-        return (latencies[0], latencies[0], latencies[0]);
-    }
-    if n == 2 {
-        return (
-            latencies[0].min(latencies[1]),
-            latencies[0].max(latencies[1]),
-            latencies[0].max(latencies[1]),
-        );
-    }
-    let a = (50 * n + 99) / 100 - 1;
-    let b = (95 * n + 99) / 100 - 1;
-    let c = (99 * n + 99) / 100 - 1;
     latencies.sort_unstable();
-    (latencies[a], latencies[b], latencies[c])
+    (
+        latencies[(50 * n + 99) / 100 - 1],
+        latencies[(95 * n + 99) / 100 - 1],
+        latencies[(99 * n + 99) / 100 - 1],
+    )
 }
 
 fn main() {
@@ -422,12 +419,16 @@ fn main() {
                         out.extend_from_slice(&prefixes[hour]);
                         out.extend_from_slice(names[ep]);
                         out.push(b' ');
-                        push_field(&mut out, n as u64, b' ');
-                        push_field(&mut out, p50 as u64, b' ');
-                        push_field(&mut out, p95 as u64, b' ');
-                        push_field(&mut out, p99 as u64, b' ');
-                        push_field(&mut out, errors as u64, b' ');
-                        push_field(&mut out, errors as u64 * 1_000_000 / n as u64, b'\n');
+                        push_field(&mut out, n as u32, b' ');
+                        push_field(&mut out, p50, b' ');
+                        push_field(&mut out, p95, b' ');
+                        push_field(&mut out, p99, b' ');
+                        push_field(&mut out, errors, b' ');
+                        push_field(
+                            &mut out,
+                            (errors as u64 * 1_000_000 / n as u64) as u32,
+                            b'\n',
+                        );
                     }
                     let _ = tx.send((hour, out));
                 }
@@ -435,8 +436,7 @@ fn main() {
         }
         drop(tx);
 
-        let out = File::create(output).expect("create output");
-        let mut writer = BufWriter::with_capacity(256 * 1024, out);
+        let mut out = File::create(output).expect("create output");
         let mut pending = vec![None; HOURS];
         let mut next_to_write = 0;
 
@@ -445,11 +445,10 @@ fn main() {
             pending[h] = Some(buf);
             while next_to_write < HOURS && pending[next_to_write].is_some() {
                 let b = pending[next_to_write].take().unwrap();
-                writer.write_all(&b).expect("write summary.txt");
+                out.write_all(&b).expect("write summary.txt");
                 drop(b);
                 next_to_write += 1;
             }
         }
-        writer.flush().expect("flush output");
     });
 }
