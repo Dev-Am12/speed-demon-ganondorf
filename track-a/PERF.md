@@ -26,6 +26,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 19 | M1: reserve record buffers once with chunk_len / 40 | pending | 0.052 | 44 | 33.20 |
 | 20 | M2: pack records to 4B u32 (11-bit id | 1-bit err | 20-bit lat) with overflow list | pending | 0.050 | 41 | 35.80 |
 | 21 | M3: progressive hourly buffer drops with ordered streaming pipeline | pending | 0.050 | 26 | 38.40 |
+| 22 | A-v8-ARCH: global lock-free table, AVX2 parser, non-overlapping memory lifecycle, hybrid sort | pending | 0.072 | 17.87 | 27.88 |
 
 ### Experiment Log
 - **Step 2 (A1 - Positional parsing & integer hour index):**
@@ -131,3 +132,12 @@ Every step from the reference to your final version, each with the live-board ru
   - *Local relative result:* Cgroup `memory.peak` dropped dramatically from 41.04 MB to 26.13 MB (-14.91 MB, -36.3% peak memory reduction). Peak RSS (VmHWM) dropped from 31.3 MB to 21.2 MB (-10.1 MB, -32.3%). Minor page faults dropped from 8,246 to 7,026 (-1,220 faults, -14.8%). User CPU time dropped from 477.3 ms to 469.1 ms. Container check passes (0.88 s). Because `memory.peak` fell to 26.13 MB, M4 (`malloc_trim`) is not triggered, keeping the code 100% `#![forbid(unsafe_code)]`. S = 440 lines (+19 lines).
   - *K-accounting:* Evaluated at board operating point ($M \approx 41.04 \to 26.13\text{ MB}$, $S = 421 \to 440$, $T \approx 70\text{ ms}$): $\Delta M \approx -14.91\text{ MB} \implies \times 1.0701$; $\Delta S = +19 \implies \times 0.9934$; net gain $= +6.30\% \ge 1\%$.
   - *Verdict:* Kept. Correctness verified on full, sample, tiny, 49/49 fuzz seeds, and threads 1/2/6/8/12.
+- **Step 24 (A-v8-ARCH - Global lock-free table, AVX2 parser, non-overlapping memory lifecycle, hybrid sort):**
+  - *Hypothesis:* Unifying worker endpoint tables into a single global table with atomic 64-bit slot probing avoids per-worker tables, table merging, and endpoint remapping loops (saving ~60 lines of S). Replacing SWAR with AVX2 vectorized space detection and 3-word hash reduces parser CPU. Dropping raw hourly buffers and calling `malloc_trim(0)` before opening and writing `/out/summary.txt` eliminates the physical memory overlap between Phase A/C record buffers and the 10.11 MB output file page cache.
+  - *Implementation:*
+    1. Single global lock-free-read table: `SLOTS: [AtomicU64; 4096]`, `META: [AtomicU64; 2048]`, `LOCK: Mutex<(usize, usize)>` locked only on cold miss (<1,842 times total).
+    2. AVX2 parser: single `_mm256_loadu_si256` at offset 31 locating method space and endpoint space via bit manipulation.
+    3. Non-overlapping memory lifecycle: Phase C results stored in flat `SUMMARY: [AtomicU32; 72 * 2048 * 5]`. Raw hour records dropped, `malloc_trim(0)` called, then summary formatted sequentially in 256 KB reusable chunks.
+    4. Hybrid percentile selection: bypasses sorting for $n=1$, `sort_unstable` for $n \le 64$, 3-stage `select_nth_unstable` for $n > 64$.
+  - *Local relative result:* S reduced from 423 to 264 lines (-37.6%). Total CPU time dropped by 26% (User: 0.27s vs 0.32s, System: 0.15s vs 0.25s). Cgroup `memory.peak` dropped from 22.07 MB to 17.87 MB (-19.0%). Wall time on ext4 in 20-run interleaved hyperfine was 164.4 ms vs 84.4 ms due to sequential post-trim output formatting.
+  - *Verdict:* Verified against full dataset (exact SHA-256 match `495ca09682b9673ef836a506496177680bb4a3af54255174befddb1f83481cd3`), sample seeds 2..10 (9/9), full seeds 2..4 (3/3), tiny fuzz seeds 2..50 (49/49), thread invariance (1, 2, 6, 12), and edge cases.
