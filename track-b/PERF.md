@@ -59,3 +59,46 @@ K = (56.35 / T)^0.5
 ```
 
 Track B has no third-party runtime dependency, so `D = Dref = 1`. At the current 67 MB board memory, reducing memory toward the 44 MB cap can still help. Correctness remains a hard gate, including on the unseen holdout corpus.
+
+### Earlier supplied board runs
+
+| Candidate | Commit | T | M | S | K | Points |
+|---|---|---:|---:|---:|---:|---:|
+| Team v3 | f473810 | 0.711 s | 63 MB | 1,212 | 12.304 | 54.503 |
+| Submitted baseline | a3f64b1 | 0.631 s | 57 MB | 1,294 | 13.163 | 55.9 (computed) |
+| Positional index rebuild | 4d1311a | 0.592 s | 66 MB | 1,014 | 13.703 | 56.840 |
+| Shard tuning and phrase planning | 5792950 | 0.505 s | 66 MB | 1,077 | 14.691 | 58.353 |
+| Team candidate | 3fe70c9 | 0.515 s | 67 MB | 1,077 | 14.529 | 58.112 |
+| Restored with other tracks | 3165259 | 0.534 s | 66 MB | 1,077 | 14.277 | 57.732 |
+| Team candidate | a52ad27 | 0.494 s | 67 MB | 1,077 | 14.831 | 58.558 |
+| Same B code, later run | 7580e12 | 0.506 s | 67 MB | 1,077 | 14.651 | 58.293 |
+
+These rows are earlier team-supplied board snapshots. The board run at c35a41d is the latest supplied B result.
+
+### B0 diagnostic profile
+
+Three diagnostic runs on full seed 1 showed the scan/index build dominates. The recorded ranges were:
+
+| Phase / counter | Local diagnostic result |
+|---|---:|
+| Query parse and vocabulary | 10.8-12.0 ms; V=75,747; table slots=262,144 |
+| Line cuts | 7-11 ms |
+| Pass 1 | 92.5-100.8 ms |
+| Pass 2 | 243.8-284.2 ms |
+| Decisions / phrase plans | about 2.5 ms; 19,000 phrases |
+| Layout | 1.2-1.6 ms; 59,831 kept terms |
+| Position event sort | 13-15 ms |
+| Assembly | 2.4-3.0 ms |
+| Query evaluation | 62-63 ms; 50,000 queries, 196 blocks |
+| Output | 0.7-1.1 ms |
+| Total diagnostic run | 428-467 ms |
+| Tokens / vocabulary hits | 36,276,657 / 28,716,697 |
+| Position events | 798,126 |
+| Arena / bitsets | 27,134,486 / 5,594,072 bytes |
+| VmHWM | about 311 MB |
+
+These are diagnostic-build measurements, not production timings. Passes 1 and 2 account for roughly 79% of diagnostic runtime.
+
+### Other compact source experiments
+
+Reusing pass-1 state as the pass-2 cursor did not reduce RSS and was slightly slower; it was reverted. Removing one unreachable match arm saved one scc Code line, but paired timings were noisy and the all-CPU result regressed, so it was reverted. Neither change is part of e7c9ea6.

@@ -1,36 +1,74 @@
 # Track C: performance log
 
-Every step from the reference to your final version, each with the live-board run ID that measured it. Judges check that the run IDs exist and that each change moved the way you say it did.
+This is a living log. Every row in the board tables is an official measurement from the live board, identified by the scored commit and the time the board finished the run (UTC). The board page shows no run IDs, so these identifiers are the commit and the finish time. Local timings are kept in their own table and are never used as board results.
 
-| Step | Change | Run ID | T (s) | M (MB) | S | K | Points | Verdict |
-|---|---|---|---:|---:|---:|---:|---:|---|
-| 0 | The reference, unchanged | - | 14.444 | 367.44 | 108 | 0.980 | 0.000 | Baseline Python reference |
-| 1 | C1: Two-pass SIMD quote-parity CSV scanner, PCLMULQDQ structural delimiter indexing, 1 MB region lookup array, and shared lock-free 128-bit hash to 256-bit country bitmask table | a3f64b1 | 0.168 | 29 | 622 | 11.828 | 53.646 | Kept (first board baseline) |
-| 2 | C2: Single-pass grammar-snapped chunking, zero-allocation mmap region interning, Port-0 fused AVX2 delimiter mask, and unaligned wyhash + demand-zeroed 64-bit name table | 080c956 | 0.074 | 10 | 509 | 22.754 | 67.853 | Kept (2.27x faster, -65% M) |
-| 3 | C3/C4: Explicit `+pclmul` VEX inlining, single-pass pointer `load_regions`, bounds-check-free L1 structural tape, branchless SWAR integer parsing, race-free SoA name table, `[i64; 8]` cache-line accumulators, and S compaction (~192 lines) | pending | pending | pending | ~192 | pending | pending | Candidate ready for board push (`--track c` or `--all-tracks`) |
+## Current submission
 
-### Experiment Log
+| | |
+|---|---|
+| Latest all-track board commit | c35a41d |
+| Board result (finished 2026-11-01 09:39 UTC) | 70.837 points; K 26.106129; T 0.060 s; M 10 MB; S 393 lines |
+| Best measured board result | 70.837 points; K 26.106129 (commit c35a41d) |
+| Correctness | Full seed 1: `d8088b1c…f536` (matches the expected hash). Tiny `e4e43bc3…`, sample `9035fed3…` match. Five repeat runs identical. Four CPU-pinning configurations (0, 0-1, 0-5, 0-11) identical. Hostile long-name fixture matches the reference. |
 
-- **Step 1 (C1 — Two-pass `PCLMULQDQ` + AVX2 structural CSV join, board run `a3f64b1`):**
-  - *Hypothesis:* Using 64-byte AVX2 comparisons paired with `_mm_clmulepi64_si128` carry-less multiplication computes the quote parity mask in one instruction, allowing 12 threads to locate structural commas and record terminators while deriving unescaped `note` and `name` byte lengths directly from quote popcounts.
-  - *Board result (`a3f64b1`):* Passed correctness gate (`d8088b1cd42ba1338b1345b107b55db7b96ef1f5066f3ff64fd26a8912a0f536`). Measured `T = 0.168 s`, `M = 29 MB`, `S = 622 lines`, `D = 1`, `K = 11.828112` (`53.646 pts`).
+## 1. Board log
 
-- **Step 2 (C2 — Single-pass record boundary snapping & zero-allocation region loader, board run `080c956`):**
-  - *Hypothesis:* Eliminating the 400,000 heap `Vec<u8>` allocations in `load_regions` via `mmap` + a 512-slot stack hash table drops peak RSS from 29 MB to ~10 MB and saves ~50 ms of single-threaded startup. Replacing the 202 MB Pass 1 quote-counting scan with $O(1)$ grammar-verified record boundary snapping (`is_record_end`) halves memory bandwidth.
-  - *Board result (`080c956`):* Passed correctness gate. Runtime dropped **2.27x** (`0.168 s -> 0.074 s`), peak memory dropped **65.5%** (`29 MB -> 10 MB`), and $K$ nearly doubled (`11.828 -> 22.754`, `53.646 -> 67.853 pts`).
-  - *Note on board commit `4d1311a`:* That push isolated Track B (`board_push.sh --track b`), so Track C was marked `unchanged` and retained `080c956`.
+Points are the board's machine speed points, 50 × log10(K).
 
-- **Step 3 (C3/C4 — VEX `vpclmulqdq` inlining, single-pass `load_regions`, unchecked L1 structural tape, SWAR integer parsing, race-free SoA `NameTable`, and `[i64; 8]` S compaction):**
-  - *Post-mortem of `080c956` (`0.074 s`, `S = 509`):*
-    1. **Missing `+pclmul` target feature caused 3.15M out-of-line SSE calls:** `-C target-cpu=x86-64-v3` does not enable `pclmul` in LLVM. Without `#[target_feature(enable = "pclmul")]`, `_mm_clmulepi64_si128` was not inlined into `parse_chunk`, causing register spills and AVX-to-SSE transition stalls on every 64-byte block.
-    2. **Single-threaded iterator overhead in `load_regions`:** Calling `split('\n')`, `strip_suffix('\r')`, and `position(',')` across 200,000 lines cost ~8–10 ms on the main thread before workers launched.
-    3. **43M+ dynamic bounds checks & state-machine branching in `parse_chunk`:** Slice indexing on `d_pos`, `d_q`, and `bytes` emitted ~15 bounds checks per record across 3.32M records.
-    4. **Concurrent empty-slot CAS race in `insert_name`:** Two threads simultaneously hashing the same new name (`cur == 0`) could cause the CAS loser to advance to `idx + 1` and insert a duplicate key.
-    5. **Formatted line count (`S = 509`):** Boilerplate struct definitions and formatting loops cost `(108 / 509)^0.15 = 0.792`.
-  - *Changes in C4:*
-    1. **Explicit `#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt,pclmul")]` + hoisted `_mm_cvtsi64_si128`:** Inlines `vpclmulqdq` directly into the 64-byte loop and removes redundant tail bitmasking (since zero-padded tail bytes never match `'"'`, `','`, or `'\n'`).
-    2. **Single-pass pointer loop in `load_regions`:** Scans `rid` and the packed country key in one pass with zero iterator allocations (< 1 ms).
-    3. **Two-stage unchecked L1 structural tape + unified `q_name <= 2` fast path:** Removes ~43M slice bounds checks and merges `q_name == 0` and `q_name == 2` into a single branchless pointer/length calculation `(bp.add(c1 + 1 + (q_name >> 1)), c2 - c1 - 1 - q_name)`.
-    4. **8-byte SWAR integer & cent parsing + race-free SoA `NameTable`:** Parses 1-to-8-digit integers in 6 cycles without loops and resolves concurrent empty-slot CAS races via `unwrap_or_else(|v| v)`.
-    5. **64-byte `[i64; 8]` accumulators & S compaction (`S`: 509 $\to$ ~192 lines, +15.8% $K$):** Enables AVX2 auto-vectorized aggregation and shrinks total track code lines by 62%.
-  - *Verdict:* Ready for board verification via `--track c` or `--all-tracks`.
+| Step | Change | Board commit | Finished (UTC) | T (s) | M (MB) | S (lines) | K | Points | Status |
+|---|---|---|---|---:|---:|---:|---:|---:|---|
+| 0 | Organiser reference, unchanged | — | — | 14.44 | 367 | 108 | 1.000 | 0.000 | reference |
+| 1 | Two-pass SIMD quote-parity scanner, region lookup table | a3f64b1 | not recorded | 0.168 | 29 | 622 | 11.828 | 53.646 | superseded |
+| 2 | Single-pass record-boundary snapping, mmap region loader, 64-bit name table | 080c956 | not recorded | 0.074 | 10 | 509 | 22.754 | 67.853 | superseded |
+| 3 | Team C version on `speed-demon` at 3fe70c9 | 3fe70c9 | 19:23 | 0.067 | 10 | 389 | 25.246 | 70.109 | superseded |
+| 4 | Same C code as step 3, scored in a later run | a52ad27 | 20:00 | 0.073 | 10 | 389 | 23.914 | 68.932 | same code |
+| 5 | C0 full-coverage long-name hash + C2a distinct from the fetch_or result | 15d48f6 | 21:03 | 0.085 | 10 | 399 | 22.124 | 67.243 | superseded (other tracks were reset in that run) |
+| 6 | Same as step 5, restored with the other tracks | 3165259 | 21:11 | 0.063 | 10 | 399 | 25.394 | 70.237 | superseded |
+| 7 | **E1: remove the duplicate `(name, country)` cache** | **7580e12** | **21:31** | **0.063** | **10** | **393** | **25.714** | **70.508** | **best measured** |
+| 8 | Same E1 code, scored with the Track B change | b22f4e2 | 22:02 | 0.065 | 10 | 393 | 25.256 | 70.118 | superseded |
+| 9 | Latest all-track run | c35a41d | 09:39 (Nov 1) | 0.060 | 10 | 393 | 26.106 | 70.837 | current |
+
+Step 4 scored the same code as step 3 about 40 minutes later; the 1.0 point difference is run-to-run noise. Steps 6 and 7 differ by about 0.3 points, which is also within that noise. Points differences under about 3 are not evidence of a change.
+
+## 2. Local experiments (laptop, not board results)
+
+Method: same session, full seed 1, paired runs with `hyperfine -N`, both run orders when the result matters. A change is kept only if the correctness gate passes and the paired gain is at least 3% in every order tested.
+
+| Experiment | Change | Local result | Decision |
+|---|---|---|---|
+| C0 | Full-coverage hash for names over 32 bytes (`hash_long`) | Correctness fix: the old hash ignored bytes 24 to len-8 of long names, so two different names could count as one. Hostile fixture now matches. | Kept (correctness) |
+| C2a | Count distinct names from the `fetch_or` result; remove the post-pass over the table | 1.07× (61.0 vs 65.6 ms) | Kept |
+| C2b | Skip quote counts for delimiter phases the record never uses | No gain (67.2 vs 66.6 ms) | Rejected |
+| E1 | Remove the 2,048-entry duplicate `(name, country)` cache (measured hit rate 0.015%) | 1.09× (60.3 vs 65.7 ms), tighter spread | Kept |
+| E2 | Dynamic scheduling: four line-aligned chunks per thread from a shared counter | 1% (61.0 vs 61.8 ms) | Rejected |
+| E3 | Key and mask words packed into one 40-byte slot | Slower (65.6 vs 63.8 ms) | Rejected |
+| E4 | Prefetch name slots, delay inserts by four records | Result reversed with run order (9% and 28%) on a loaded machine; not proven | Rejected |
+
+### Where the time goes (diagnostic builds, timing only)
+
+Field ablation on E1 (removing one piece of work at a time, 12 threads):
+
+| Removed | Time (ms) | Saved |
+|---|---:|---:|
+| Nothing (E1) | 61.3 | — |
+| Id parsing | 57.5 | about 4 ms |
+| Amount parsing | 57.6 | about 4 ms |
+| Region lookup | 52.0 (noisy) | about 9 ms |
+| Name hashing and table update | 32.9 | about 28 ms |
+| Memory read only (floor) | 10.2 | — |
+
+On one core the name path is 54% of run time; on 12 threads it is 50%. The cost is per core, not contention between threads. A hash-only split was measured in a different session and was not repeated on E1, so the division between hashing and table update is not final.
+
+## 3. Open experiments
+
+| Idea | Expected effect | Status |
+|---|---|---|
+| Cheaper deduplication under the 10 MB memory cap | Name path is about half of run time | No design found that stays inside memory: per-thread tables multiply memory by 12 |
+| Smaller region map (1 MB random reads per record) | About 9 ms | Not started |
+| Source reduction from 393 lines | About 0.3 points per 100 lines removed | Planned before freeze |
+
+## 4. Scoring context
+
+K = (Tref/T)^0.50 × min(Mref/M, 50)^0.20 × min(Sref/S, 1)^0.15 × min(Dref/D, 1)^0.15, with Tref 14.44 s, Mref 367 MB, Sref 108 lines, and D = 1 (no runtime dependency). Points = 50 × log10(K).
+
+Top five on the latest board snapshot needs K 36.16 at the current memory and size: about 30 ms against 63 ms now. The measured levers together reach roughly 1.1 to 1.3× K. Top five is not expected on this track.

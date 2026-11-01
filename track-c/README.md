@@ -1,26 +1,52 @@
 # Track C: Join
 
-The task, the input files and the exact output format are in the [spec](https://github.com/hackathon-raptors/speed-demon-2026/blob/main/specs/c-join.md).
+The task, the input files and the exact output format are in the [spec](https://github.com/hackathon-raptors/speed-demon-2026/blob/main/specs/c-join.md). Measured history and open experiments are in [PERF.md](PERF.md).
+
+## Status
+
+Latest board result: Track C scored 70.837 points (K 26.106129, T 0.060 s, M 10 MB, S 393 lines) in the all-track run c35a41d, finished 2026-11-01 at 09:39 UTC. Earlier verified E1 runs are recorded in PERF.md. This update changes C documentation only; no C source was changed.
 
 ## Approach
 
-The implementation is written in standard-library Rust (`D = 1`) and combines a two-stage `AVX2` + `VPCLMULQDQ` structural CSV pipeline with SWAR integer parsing, single-pass `mmap` region joining, and Structure-of-Arrays (SoA) lock-free bitmask aggregation:
+The program maps both inputs read-only, splits the records into chunks at record boundaries, parses each chunk in parallel, and joins each record to its country through a 1 MB region table.
 
-1. **Single-Pass Zero-Allocation `mmap` Region Join (`regions.csv`):** Maps `/data/regions.csv` read-only and scans `region_id` and country bytes in a single tight loop without subslice iterators, interning the 240 three-letter country slices in a 512-entry stack hash table and populating a flat 1 MB `u8` lookup array (`region_map[0..1_000_000]`, with `0` representing `_UNMATCHED` via OS zero-page allocation).
-2. **Single-Pass Grammar-Verified Chunk Alignment:** Maps `/data/records.csv` read-only via `mmap` and partitions the body across up to 12 worker threads (`std::thread::scope`). Because the schema guarantees that every record terminates with unquoted `,region_id,amount\r?\n` (`\.[0-9]{2}\r?\n`) followed by `[BOM]id,` while embedded newlines occur only inside alphabetic `note` fields, each worker snaps its starting boundary in $O(1)$ time without a separate 202 MB quote-counting pass.
-3. **Two-Stage `VPCLMULQDQ` + `AVX2` L1 Structural Tape:** Marked explicitly with `#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt,pclmul")]` so LLVM inlines `_mm_clmulepi64_si128` as a single VEX-encoded `vpclmulqdq` instruction (avoiding `-C target-cpu=x86-64-v3`'s missing `+pclmul` attribute and out-of-line SSE transition stalls). Stage 1 scans 64-byte blocks and extracts structural delimiter offsets and cumulative quote popcounts into a 320-entry L1-resident stack buffer (`d_pos`, `d_q`) with zero inner branches. Stage 2 consumes complete records at a fixed stride of 5 delimiters (`idx += 5`) using unchecked pointer offsets.
-4. **Branchless 8-Byte SWAR Integer & Cent Parsing:** Replaces byte-by-byte digit loops for `id`, `region_id`, and `amount` dollars with 8-byte SWAR multiplications (`2561`, `6_553_601`, `42_949_672_960_001`), parsing 1-to-8-digit integers in 6 cycles with zero branches. Unescaped `note` byte lengths and unescaped `name` spans (`q_name <= 2`) are computed branchlessly from cumulative quote popcounts.
-5. **Branchless `wymix` Name Hashing & Race-Free L2-Resident SoA Country Bitmask:** Empty unquoted `,` and quoted `""` names set a local `empty_name` flag (`agg[7] = 1`) with zero hashing or atomic traffic. Non-empty names of `1..=16` bytes are hashed branchlessly via masked overlapping unaligned `u64` loads folded through a 64x64->128-bit hardware multiply (`wymix`). A demand-zeroed Structure-of-Arrays hash table keeps all 131,072 64-bit keys (`1 MiB`) inside each P-core's 1.25 MiB L2 cache while storing 32-byte-aligned 256-bit country masks (`[AtomicU64; 4]`) with race-free CAS resolution. Per-thread country metrics use 64-byte cache-line-sized `[i64; 8]` arrays for SIMD-vectorized reduction.
+1. **Regions** (`load_regions`). The region file is mapped and read once. Countries are identified by their three letters (up to 240 distinct values). A table of 1,000,000 bytes maps each region id to a country index, with 0 meaning `_UNMATCHED`.
+
+2. **Chunks** (`is_record_end`). The body of the records file is split into up to twelve chunks. Each split point is moved forward to the start of a record, using the schema: a record ends with an unquoted `,region_id,amount` followed by a line feed or CRLF, and the next record starts with a digit after an optional byte-order mark. Embedded line feeds occur only inside quoted fields.
+
+3. **Structural scan** (`parse_chunk`, AVX2 and PCLMULQDQ). Each 64-byte block is classified for quote, comma and line feed. The in-quote mask comes from a carry-less multiplication of the quote mask (quote parity). Separators outside quotes are recorded with their position and the running quote count. Records are parsed five delimiters at a time.
+
+4. **Fields.** `id` and `region_id` are decimal digit loops. `amount` is parsed to cents from the integer part and the two-digit fraction. A name is read directly when it has no escaped quotes; otherwise its quotes are removed into a buffer. The note's length comes from the quote counts.
+
+5. **Names** (`hash_name_fast`, `hash_long`, `insert_name`). Non-empty names are hashed: names of up to 32 bytes by the fast path, longer names by `hash_long`, which reads every byte. A shared table of 131,072 slots stores 64-bit name keys with linear probing and compare-and-swap. Each slot has four mask words, one bit per country, so each `(name, country)` pair is counted once: `fetch_or` returns the previous bit, and exactly one thread sees it clear.
+
+6. **Aggregates.** Each thread keeps one array of nine counters per country: records, id sum, amount sum, amount minimum and maximum, empty-name flag, name bytes, note bytes, and the distinct-name count. The arrays are merged by sum, min, max and OR, and the output is sorted bytewise by country name, with `_UNMATCHED` last.
 
 ## Dependencies
 
-None. Uses Rust's standard library only.
+None. The solution uses the Rust standard library only. `dependency_count = 0` in `.speed-demon.toml`, so D = 1.
+
+## Build and checks
+
+- Build: `RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release --offline` (the Dockerfile does the same).
+- Fixtures: `fixtures/run_ref.sh c <dir> <out>` produces the reference output for a dataset; the hostile long-name fixture is generated by `fixtures/make_c_longname.py` (to be committed with the repo).
+
+## Where each claim is checked
+
+| Claim | Where |
+|---|---|
+| Long names hash every byte | `hash_long` |
+| Distinct names counted once per country | `insert_name` (return value of `fetch_or`) |
+| Quote parity by carry-less multiplication | `parse_chunk`, `clmul` |
+| Chunk boundaries are record starts | `is_record_end` |
+| Aggregates and output order | the merge and output section of `main` |
+
+## How the code was produced
+
+Earlier versions were written by coding agents under the team's loop prompts. The Track C changes in this phase (long-name hash, distinct counting, removal of the duplicate cache) were written by Claude in chat and applied by the team. Every change was gated and measured before submission. *(Confirm before publishing.)*
 
 ## With another 24 hours
 
-1. **Profile-Guided Optimization (PGO):** Generate an LLVM PGO profile on synthetic generator data using the allowlisted `halloumee/speed-demon-rust` toolchain image to optimize register allocation in `parse_chunk`.
-2. **Dense Name-ID Indirection:** Map `keys` slots to dense 17-bit name IDs so only touched country masks are faulted into physical pages, pushing peak RSS down toward the 50x memory cap (~7.35 MB).
-
-## AI tools used
-
-Gemini, GPT-6 Luna, and Claude assisted with SIMD structural parsing design, post-mortem bottleneck analysis, and verification workflows.
+1. **Deduplication under the 10 MB memory cap.** The name path is about half the run time. Per-thread tables would multiply memory by twelve, so the next design must share one table with less random access.
+2. **Smaller region map.** The 1 MB region table is read at random once per record; a denser mapping could save about 9 ms.
+3. **Source reduction** from 393 lines, about 0.3 points per 100 lines removed.
