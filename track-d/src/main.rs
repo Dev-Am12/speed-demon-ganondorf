@@ -231,6 +231,9 @@ fn shortest_path(
     if s == t {
         return 0;
     }
+    if s as usize + 1 >= offsets.len() || t as usize + 1 >= offsets.len() {
+        return -1;
+    }
     if offsets[s as usize] == offsets[s as usize + 1] {
         return -1;
     }
@@ -281,12 +284,15 @@ fn main() {
 
     let mut header = [0u8; 128];
     let n_read = file.read_at(&mut header, 0).expect("read header");
-    let nl = header[..n_read].iter().position(|&b| b == b'\n').unwrap();
+    let nl = header[..n_read]
+        .iter()
+        .position(|&b| b == b'\n')
+        .unwrap_or(n_read);
     let mut p = 0;
     let (n, m, data_start) = (
         parse_u32(&header[..nl], &mut p) as usize,
         parse_u32(&header[..nl], &mut p) as usize,
-        nl + 1,
+        (nl + 1).min(file_len),
     );
 
     let default_threads = std::thread::available_parallelism()
