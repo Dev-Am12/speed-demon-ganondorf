@@ -2,6 +2,8 @@
 
 This file is the complete measurement record for Track B. Section 1 lists every board push the scoring board has recorded for this team, in time order: 53 pushes, of which 47 were scored and 6 failed to build. Later sections cover the local experiments, the diagnostic profile, the scoring context, and the discrepancies we have found in our own records.
 
+Adoptability and robustness. The source in this snapshot includes a correctness-focused hardening pass for the organizer's full 1–32-byte token contract: every token key retains all token bytes and its length, while vocabulary tags are used only to find candidates and are verified against the complete key. Phrase matching uses the same exact keys. The goal is to generalize across valid hidden datasets rather than rely on seed-1 token distributions. The board history and measurements below describe previously scored revisions; this hardening pass has not yet received a board timing.
+
 ## Disclosure and conventions
 
 - **Commit IDs replace run IDs.** The raw board feed did not give a run ID for every run. Every board row here is identified by the commit that was scored. Run IDs we did receive are kept in `runs_ledger.md`.

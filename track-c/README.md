@@ -2,6 +2,8 @@
 
 Track C reads a hostile CSV of about 200 MB (quoted commas, escaped quotes, embedded line feeds, mixed CRLF and LF line endings, and byte-order marks in the middle of the file), joins each record to a country through a region table, and writes per-country aggregates with exact distinct-name counts. The task, the input files and the exact output format are in the [spec](https://github.com/hackathon-raptors/speed-demon-2026/blob/main/specs/c-join.md). Measured history and open experiments are in [PERF.md](PERF.md).
 
+Adoptability and robustness. The source in this snapshot hardens the join for the organizer's generated data rather than tuning identity assumptions to seed 1. The 64-bit name hash selects a probe chain only; matching hashes are disambiguated by exact raw-field-byte comparison, with representative offsets and lengths published safely across threads. The 2^17-slot table is retained because the frozen generator's conservative maximum is 100,528 distinct non-empty names, and a full-table guard fails explicitly if that bound is ever exceeded. Region IDs below 1,000,000 use the direct map; larger valid IDs use a sorted sparse lookup. The board figures below are the last recorded measurement and do not benchmark this hardening pass.
+
 ## Status
 
 | Item | Value |

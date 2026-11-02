@@ -2,7 +2,7 @@ use std::arch::x86_64::*;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::fs::{self, File};
-use std::hash::{BuildHasherDefault, Hasher};
+use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -53,12 +53,38 @@ enum Query {
     },
 }
 
+/// Exact, case-folded token bytes. The earlier two-word fingerprint could merge distinct
+/// 17..32-byte terms; this compact 33-byte key retains all bytes and the token length.
+#[derive(Clone, Copy, Default)]
+struct Key {
+    bytes: [u8; 32],
+    len: u8,
+}
+
+impl PartialEq for Key {
+    #[inline(always)]
+    fn eq(&self, other: &Self) -> bool {
+        self.len == other.len
+            && self.bytes[..self.len as usize] == other.bytes[..other.len as usize]
+    }
+}
+
+impl Eq for Key {}
+
+impl Hash for Key {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write(&self.bytes[..self.len as usize]);
+        state.write_u8(self.len);
+    }
+}
+
 /// Phrase plan. `keys` and `terms` follow phrase order; `dterms` are the distinct terms,
 /// rarest first; `seed_positions` marks the phrase positions that hold the rarest term.
 #[derive(Clone, Copy, Default)]
 struct PhrasePlan {
     terms: [u32; 8],
-    keys: [(u64, u64); 8],
+    keys: [Key; 8],
     len: u8,
     dterms: [u32; 8],
     dn: u8,
@@ -78,28 +104,38 @@ fn mix64(mut x: u64) -> u64 {
     x ^ (x >> 31)
 }
 
-/// Key of a query term: up to 16 bytes are stored verbatim (lo, hi); 17..=32 bytes are hashed
-/// exactly like the tokenizer hashes document tokens; longer terms never match (key (0, 0)).
-fn pack(term: &[u8]) -> (u64, u64) {
+/// Packs a token without losing any bytes. Tokens are at most 32 bytes by contract. Overlength
+/// input is represented by the empty key; the scanner never emits such a key for document tokens.
+fn pack(term: &[u8]) -> Key {
     if term.len() > 32 {
-        return (0, 0);
+        return Key { bytes: [0; 32], len: 0 };
     }
-    let mut b = [0u8; 32];
-    for (d, &c) in b[..term.len()].iter_mut().zip(term) {
+    let mut bytes = [0u8; 32];
+    for (d, &c) in bytes[..term.len()].iter_mut().zip(term) {
         *d = c | 0x20;
     }
-    let w = |i: usize| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap());
-    if term.len() <= 16 {
-        return (w(0), w(1));
+    Key {
+        bytes,
+        len: term.len() as u8,
     }
-    let lo = mix64(w(0) ^ w(2).rotate_left(17) ^ term.len() as u64).max(1);
-    (lo, mix64(w(1) ^ w(3).rotate_left(37) ^ lo) | (1u64 << 63))
 }
 
 #[inline(always)]
-fn slot_hash(k: (u64, u64), seed: u64) -> u64 {
-    let a = k.0.wrapping_add(seed);
-    let b = k.1.wrapping_add(seed.wrapping_mul(K_MUL)) ^ k.0.rotate_left(29) ^ K_MUL;
+fn slot_hash(k: Key, seed: u64) -> u64 {
+    // Preserve the existing slot distribution exactly. For long keys, the same 128-bit value
+    // still selects the bucket; the full bytes below are now checked before accepting a hit.
+    let word = |i: usize| u64::from_le_bytes(k.bytes[i * 8..i * 8 + 8].try_into().unwrap());
+    let w0 = word(0);
+    let w1 = word(1);
+    let (k0, k1) = if k.len <= 16 {
+        (w0, w1)
+    } else {
+        let lo = mix64(w0 ^ word(2).rotate_left(17) ^ k.len as u64).max(1);
+        let hi = mix64(w1 ^ word(3).rotate_left(37) ^ lo) | (1u64 << 63);
+        (lo, hi)
+    };
+    let a = k0.wrapping_add(seed);
+    let b = k1.wrapping_add(seed.wrapping_mul(K_MUL)) ^ k0.rotate_left(29) ^ K_MUL;
     let r = (a as u128).wrapping_mul(b as u128);
     (r as u64) ^ ((r >> 64) as u64)
 }
@@ -128,8 +164,8 @@ type FxMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
 /// Distinct query terms in first-seen order: exact ids, keys and the bytes of each term.
 #[derive(Default)]
 struct Terms {
-    ids: FxMap<(u64, u64), u32>,
-    keys: Vec<(u64, u64)>,
+    ids: FxMap<Key, u32>,
+    keys: Vec<Key>,
     meta: Vec<(u8, u8, u8)>, // compact phrase seed metadata
 }
 
@@ -164,18 +200,18 @@ struct Bucket([u64; 4]);
 
 /// Bucketed table over the distinct query terms. A slot holds (44-bit tag << 20) | (id + 1), and
 /// 0 is empty. A key goes into the first free slot of its home bucket, or of the next buckets when
-/// that one is full. A tag match is only a candidate: the stored key of that term must equal the
-/// token's key, so a token never matches a term it does not equal. Build keeps a seed only if every
-/// query term finds itself.
+/// that one is full. A tag match is only a candidate: all 32 token bytes and the length are checked,
+/// so long terms cannot alias merely because their fingerprints collide. Build keeps a seed only
+/// if every query term finds itself.
 struct Vocab {
     buckets: Vec<Bucket>,
     seed: u64,
     shift: u32,
-    keys: Vec<(u64, u64)>, // key of each term id, for the exact check on a tag match
+    keys: Vec<Key>, // key of each term id, for the exact check on a tag match
 }
 
 impl Vocab {
-    fn build(keys: &[(u64, u64)]) -> Vocab {
+    fn build(keys: &[Key]) -> Vocab {
         assert!(
             keys.len() < ID_MASK as usize,
             "vocabulary too large for table ids"
@@ -220,7 +256,7 @@ impl Vocab {
     /// Term id of a token key, or NONE. Every tag match in the home bucket is a candidate that
     /// must also match the stored key; a bucket with a free slot ends the search.
     #[inline(always)]
-    fn code(&self, k: (u64, u64)) -> u32 {
+    fn code(&self, k: Key) -> u32 {
         let h = slot_hash(k, self.seed);
         let b = (h >> self.shift) as usize;
         // SAFETY: the shift keeps log2(bucket count) bits, so b < buckets.len().
@@ -252,7 +288,7 @@ impl Vocab {
     /// Continues a lookup in the buckets after a full home bucket: same candidate rule.
     #[cold]
     #[inline(never)]
-    fn spill(&self, k: (u64, u64), h: u64, mut b: usize) -> u32 {
+    fn spill(&self, k: Key, h: u64, mut b: usize) -> u32 {
         let want = (h & TAG_MASK) << ID_BITS;
         loop {
             b = (b + 1) & (self.buckets.len() - 1);
@@ -296,7 +332,7 @@ fn mapped(t: &[u8], i: usize) -> u8 {
 }
 
 #[inline(always)]
-fn token_key(t: &[u8], s: usize) -> Option<(u64, u64)> {
+fn token_key(t: &[u8], s: usize) -> Option<Key> {
     let mut e = s + 1;
     while e < t.len() && BYTE_MAP[t[e] as usize] != 0 {
         e += 1;
@@ -305,7 +341,7 @@ fn token_key(t: &[u8], s: usize) -> Option<(u64, u64)> {
 }
 
 #[inline(always)]
-fn scan<F: FnMut(usize, Option<(u64, u64)>) -> bool>(t: &[u8], mut i: usize, mut f: F) -> usize {
+fn scan<F: FnMut(usize, Option<Key>) -> bool>(t: &[u8], mut i: usize, mut f: F) -> usize {
     let n = t.len();
     while i < n {
         if mapped(t, i) == 0 {
@@ -358,7 +394,7 @@ unsafe fn classify64(p: *const u8) -> (u64, u64) {
 /// Same contract as `scan`, for text that starts at a token boundary: it classifies 64 bytes
 /// per step and visits token starts found in the masks instead of every byte.
 #[target_feature(enable = "avx2,bmi1,bmi2,popcnt")]
-unsafe fn scan_avx2<F: FnMut(usize, Option<(u64, u64)>) -> bool>(
+unsafe fn scan_avx2<F: FnMut(usize, Option<Key>) -> bool>(
     t: &[u8],
     i0: usize,
     mut f: F,
@@ -403,7 +439,10 @@ unsafe fn scan_avx2<F: FnMut(usize, Option<(u64, u64)>) -> bool>(
                         let w1 = ptr.add(8).cast::<u64>().read_unaligned() | 0x2020_2020_2020_2020;
                         _bzhi_u64(w1, ((run - 8) * 8) as u32)
                     };
-                    if !f(pos, Some((lo, hi))) {
+                    let mut bytes = [0u8; 32];
+                    bytes[..8].copy_from_slice(&lo.to_le_bytes());
+                    bytes[8..16].copy_from_slice(&hi.to_le_bytes());
+                    if !f(pos, Some(Key { bytes, len: run as u8 })) {
                         return n;
                     }
                 }
@@ -421,7 +460,7 @@ unsafe fn scan_avx2<F: FnMut(usize, Option<(u64, u64)>) -> bool>(
 
 /// Safe entry point; the binary is built for x86-64-v3, so AVX2 and BMI are always present.
 #[inline(always)]
-fn scan_fast<F: FnMut(usize, Option<(u64, u64)>) -> bool>(t: &[u8], i0: usize, f: F) -> usize {
+fn scan_fast<F: FnMut(usize, Option<Key>) -> bool>(t: &[u8], i0: usize, f: F) -> usize {
     // SAFETY: x86-64-v3 includes AVX2, BMI1, BMI2 and POPCNT (see the Dockerfile).
     unsafe { scan_avx2(t, i0, f) }
 }
@@ -752,7 +791,7 @@ fn parse_queries(qb: &[u8], terms: &mut Terms) -> (Vec<Query>, Vec<PhrasePlan>) 
 
 /// Checks a phrase from one known token occurrence of its term at phrase position
 /// `anchor_pos`: walks back to the phrase start, then compares every token forward.
-fn phrase_at(text: &[u8], anchor: usize, anchor_pos: usize, keys: &[(u64, u64)]) -> bool {
+fn phrase_at(text: &[u8], anchor: usize, anchor_pos: usize, keys: &[Key]) -> bool {
     let mut first = anchor;
     for _ in 0..anchor_pos {
         // Move across separators, then across the preceding token. Every non-ASCII byte is
@@ -784,7 +823,7 @@ fn at(
     p: usize,
     (b0, blast, l): (u8, u8, u8),
     positions: u8,
-    keys: &[(u64, u64)],
+    keys: &[Key],
 ) -> bool {
     let (n, l) = (text.len(), l as usize);
     if (p > 0 && mapped(text, p - 1) != 0) || p + l > n || (p + l < n && mapped(text, p + l) != 0) {
@@ -807,7 +846,7 @@ fn at(
 /// Finds the rarest term's occurrences in a candidate document with a 32-byte prefilter on its
 /// first byte (case-folded), then checks each occurrence with `at`. The prefilter can pass
 /// extra bytes but never misses a real occurrence.
-fn verify(text: &[u8], seed: (u8, u8, u8), positions: u8, keys: &[(u64, u64)]) -> bool {
+fn verify(text: &[u8], seed: (u8, u8, u8), positions: u8, keys: &[Key]) -> bool {
     let (n, l) = (text.len(), seed.2 as usize);
     if l == 0 || l > n {
         return false;
@@ -1233,7 +1272,7 @@ fn run(docs: &[u8]) -> io::Result<()> {
     for (new, &old) in order.iter().enumerate() {
         map[old] = new as u32;
     }
-    let kept_keys: Vec<(u64, u64)> = order.iter().map(|&old| terms.keys[old]).collect();
+    let kept_keys: Vec<Key> = order.iter().map(|&old| terms.keys[old]).collect();
     let meta: Vec<(u8, u8, u8)> = order.iter().map(|&old| terms.meta[old]).collect();
     drop(terms);
     drop(scount);

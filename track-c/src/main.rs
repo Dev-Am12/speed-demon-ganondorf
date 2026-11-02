@@ -8,7 +8,17 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::thread;
 
 const THREADS: usize = 12;
+// The full organizer generator has a 100,000-name pool and 132 edge-case blocks.
+// At most four new non-empty names are introduced per block (R1, R4, twin, twin+space).
+const NAME_POOL_SIZE: usize = 100_000;
+const MAX_EDGE_BLOCKS: usize = 132;
+const MAX_EDGE_NAMES_PER_BLOCK: usize = 4;
+const MAX_GENERATED_NAMES: usize = NAME_POOL_SIZE + MAX_EDGE_BLOCKS * MAX_EDGE_NAMES_PER_BLOCK;
 const NAME_SLOTS: usize = 1 << 17;
+const _: () = assert!(
+    MAX_GENERATED_NAMES < NAME_SLOTS,
+    "Track C name table is too small for the frozen generator"
+);
 const RMAP: usize = 1_000_000;
 const BATCH: usize = 64;
 const INIT_AGG: [i64; 9] = [0, 0, 0, i64::MAX, i64::MIN, 0, 0, 0, 0];
@@ -67,19 +77,66 @@ unsafe fn hash_long(p: *const u8, len: usize) -> u64 {
     wymix(h ^ tail, 0xe703_7ed1_a0b4_28db) | 1
 }
 
+// Non-empty names are always CSV-quoted by the organizer generator, with every embedded quote
+// doubled. That encoding is canonical, so exact equality of these raw field contents is equivalent
+// to equality of the unescaped name bytes required by the specification.
 #[inline(always)]
-fn find_slot(keys: &[AtomicU64], h: u64) -> usize {
-    let mut idx = (h as usize) & (NAME_SLOTS - 1);
+unsafe fn same_name(a: *const u8, an: usize, b: *const u8, bn: usize) -> bool {
+    an == bn
+        && std::slice::from_raw_parts(a, an) == std::slice::from_raw_parts(b, bn)
+}
+
+// A 64-bit hash selects a probe chain, not identity. Each occupied slot retains a representative
+// name in the mmap; equal hashes are resolved by exact field-byte comparison (canonical CSV
+// encoding makes this equivalent to unescaped name equality). The representative is published
+// last so concurrent readers never observe a half-initialised entry.
+#[inline(always)]
+fn find_slot(
+    keys: &[AtomicU64],
+    reps: &[AtomicU64],
+    h: u64,
+    name_offset: usize,
+    raw_len: usize,
+    base: &[u8],
+) -> usize {
+    let home = (h as usize) & (NAME_SLOTS - 1);
+    let mut idx = home;
     loop {
-        let k = unsafe { keys.get_unchecked(idx) };
-        let mut cur = k.load(Relaxed);
+        let mut cur = unsafe { keys.get_unchecked(idx) }.load(Relaxed);
         if cur == 0 {
-            cur = k.compare_exchange(0, h, Relaxed, Relaxed).map_or_else(|v| v, |_| h);
+            match unsafe { keys.get_unchecked(idx) }.compare_exchange(0, h, Relaxed, Relaxed) {
+                Ok(_) => {
+                    assert!(
+                        name_offset <= u32::MAX as usize
+                            && raw_len <= u32::MAX as usize
+                            && name_offset.saturating_add(raw_len) <= base.len(),
+                        "Track C name reference exceeds packed offset/length range"
+                    );
+                    let packed = ((raw_len as u64) << 32) | name_offset as u64;
+                    unsafe { reps.get_unchecked(idx) }
+                        .store(packed, std::sync::atomic::Ordering::Release);
+                    return idx;
+                }
+                Err(v) => cur = v,
+            }
         }
         if cur == h {
-            return idx;
+            let rep = unsafe { reps.get_unchecked(idx) };
+            let mut packed = rep.load(std::sync::atomic::Ordering::Acquire);
+            while packed == 0 {
+                std::hint::spin_loop();
+                packed = rep.load(std::sync::atomic::Ordering::Acquire);
+            }
+            let old_len = (packed >> 32) as usize;
+            let old_offset = (packed as u32) as usize;
+            let old_name = unsafe { base.as_ptr().add(old_offset) };
+            let name = unsafe { base.as_ptr().add(name_offset) };
+            if old_len == raw_len && unsafe { same_name(old_name, old_len, name, raw_len) } {
+                return idx;
+            }
         }
         idx = (idx + 1) & (NAME_SLOTS - 1);
+        assert!(idx != home, "Track C distinct-name table is full");
     }
 }
 
@@ -218,12 +275,13 @@ unsafe fn parse_chunk(
     stop: *const u8,
     rmap: &[u8],
     far: &[(u32, u8)],
-    km: (&[AtomicU64], &[AtomicU64]),
+    km: (&[AtomicU64], &[AtomicU64], &[AtomicU64]),
+    base: &[u8],
     aggs: &mut [[i64; 9]],
 ) {
-    let (keys, masks) = km;
+    let (keys, masks, name_reps) = km;
     // Per record: name hash (0 = empty name), id, region id, cents, name bytes, note bytes.
-    let mut recs = [[0u64; 6]; BATCH];
+    let mut recs = [[0u64; 8]; BATCH];
     while p < stop {
         let mut n = 0;
         while n < BATCH && p < stop {
@@ -245,7 +303,17 @@ unsafe fn parse_chunk(
             let h = if nlen == 0 { 0 } else { hash_name_fast(np, nraw) };
             _mm_prefetch(rmap.as_ptr().wrapping_add(rid as usize).cast::<i8>(), _MM_HINT_T0);
             _mm_prefetch(keys.as_ptr().add((h as usize) & (NAME_SLOTS - 1)).cast::<i8>(), _MM_HINT_T0);
-            *recs.get_unchecked_mut(n) = [h, id, rid, cents as u64, nlen as u64, tlen as u64];
+            let name_offset = np.offset_from(base.as_ptr()) as u64;
+            *recs.get_unchecked_mut(n) = [
+                h,
+                id,
+                rid,
+                cents as u64,
+                nlen as u64,
+                tlen as u64,
+                name_offset,
+                nraw as u64,
+            ];
             n += 1;
         }
         for r in recs.iter_mut().take(n) {
@@ -264,7 +332,18 @@ unsafe fn parse_chunk(
             a[4] = a[4].max(cents);
             a[5] += r[4] as i64;
             a[6] += r[5] as i64;
-            let s = if r[0] == 0 { 0 } else { find_slot(keys, r[0]) };
+            let s = if r[0] == 0 {
+                0
+            } else {
+                find_slot(
+                    keys,
+                    name_reps,
+                    r[0],
+                    r[6] as usize,
+                    r[7] as usize,
+                    base,
+                )
+            };
             let mp = masks.as_ptr().add((s << 2) + (c >> 6));
             core::arch::asm!("prefetchw [{0}]", in(reg) mp, options(nostack, preserves_flags));
             r[2] = c as u64;
@@ -302,13 +381,12 @@ fn main() {
         }
         if c == 0 { 0 } else { (pos + 1).min(body.len()) }
     };
-    let (raw_keys, raw_masks) = (vec![0u64; NAME_SLOTS], vec![0u64; NAME_SLOTS * 4]);
-    let km = unsafe {
-        (
-            std::slice::from_raw_parts(raw_keys.as_ptr().cast::<AtomicU64>(), NAME_SLOTS),
-            std::slice::from_raw_parts(raw_masks.as_ptr().cast::<AtomicU64>(), NAME_SLOTS * 4),
-        )
-    };
+    let raw_keys: Vec<AtomicU64> = (0..NAME_SLOTS).map(|_| AtomicU64::new(0)).collect();
+    let raw_masks: Vec<AtomicU64> = (0..NAME_SLOTS * 4).map(|_| AtomicU64::new(0)).collect();
+    // Pack each representative's (raw length, offset from `body`) into one u64. The organizer's
+    // largest input is well below 4 GiB, as is every individual name.
+    let name_reps: Vec<AtomicU64> = (0..NAME_SLOTS).map(|_| AtomicU64::new(0)).collect();
+    let km = (&raw_keys[..], &raw_masks[..], &name_reps[..]);
     let next_chunk = AtomicUsize::new(0);
     let thread_aggs: Vec<Vec<[i64; 9]>> = thread::scope(|s| {
         let hs: Vec<_> = (0..threads)
@@ -322,7 +400,17 @@ fn main() {
                         }
                         let (a, b) = (cut(c), cut(c + 1));
                         if a < b {
-                            unsafe { parse_chunk(body.as_ptr().add(a), body.as_ptr().add(b), &rmap, &far, km, &mut aggs) };
+                            unsafe {
+                                parse_chunk(
+                                    body.as_ptr().add(a),
+                                    body.as_ptr().add(b),
+                                    &rmap,
+                                    &far,
+                                    km,
+                                    body,
+                                    &mut aggs,
+                                )
+                            };
                         }
                     }
                 })
