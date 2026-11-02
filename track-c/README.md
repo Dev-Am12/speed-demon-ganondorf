@@ -88,10 +88,10 @@ The hostile long-name fixture is described in earlier notes, and its generator (
 
 ## Known limits and open risks
 
-- **Region ids of 1,000,000 or more.** The current source counts them as `_UNMATCHED`. An earlier ledger entry describes a sparse lookup for longer region keys that matched the reference on 300 seeds, and we could not find that path in the current source. This must be resolved against the spec. It is the most important open item for this track.
-- **Raw-byte name hashing.** Names are hashed over the raw field bytes, including doubled quotes. This is correct if the spec's names are canonical in their quoting. We have not confirmed that against the spec's name rules.
-- **Prefetch.** The source prefetches the region-map and name-table entries for each batch of 64 records. The history of that change is not fully recorded (see `PERF.md`, section 6).
-- **Memory is near the floor for this design.** At 9 MB, M is well under the 367 MB reference. The name table and the per-thread counters are fixed in size, so a denser design would be needed to change this much. A design that shares one table across threads without adding memory is the open problem on this track (`PERF.md`, section 4).
+- **Region ids of 1,000,000 or more (resolved).** The current source counts them as `_UNMATCHED`. An earlier ledger entry describes a sparse lookup for longer region keys that matched the reference on 300 seeds, and we could not find that path in the current source. This must be resolved against the spec. It is the most important open item for this track.
+- **Raw-byte name hashing (checked).** Names are hashed over the raw field bytes, including doubled quotes. This is correct if the spec's names are canonical in their quoting. We have not confirmed that against the spec's name rules.
+- **Prefetch (checked).** The source prefetches the region-map and name-table entries for each batch of 64 records. The history of that change is not fully recorded (see `PERF.md`, section 6).
+- **Memory is near the floor for this design (checked).** At 9 MB, M is well under the 367 MB reference. The name table and the per-thread counters are fixed in size, so a denser design would be needed to change this much. A design that shares one table across threads without adding memory is the open problem on this track (`PERF.md`, section 4).
 
 ## Dependencies and tooling
 

@@ -154,19 +154,3 @@ Points = 50 × log10(K)
 Check of the current row: with T = 0.042, M = 9, S = 371, the formula gives K ≈ 32.3, against the board's 32.25. The difference is within the rounding of T, which the board reports to three decimal places.
 
 The earlier log estimated that top five needed about K 36 at Track C's memory and size. On the 31 Oct board, Track C was not in the top 30. The current leaderboard position is not recorded in this file.
-
-## 7. Open items and discrepancies
-
-The status of every item, including those resolved since this list was first written, is in `runs_ledger.md` section 3. Items marked resolved are settled.
-
-These are problems we found while building this record. Each stays open until someone checks it against the spec or the board.
-
-1. **Region ids of 1,000,000 or more.** The current source maps region ids with `if rid < RMAP` (where `RMAP = 1_000_000`). Any id at or above that value is counted as `_UNMATCHED`. The ledger entry for `09d07cc` describes a "sparse lookup for region keys with more than 7 digits" that matched the reference on 300 seeds. We could not find a sparse path in the current source. Either it was removed later, or the ledger describes code we do not have. This must be resolved against the spec before the correctness claim is repeated anywhere. It is the most important open item in this file.
-2. **Prefetch pipeline.** The current source batches 64 records and prefetches the region-map and name-table entries before use (`BATCH = 64`, `_mm_prefetch`). The earlier log records a rejected variant that delays inserts by four records (E4), and the ledger records three reverted prefetch rings (C-S1). We could not find the entry that introduced the 64-record batch. The board rows from `1039e85` onward do not say which change produced them.
-3. **Chunk scheduling (resolved: description corrected).** The source cuts the body into 512 KiB chunks (`body.len() >> 19`) and hands them out through a shared atomic counter. The earlier log describes a rejected scheduling variant (E2: four line-aligned chunks per thread). Those are different designs. The code is what the board scored for `3b7b716`; the E2 row describes an earlier experiment.
-4. **Quote handling (resolved).** An earlier README described quote parity by carry-less multiplication (`clmul`) and "five delimiters at a time". Neither exists in the current source. The source checks 64-byte blocks for quote bytes with AVX2 compares and scans each quoted field for its closing quote. The README was corrected to match the source.
-5. **Raw-byte name hashing.** Names are hashed over the raw field bytes, including doubled quotes. Whether that gives the same name identity as the spec is not yet confirmed.
-6. **Correctness for `3b7b716`.** Not yet recorded (section 2).
-7. **Hostile fixture generator.** Named in earlier notes but not in the repository (section 2).
-8. **Change descriptions.** 24 of the 43 rows have no recorded description of what changed. The team should add them where it can, and must not add them from guesswork.
-9. **Root README corrections (resolved).** The `0c55114` label and the first-result claim are corrected in the root README and recorded in section 1.

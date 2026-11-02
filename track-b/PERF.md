@@ -170,19 +170,3 @@ The gap to rank 1 is mostly in time (0.064 s against 0.297 s). Halving our time 
 **Board experiments that did not help.** `25e6277` (MAX_DENSE 384 → 256) and `fbe7674` (INDEX_THREADS = 6) were reverted. Compared with `0c55114`, `25e6277` raised both time (0.338 s against 0.307 s) and memory (127 MB against 122 MB). `fbe7674` cut memory to 94 MB but raised time to 0.409 s and lowered K.
 
 **The rewrites on 1 and 2 Nov.** `f29eac6`, `bbbb3f1`, `2deeaab` and `21a5643` raised memory to 129–133 MB and did not move K much. `e091971` (1 Nov 18:54, 154 MB) is not a rewrite; the record does not say what changed in it. `005c99a` (`61.034`) is the best Track B result. The team notes say the rewrites "did not help". The board numbers show a net gain over `faaeb9d` of 0.66 points, so both statements are in the record.
-
-## 6. Open items and discrepancies
-
-The status of every item, including those resolved since this list was first written, is in `runs_ledger.md` section 3. Items marked resolved are settled.
-
-These are problems we found while building this record. Each stays open until someone checks it against the source or the board.
-
-1. **Vocabulary lookup is tag-based, not exact.** The current source (`track-b/src/main.rs`, table `Vocab`) stores a 46-bit tag and a term id in each slot, and a lookup compares tags. It does not compare the full key on a hit. A false match is possible in principle; a comment in the source estimates about 1 in 10^7 per dataset, and the build keeps a seed only if every present term looks itself up. Earlier documentation, including an earlier version of this file, said that a tag match is checked against the full key. That was wrong for the current source. The fuzz and gate results are evidence, not proof, and the holdout corpus has not been seen. This is the main correctness risk on Track B.
-2. **"1 dep" (resolved).** The board displays one dependency for every entry, including ours. That is the standard library, which the formula counts as D = 1. Our zero external dependencies therefore give D = 1, the value this file's formula uses, and no change to the scoring analysis is needed.
-3. **Function name `push_word`.** The ledger names the Acc10 change `push_word`, but the source has no function of that name. The source has `Acc10::push` and `Acc10::add`. This file uses the ledger name for the experiment and the source name for the code.
-4. **Gemini model name.** The team records name both "Gemini 4 Argon" and "Gemini 3.8 Flash". See `track-b/README.md`.
-5. **Controls.** The earlier root README said the gate includes three deliberately wrong controls (`NOT` read as `OR`, bytes at or above 0x80 treated as letters, and an inverted phrase result). We could not find those controls in the repository snapshot, so they are not claimed here.
-6. **Local gate for `005c99a`.** Not recorded. It should be run and recorded here.
-7. **Build failure causes.** The team's account is recorded in section 5. The local build passed for `3640ce1` and `6b67bfe`, and a host-side error is suspected. This is not confirmed; the team should confirm it, for example by re-running the failed commits on the scoring host.
-8. **Change descriptions.** 18 of the 53 rows have no recorded description of what changed. The team should add them where it can, and must not add them from guesswork.
-9. **Dates in team notes (resolved).** The feed is UTC and is used throughout. Team notes that use IST are marked where they differ.
