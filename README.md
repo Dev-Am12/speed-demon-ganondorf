@@ -472,7 +472,7 @@ Candidates we could not finish or measure properly. Track owners to confirm and 
 | **Members** | Ashutosh Mishra, Shivam Mishra |
 | **Role C: Correctness and oracle** | Ashutosh. Owned tracks B and C, the fixtures and the oracle, and repository ownership |
 | **Role P: Platform and performance** | Shivam. Owned tracks A and D, Docker, and the scripts |
-| **Discord** | am0007 |
+| **Discord** | am0007 (Ashutosh), mishrag2948 (Shivam) |
 | **Location / timezone** | IST |
 
 ---
