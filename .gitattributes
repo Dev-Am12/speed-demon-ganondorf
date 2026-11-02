@@ -1,4 +1,4 @@
-# Git line ending configuration per PLAN.md section 4
+# Git line ending configuration
 * text=auto eol=lf
 *.sh text eol=lf
 data/** -text
