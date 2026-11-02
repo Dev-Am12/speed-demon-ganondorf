@@ -649,18 +649,17 @@ fn index_shard(docs: &[u8], a: usize, b: usize, nd: usize, vocab: &Vocab, d_coun
     flush_window(&mut acc[..d_count], &mut bits, words, window);
     assert_eq!(d, nd, "line count changed between the cut pass and indexing");
 
-    let total: usize = logs.iter().map(Vec::len).sum();
-    let mut arena: Vec<u16> = Vec::with_capacity(total);
+    let mut arena: Vec<u16> = Vec::new();
     let mut offs: Vec<u32> = Vec::with_capacity(nterms - d_count + 1);
     let mut cnt = [0u32; BUCKET];
     let mut last = [u32::MAX; BUCKET];
     let mut start = [0usize; BUCKET];
-    for (k, log) in logs.into_iter().take(nb).enumerate() {
+    for (k, log) in logs.iter().take(nb).enumerate() {
         // Pass 1: exact per-term counts. Entries are in document order, so `last` removes
         // repeats of a term inside one document.
         cnt.fill(0);
         last.fill(u32::MAX);
-        for &e in &log {
+        for &e in log {
             let (kk, doc) = ((e >> 16) as usize, e & 0xFFFF);
             if last[kk] != doc {
                 last[kk] = doc;
@@ -676,7 +675,7 @@ fn index_shard(docs: &[u8], a: usize, b: usize, nd: usize, vocab: &Vocab, d_coun
         arena.resize(run, 0);
         let mut fill = start;
         last.fill(u32::MAX);
-        for &e in &log {
+        for &e in log {
             let (kk, doc) = ((e >> 16) as usize, e & 0xFFFF);
             if last[kk] != doc {
                 last[kk] = doc;
@@ -691,6 +690,7 @@ fn index_shard(docs: &[u8], a: usize, b: usize, nd: usize, vocab: &Vocab, d_coun
         }
     }
     offs.push(arena.len() as u32);
+    drop(logs);
     Shard {
         base: 0,
         words,
@@ -1186,6 +1186,7 @@ fn run(docs: &[u8]) -> io::Result<()> {
     }
     vocab.remap(&map);
     let texts: Vec<([u8; 32], u8)> = order.iter().map(|&old| terms.texts[old]).collect();
+    drop(terms);
     for q in &mut queries {
         if let Query::Bool { terms: t, len, .. } = q {
             for x in &mut t[..*len as usize] {
