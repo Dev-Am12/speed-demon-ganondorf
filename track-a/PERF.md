@@ -164,3 +164,8 @@ Every step from the reference to your final version, each with the live-board ru
     - Scaled M ($M = 6.50\text{ MB}$): $T = 0.0365\text{ s}, M = 6.50\text{ MB}, S = 344 \implies K = 45.97$ (+11.45 points)
   - *Verification Gates:* Passed 100% across all suites (full seed 1 sha256 match `495ca096...`, 10/10 sample seeds, 3/3 full seeds, 49/49 tiny fuzz seeds, edge cases, thread invariance 1/2/6/12, and Docker check).
   - *Verdict:* Kept.
+
+### Board loop log
+| Change | Run ID | Commit | T (s) | M (MB) | S | Points | Verdict |
+|---|---|---|---|---|---|---|---|
+| repair: restore verified sources (A 64925b1, B 005c99a) | run-8d8dca2d47f6 | 248c1df | 0.042 | 24.0 | 423 | 75.372 | baseline |

@@ -21,3 +21,5 @@
 | local-714eb19 | 2026-11-01T09:10:00Z | B | reverted | B5 dead match arm removal: gates PASS and scc code -1; corrected repeated PSET pair noisy/order-sensitive, all-CPU +15.7%, RSS +0.03 MB (local) | 1.02s local (noisy) | 310.0MB local | n/a | reverted |
 | local-196ab00 | 2026-11-01T09:17:17Z | B | 196ab00 | B6 gallop path removed; GATE B PASS, scc code 1155 -> 1129, paired PSET aggregate +0.5% time, RSS -0.19 MB (local) | 1.035s local | 309.8MB local | n/a | kept |
 | local-e7c9ea6 | 2026-11-01T09:39:00Z | B | e7c9ea6 | Acc10 push_word set-bit loop; GATE B PASS (68 checks), tiny fuzz 2-40 PASS; four 40-run PSET batches averaged 5.7% faster than B6 but several were noisy; selected by team; board run c35a41d | 1.109s local; 0.435s board | n/a local; 67MB board | 15.741032 board | kept (board selected) |
+| run-8d8dca2d47f6 | 2026-11-02T06:45:04Z | A | 248c1df | repair: restore verified sources (A 64925b1, B 005c99a) | 0.0415s | 24MB | 32.17 | baseline |
+| run-c57c7b5fbb81 | 2026-11-02T06:45:10Z | B | 248c1df | repair: restore verified sources (A 64925b1, B 005c99a) | 0.3411s | 121MB | 15.52 | baseline |

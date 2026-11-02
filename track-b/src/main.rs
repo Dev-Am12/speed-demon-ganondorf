@@ -261,15 +261,6 @@ impl Vocab {
             }
         }
     }
-
-    /// Rewrites every payload id through `map` (old id -> new id). Tags are unchanged.
-    fn remap(&mut self, map: &[u32]) {
-        for e in self.buckets.iter_mut().flat_map(|bk| bk.0.iter_mut()) {
-            if *e != 0 {
-                *e = (*e & !ID_MASK) | (map[((*e & ID_MASK) - 1) as usize] as u64 + 1);
-            }
-        }
-    }
 }
 
 // --------------------------------------------------------------- tokenizer
@@ -545,10 +536,10 @@ fn index_shard(
     nd: usize,
     vocab: &Vocab,
     d_count: usize,
-    nterms: usize,
+    kept: usize,
 ) -> Shard {
     let words = nd.div_ceil(64);
-    let nb = (nterms - d_count).div_ceil(BUCKET);
+    let nb = (kept - d_count).div_ceil(BUCKET);
     let cap = ((b - a) / 64 / nb.max(1)).max(32);
     let mut logs: Vec<Vec<u32>> = (0..nb).map(|_| Vec::with_capacity(cap)).collect();
     let mut bits = vec![0u64; d_count * words];
@@ -565,8 +556,9 @@ fn index_shard(
                 let Some(k) = tok else {
                     return true;
                 };
-                let c = vocab.code(k) as usize;
-                if c < nterms {
+                let c = vocab.code(k);
+                if c < kept as u32 {
+                    let c = c as usize;
                     if c < d_count {
                         // SAFETY: term and document word are within the dense row allocation.
                         unsafe {
@@ -610,7 +602,7 @@ fn index_shard(
         "line count changed between the cut pass and indexing"
     );
 
-    let mut offs: Vec<u32> = Vec::with_capacity(nterms - d_count + 1);
+    let mut offs: Vec<u32> = Vec::with_capacity(kept - d_count + 1);
     let mut cnt = [0u32; BUCKET];
     let mut last = [u32::MAX; BUCKET];
     let mut total_postings = 0usize;
@@ -630,7 +622,7 @@ fn index_shard(
         }
         log.truncate(w);
         let base_t = k * BUCKET;
-        let lim = (nterms - d_count - base_t).min(BUCKET);
+        let lim = (kept - d_count - base_t).min(BUCKET);
         for kk in 0..lim {
             offs.push(total_postings as u32);
             total_postings += cnt[kk] as usize;
@@ -643,7 +635,7 @@ fn index_shard(
     let mut start = [0usize; BUCKET];
     for (k, log) in logs.into_iter().enumerate() {
         let base_t = k * BUCKET;
-        let lim = (nterms - d_count - base_t).min(BUCKET);
+        let lim = (kept - d_count - base_t).min(BUCKET);
         for kk in 0..lim {
             start[kk] = offs[base_t + kk] as usize;
         }
@@ -1167,7 +1159,7 @@ fn run(docs: &[u8]) -> io::Result<()> {
     // snapped to line starts and cut into one piece per thread, so the sample is the same
     // contiguous prefix as before, counted in parallel). Dense terms get the lowest ids, so the
     // sample's ids are still the table's ids here.
-    let mut vocab = Vocab::build(&terms.keys);
+    let vocab = Vocab::build(&terms.keys);
     let snap = |raw: usize| match raw {
         0 => 0,
         _ => docs[raw..]
@@ -1230,14 +1222,18 @@ fn run(docs: &[u8]) -> io::Result<()> {
         .take_while(|&i| is_dense(order[i]))
         .count()
         .min(MAX_DENSE);
-    // Discarded terms map to a nonzero sentinel, preserving vocabulary spill chains.
-    let mut map = vec![kept as u32; nterms];
+    let mut map = vec![NONE; nterms];
     for (new, &old) in order.iter().enumerate() {
         map[old] = new as u32;
     }
-    vocab.remap(&map);
+    let kept_keys: Vec<(u64, u64)> = order.iter().map(|&old| terms.keys[old]).collect();
     let meta: Vec<(u8, u8, u8)> = order.iter().map(|&old| terms.meta[old]).collect();
     drop(terms);
+    drop(scount);
+    drop(order);
+    drop(vocab);
+    let vocab = Vocab::build(&kept_keys);
+    drop(kept_keys);
     for q in &mut queries {
         if let Query::Bool { terms: t, len, .. } = q {
             for x in &mut t[..*len as usize] {
@@ -1256,17 +1252,7 @@ fn run(docs: &[u8]) -> io::Result<()> {
         threads,
         n,
         || (),
-        |i, _| {
-            index_shard(
-                docs,
-                cuts[i],
-                cuts[i + 1],
-                counts[i],
-                &vocab,
-                d_count,
-                nterms,
-            )
-        },
+        |i, _| index_shard(docs, cuts[i], cuts[i + 1], counts[i], &vocab, d_count, kept),
     );
     drop(vocab);
     for (i, sh) in shards.iter_mut().enumerate() {
