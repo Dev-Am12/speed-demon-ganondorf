@@ -1,454 +1,444 @@
-// Track A (Ingest): parallelized solution in safe standard-library Rust.
-// Implements the HTTP request aggregation contract in specs/a-ingest.md.
-
 use std::arch::x86_64::*;
 use std::fs::File;
 use std::io::Write;
-use std::os::unix::fs::FileExt;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Mutex};
-use std::thread;
+use std::os::unix::io::AsRawFd;
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
+use std::sync::{Barrier, Mutex};
 
-const HOURS: usize = 72;
-const CHUNK_SIZE: usize = 64 * 1024;
-const DATES: [&str; 4] = ["2026-10-30", "2026-10-31", "2026-11-01", "2026-11-02"];
+const H_SLOTS: usize = 128;
+const BLOCK_CAP: usize = 4096;
 
-struct Table {
-    slots: Vec<u64>,
-    arena: Vec<u8>,
-    offsets: Vec<(u32, u16)>,
+extern "C" {
+    fn mmap(a: *mut (), l: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8;
+    fn munmap(a: *mut u8, l: usize) -> i32;
+    fn madvise(a: *mut u8, l: usize, adv: i32) -> i32;
+    fn malloc_trim(pad: usize) -> i32;
 }
 
-impl Table {
-    fn new() -> Self {
-        Self {
-            slots: vec![0u64; 4096],
-            arena: Vec::with_capacity(65536),
-            offsets: Vec::with_capacity(2048),
-        }
-    }
+type HourBlock = (Vec<u32>, Vec<u32>);
 
-    #[inline(always)]
-    fn hash(name: &[u8]) -> (u32, usize) {
-        let len = name.len();
-        let h = if len >= 8 {
-            unsafe {
-                let first = (name.as_ptr() as *const u64).read_unaligned();
-                let last = (name.as_ptr().add(len - 8) as *const u64).read_unaligned();
-                (first ^ last.rotate_left(32) ^ (len as u64)).wrapping_mul(0x517cc1b727220a95)
-            }
+static SLOTS: [AtomicU64; 8192] = [const { AtomicU64::new(0) }; 8192];
+static META: [AtomicU64; 4096] = [const { AtomicU64::new(0) }; 4096];
+static ARENA: [AtomicU64; 32768] = [const { AtomicU64::new(0) }; 32768];
+static LOCK: Mutex<(usize, usize)> = Mutex::new((0, 0));
+static ORDER: [AtomicU16; 4096] = [const { AtomicU16::new(0) }; 4096];
+static N_EPS: AtomicUsize = AtomicUsize::new(0);
+static ARENA_BYTES: AtomicUsize = AtomicUsize::new(0);
+static HOURLY: [Mutex<Vec<HourBlock>>; H_SLOTS] = [const { Mutex::new(Vec::new()) }; H_SLOTS];
+static HOUR_EPOCH: [AtomicUsize; H_SLOTS] = [const { AtomicUsize::new(0) }; H_SLOTS];
+static HOUR_PREF: [[AtomicU64; 3]; H_SLOTS] = [const { [const { AtomicU64::new(0) }; 3] }; H_SLOTS];
+static ACTIVE_H: [AtomicUsize; H_SLOTS] = [const { AtomicUsize::new(0) }; H_SLOTS];
+static N_HOURS: AtomicUsize = AtomicUsize::new(0);
+static SUMMARY: [AtomicU32; H_SLOTS * 4096 * 5] = [const { AtomicU32::new(0) }; H_SLOTS * 4096 * 5];
+static NEXT_H: AtomicUsize = AtomicUsize::new(0);
+static NEXT_FMT: AtomicUsize = AtomicUsize::new(0);
+static WRITE_TURN: AtomicUsize = AtomicUsize::new(0);
+
+// SAFETY: All unaligned loads are bounds-checked by branch conditions on `n = s.len()`.
+#[inline(always)]
+unsafe fn hash(s: &[u8]) -> u64 {
+    const K1: u64 = 0x9E3779B97F4A7C15;
+    const K2: u64 = 0xBF58476D1CE4E5B9;
+    let (n, p) = (s.len(), s.as_ptr());
+    let h = if n >= 8 {
+        if n <= 16 {
+            let a = (p as *const u64).read_unaligned();
+            let b = (p.add(n - 8) as *const u64).read_unaligned();
+            (a ^ b.rotate_left(23) ^ n as u64).wrapping_mul(K1)
+        } else if n <= 32 {
+            let a = (p as *const u64).read_unaligned();
+            let b = (p.add(8) as *const u64).read_unaligned();
+            let c = (p.add(n - 16) as *const u64).read_unaligned();
+            let d = (p.add(n - 8) as *const u64).read_unaligned();
+            (a ^ b.rotate_left(17) ^ n as u64).wrapping_mul(K1)
+                ^ (c ^ d.rotate_left(29)).wrapping_mul(K2)
         } else {
-            let mut h = len as u64;
-            for &b in name {
-                h = (h ^ b as u64).wrapping_mul(0x100000001b3);
+            let mut h = n as u64;
+            let mut i = 0;
+            while i + 8 < n {
+                h = (h.rotate_left(5) ^ (p.add(i) as *const u64).read_unaligned()).wrapping_mul(K1);
+                i += 8;
             }
-            h
-        };
-        let tag = (h >> 32) as u32 ^ (h as u32);
-        (tag, h as usize)
-    }
-
-    #[inline(always)]
-    fn get_name(&self, id: u16) -> &[u8] {
-        let (start, len) = self.offsets[id as usize];
-        &self.arena[start as usize..start as usize + len as usize]
-    }
-
-    fn intern(&mut self, name: &[u8]) -> u16 {
-        let (tag, h) = Self::hash(name);
-        let mut i = h & 4095;
-        loop {
-            let slot = self.slots[i];
-            if slot == 0 {
-                let id = self.offsets.len() as u16;
-                assert!(id < 2048, "endpoints > 2047");
-                self.offsets
-                    .push((self.arena.len() as u32, name.len() as u16));
-                self.arena.extend_from_slice(name);
-                self.slots[i] = ((tag as u64) << 32) | (id as u64 + 1);
-                return id;
-            }
-            if (slot >> 32) as u32 == tag && self.get_name((slot as u32 - 1) as u16) == name {
-                return (slot as u32 - 1) as u16;
-            }
-            i = (i + 1) & 4095;
+            (h.rotate_left(5) ^ (p.add(n - 8) as *const u64).read_unaligned()).wrapping_mul(K1)
         }
-    }
-}
-
-struct HourData {
-    records: Vec<u32>,
-    overflow: Vec<(u32, u32)>,
-}
-
-struct Local {
-    table: Table,
-    hours: Vec<HourData>,
-    cap: usize,
-}
-
-#[inline(always)]
-unsafe fn find_space_avx2(ptr: *const u8) -> usize {
-    let space = _mm256_set1_epi8(b' ' as i8);
-    let mut offset = 0;
-    loop {
-        let v = _mm256_loadu_si256(ptr.add(offset) as *const __m256i);
-        let mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, space)) as u32;
-        if mask != 0 {
-            return offset + mask.trailing_zeros() as usize;
-        }
-        offset += 32;
-    }
-}
-
-#[inline(always)]
-fn parse_line(buf: &[u8], pos: usize, local: &mut Local) -> usize {
-    unsafe {
-        let p = buf.as_ptr().add(pos);
-        let day_idx = (*p.add(9) - b'0') as usize + ((*p.add(6) == b'1') as usize);
-        let hour = day_idx * 24 + ((*p.add(11) - b'0') * 10 + *p.add(12) - b'0') as usize - 18;
-
-        let mut method_space = 31;
-        while *p.add(method_space) != b' ' {
-            method_space += 1;
-        }
-
-        let ep_start = method_space + 1;
-        let ep_len = find_space_avx2(p.add(ep_start));
-        let ep_end = ep_start + ep_len;
-
-        let err = (*p.add(ep_end + 1) == b'5') as u32;
-        let mut latency = 0u32;
-        let mut j = ep_end + 5;
-        while *p.add(j) != b'\n' {
-            latency = latency * 10 + (*p.add(j) - b'0') as u32;
-            j += 1;
-        }
-
-        let name = std::slice::from_raw_parts(p.add(ep_start), ep_len);
-        let id = local.table.intern(name);
-        let cap = local.cap;
-        let hd = &mut local.hours[hour];
-        if hd.records.capacity() == 0 {
-            hd.records.reserve(cap);
-        }
-        if latency >= 0xFFFFF {
-            hd.overflow.push((hd.records.len() as u32, latency));
-        }
-        hd.records
-            .push((id as u32 & 0x7FF) | (err << 11) | (latency.min(0xFFFFF) << 12));
-        pos + j + 1
-    }
-}
-
-fn parse_worker_range(file: &File, mut start: usize, end: usize) -> Local {
-    let cap = ((end - start) / 100).clamp(64, 50000);
-    let mut local = Local {
-        table: Table::new(),
-        hours: (0..HOURS)
-            .map(|_| HourData {
-                records: Vec::new(),
-                overflow: Vec::new(),
-            })
-            .collect(),
-        cap,
+    } else if n >= 4 {
+        let a = (p as *const u32).read_unaligned() as u64;
+        let b = (p.add(n - 4) as *const u32).read_unaligned() as u64;
+        (n as u64 ^ a ^ (b << 32)).wrapping_mul(K1)
+    } else {
+        let (a, b, c) = (s[0] as u64, s[n >> 1] as u64, s[n - 1] as u64);
+        (n as u64 ^ a ^ (b << 8) ^ (c << 16)).wrapping_mul(K1)
     };
-    let mut buf = [0u8; CHUNK_SIZE + 64];
-    let mut carried = 0;
-    while start < end {
-        let to_read = (CHUNK_SIZE - carried).min(end - start);
-        let n = file
-            .read_at(&mut buf[carried..carried + to_read], start as u64)
-            .expect("read_at");
-        if n == 0 {
-            break;
-        }
-        let valid = carried + n;
-        let last_nl = match buf[..valid].iter().rposition(|&b| b == b'\n') {
-            Some(nl) => nl,
-            None => {
-                carried = valid;
-                start += n;
-                continue;
-            }
-        };
-        let mut pos = 0;
-        while pos < last_nl {
-            pos = parse_line(&buf, pos, &mut local);
-        }
-        buf.copy_within(last_nl + 1..valid, 0);
-        carried = valid - (last_nl + 1);
-        start += n;
-    }
-    local
+    let h = (h ^ (h >> 30)).wrapping_mul(K2);
+    h ^ (h >> 29)
 }
 
+// SAFETY: `id < N_EPS`, and `META[id]` is published with Release ordering before `SLOTS` entry.
 #[inline(always)]
-fn push_field(buf: &mut Vec<u8>, mut n: u32, delim: u8) {
-    let mut temp = [0u8; 12];
-    let mut i = 11;
-    temp[11] = delim;
-    loop {
-        i -= 1;
-        temp[i] = b'0' + (n % 10) as u8;
-        n /= 10;
-        if n == 0 {
-            break;
-        }
-    }
-    buf.extend_from_slice(&temp[i..12]);
-}
-
-#[inline(always)]
-fn percentile_values(latencies: &mut [u32]) -> (u32, u32, u32) {
-    let n = latencies.len();
-    latencies.sort_unstable();
-    (
-        latencies[(50 * n + 99) / 100 - 1],
-        latencies[(95 * n + 99) / 100 - 1],
-        latencies[(99 * n + 99) / 100 - 1],
+unsafe fn get_name_sp(id: usize) -> &'static [u8] {
+    let m = META[id].load(Relaxed);
+    std::slice::from_raw_parts(
+        (ARENA.as_ptr() as *const u8).add((m >> 16) as usize),
+        m as u16 as usize,
     )
 }
 
+// SAFETY: `ARENA` writes are serialized by `LOCK` and bounds-checked by `assert!`.
+#[inline(always)]
+unsafe fn intern(name: &[u8]) -> u16 {
+    let h = hash(name);
+    let len_sp = name.len() + 1;
+    let n_tag = (h & 0xFFFF_FFFF_0000_0000) | ((len_sp as u64) << 16);
+    let mut i = (h as usize) & 8191;
+    loop {
+        let s = SLOTS[i].load(Acquire);
+        if s == 0 {
+            break;
+        }
+        if (s & 0xFFFF_FFFF_FFFF_0000) == n_tag
+            && &get_name_sp((s & 0xFFFF) as usize - 1)[..name.len()] == name
+        {
+            return (s & 0xFFFF) as u16 - 1;
+        }
+        i = (i + 1) & 8191;
+    }
+    let mut st = LOCK.lock().unwrap();
+    i = (h as usize) & 8191;
+    loop {
+        let s = SLOTS[i].load(Relaxed);
+        if s == 0 {
+            let (id, start) = *st;
+            assert!(id < 4096 && start + len_sp <= ARENA.len() * 8);
+            *st = (id + 1, start + len_sp);
+            let dst = (ARENA.as_ptr() as *mut u8).add(start);
+            std::ptr::copy_nonoverlapping(name.as_ptr(), dst, name.len());
+            *dst.add(name.len()) = b' ';
+            META[id].store(((start as u64) << 16) | len_sp as u64, Release);
+            SLOTS[i].store(n_tag | (id as u64 + 1), Release);
+            return id as u16;
+        }
+        if (s & 0xFFFF_FFFF_FFFF_0000) == n_tag
+            && &get_name_sp((s & 0xFFFF) as usize - 1)[..name.len()] == name
+        {
+            return (s & 0xFFFF) as u16 - 1;
+        }
+        i = (i + 1) & 8191;
+    }
+}
+
+// SAFETY: `p` points to a valid 27-byte RFC 3339 timestamp `YYYY-MM-DDTHH:MM:SS.ffffffZ`.
+#[inline(always)]
+unsafe fn parse_hour_slot(p: *const u8) -> usize {
+    let y = (*p - b'0') as i32 * 1000
+        + (*p.add(1) - b'0') as i32 * 100
+        + (*p.add(2) - b'0') as i32 * 10
+        + (*p.add(3) - b'0') as i32;
+    let m = (*p.add(5) - b'0') as i32 * 10 + (*p.add(6) - b'0') as i32;
+    let d = (*p.add(8) - b'0') as i32 * 10 + (*p.add(9) - b'0') as i32;
+    let hh = (*p.add(11) - b'0') as i32 * 10 + (*p.add(12) - b'0') as i32;
+    let y = y - (m <= 2) as i32;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let days = 365 * y + y / 4 - y / 100 + y / 400 + (153 * mp + 2) / 5 + d;
+    let eh = (days * 24 + hh) as usize;
+    let slot = eh & (H_SLOTS - 1);
+    if HOUR_EPOCH[slot].load(Relaxed) == 0 {
+        let mut pref = [0u8; 24];
+        std::ptr::copy_nonoverlapping(p, pref.as_mut_ptr(), 13);
+        pref[13..21].copy_from_slice(b":00:00Z ");
+        for (i, c) in pref.chunks_exact(8).enumerate() {
+            HOUR_PREF[slot][i].store(u64::from_ne_bytes(c.try_into().unwrap()), Relaxed);
+        }
+        HOUR_EPOCH[slot].store(eh, Release);
+    }
+    slot
+}
+
+// SAFETY: Called only when `pos + 160 <= end`, so at least 96 bytes from `ptr` (`p.add(63)`) are readable.
+#[inline(always)]
+unsafe fn find_space(ptr: *const u8) -> usize {
+    let sp = _mm256_set1_epi8(32);
+    let mut off = 0;
+    loop {
+        let v = _mm256_loadu_si256(ptr.add(off) as _);
+        let m = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, sp)) as u32;
+        if m != 0 {
+            return off + m.trailing_zeros() as usize;
+        }
+        off += 32;
+    }
+}
+
+// SAFETY: Fast SIMD path runs only while `pos + 160 <= end`; tail lines use bounds-checked indexing.
+unsafe fn parse_worker(data: &[u8], mut pos: usize, end: usize) {
+    let mut hours: [HourBlock; H_SLOTS] = [const { (Vec::new(), Vec::new()) }; H_SLOTS];
+    while pos < end {
+        let p = data.as_ptr().add(pos);
+        let h = parse_hour_slot(p);
+        let (s, e) = if pos + 160 <= end {
+            let v = _mm256_loadu_si256(p.add(31) as _);
+            let m = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(32))) as u32;
+            let s = 32 + m.trailing_zeros() as usize;
+            let m2 = m & (m - 1);
+            let e = if m2 != 0 {
+                31 + m2.trailing_zeros() as usize
+            } else {
+                63 + find_space(p.add(63))
+            };
+            (s, e)
+        } else {
+            let mut s = 31;
+            while *p.add(s) != b' ' {
+                s += 1;
+            }
+            s += 1;
+            let mut e = s;
+            while *p.add(e) != b' ' {
+                e += 1;
+            }
+            (s, e)
+        };
+        let (err, mut lat, mut j) = ((*p.add(e + 1) == b'5') as u32, 0u32, e + 5);
+        while *p.add(j) >= b'0' {
+            lat = lat * 10 + (*p.add(j) - b'0') as u32;
+            j += 1;
+        }
+        if *p.add(j) == b'\r' {
+            j += 1;
+        }
+        let id = intern(&data[pos + s..pos + e]);
+        let r = (id as u32 & 0xFFF) | (err << 12) | (lat.min(0x7FFFF) << 13);
+        let hb = &mut hours[h];
+        if hb.0.is_empty() {
+            hb.0.reserve_exact(BLOCK_CAP);
+        }
+        hb.0.push(r);
+        if lat >= 0x7FFFF {
+            hb.1.push(lat);
+        }
+        if hb.0.len() == BLOCK_CAP {
+            let full = std::mem::replace(hb, (Vec::new(), Vec::new()));
+            HOURLY[h].lock().unwrap().push(full);
+        }
+        pos += j + 1;
+    }
+    for (h, hb) in hours.into_iter().enumerate() {
+        if !hb.0.is_empty() {
+            HOURLY[h].lock().unwrap().push(hb);
+        }
+    }
+}
+
+// SAFETY: `i` is in `1..=10`, so `i + 12 <= 22 < 24`, and destination has >= 16 bytes slack.
+#[inline(always)]
+unsafe fn push_u32(ptr: *mut u8, mut n: u32, d: u8) -> *mut u8 {
+    let (mut t, mut i) = ([0u8; 24], 11);
+    t[11] = d;
+    while n >= 10 {
+        i -= 1;
+        t[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    i -= 1;
+    t[i] = b'0' + n as u8;
+    let src = t.as_ptr().add(i);
+    (ptr as *mut u64).write_unaligned((src as *const u64).read_unaligned());
+    (ptr.add(8) as *mut u32).write_unaligned((src.add(8) as *const u32).read_unaligned());
+    ptr.add(12 - i)
+}
+
+// SAFETY: `N_HOURS` and `N_EPS` are published before Barrier 1 completes; each worker claims disjoint `idx`.
+unsafe fn process_hours() {
+    let (n_hours, n_eps) = (N_HOURS.load(Acquire), N_EPS.load(Acquire));
+    let mut flat = Vec::new();
+    let (mut cnts, mut errs, mut curs) = ([0u32; 4096], [0u32; 4096], [0u32; 4096]);
+    loop {
+        let idx = NEXT_H.fetch_add(1, Relaxed);
+        if idx >= n_hours {
+            break;
+        }
+        let h = ACTIVE_H[idx].load(Relaxed);
+        let h_data = std::mem::take(&mut *HOURLY[h].lock().unwrap());
+        cnts[..n_eps].fill(0);
+        errs[..n_eps].fill(0);
+        for hb in &h_data {
+            for &r in &hb.0 {
+                let ep = (r & 0xFFF) as usize;
+                cnts[ep] += 1;
+                errs[ep] += (r >> 12) & 1;
+            }
+        }
+        let mut sum = 0u32;
+        for i in 0..n_eps {
+            curs[i] = sum;
+            sum += cnts[i];
+        }
+        flat.resize(sum as usize, 0);
+        for hb in &h_data {
+            let mut oi = 0;
+            for &r in &hb.0 {
+                let ep = (r & 0xFFF) as usize;
+                let (slot, mut lat) = (curs[ep] as usize, r >> 13);
+                curs[ep] += 1;
+                if lat == 0x7FFFF {
+                    lat = hb.1[oi];
+                    oi += 1;
+                }
+                flat[slot] = lat;
+            }
+        }
+        drop(h_data);
+        for ep in 0..n_eps {
+            let n = cnts[ep] as usize;
+            if n == 0 {
+                continue;
+            }
+            let (p50, p95, p99) = if n == 1 {
+                let v = flat[curs[ep] as usize - 1];
+                (v, v, v)
+            } else {
+                let cur = curs[ep] as usize;
+                let s = &mut flat[cur - n..cur];
+                let a = (n - 1) / 2;
+                let b = (95 * n + 99) / 100 - 1;
+                let c = (99 * n + 99) / 100 - 1;
+                if n <= 128 {
+                    s.sort_unstable();
+                } else {
+                    s.select_nth_unstable(b);
+                    if c > b {
+                        s[b + 1..].select_nth_unstable(c - b - 1);
+                    }
+                    if a < b {
+                        s[..b].select_nth_unstable(a);
+                    }
+                }
+                (s[a], s[b], s[c])
+            };
+            *(SUMMARY.as_ptr() as *mut [u32; 5]).add(idx * 4096 + ep) =
+                [n as u32, p50, p95, p99, errs[ep]];
+        }
+    }
+}
+
+// SAFETY: Runs after Barrier 2 (`munmap` + `malloc_trim` + `ORDER` sort). `WRITE_TURN` serializes file writes.
+unsafe fn format_hours(out_f: &File) {
+    let (n_hours, n_eps) = (N_HOURS.load(Acquire), N_EPS.load(Acquire));
+    let cap = (ARENA_BYTES.load(Acquire) + n_eps * 88).max(180 * 1024);
+    let mut buf: Vec<u8> = vec![0u8; cap];
+    loop {
+        let idx = NEXT_FMT.fetch_add(1, Relaxed);
+        if idx >= n_hours {
+            break;
+        }
+        let h = ACTIVE_H[idx].load(Relaxed);
+        let mut pref = [0u8; 24];
+        for (i, chunk) in pref.chunks_exact_mut(8).enumerate() {
+            chunk.copy_from_slice(&HOUR_PREF[h][i].load(Relaxed).to_ne_bytes());
+        }
+        let mut ptr = buf.as_mut_ptr();
+        for i in 0..n_eps {
+            let ep = ORDER[i].load(Relaxed) as usize;
+            let s = *(SUMMARY.as_ptr() as *const [u32; 5]).add(idx * 4096 + ep);
+            if s[0] == 0 {
+                continue;
+            }
+            std::ptr::copy_nonoverlapping(pref.as_ptr(), ptr, 21);
+            ptr = ptr.add(21);
+            let name = get_name_sp(ep);
+            std::ptr::copy_nonoverlapping(name.as_ptr(), ptr, name.len());
+            ptr = ptr.add(name.len());
+            ptr = push_u32(ptr, s[0], b' ');
+            ptr = push_u32(ptr, s[1], b' ');
+            ptr = push_u32(ptr, s[2], b' ');
+            ptr = push_u32(ptr, s[3], b' ');
+            if s[4] == 0 {
+                (ptr as *mut u32).write_unaligned(0x0a302030);
+                ptr = ptr.add(4);
+            } else {
+                ptr = push_u32(ptr, s[4], b' ');
+                ptr = push_u32(ptr, (s[4] as u64 * 1_000_000 / s[0] as u64) as u32, b'\n');
+            }
+        }
+        let written = ptr.offset_from(buf.as_ptr()) as usize;
+        while WRITE_TURN.load(Acquire) != idx {
+            std::hint::spin_loop();
+        }
+        (&*out_f).write_all(&buf[..written]).expect("write");
+        WRITE_TURN.store(idx + 1, Release);
+    }
+}
+
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let (input, output) = (
-        args.get(1).map_or("/data/requests.log", |s| s.as_str()),
-        args.get(2).map_or("/out/summary.txt", |s| s.as_str()),
+    let mut args = std::env::args().skip(1);
+    let inp = args.next().unwrap_or("/data/requests.log".into());
+    let out_p = args.next().unwrap_or("/out/summary.txt".into());
+    let file = File::open(&inp).expect("open");
+    let (len, fd) = (
+        file.metadata().expect("stat").len() as usize,
+        file.as_raw_fd(),
     );
-    let file = File::open(input).expect("open input");
-    let len = file.metadata().expect("stat").len() as usize;
+    let out_f = File::create(out_p).expect("create");
     if len == 0 {
-        File::create(output).expect("create output");
         return;
     }
-
-    let workers = std::env::var("THREADS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(12)
-        .clamp(1, 12);
-    let (parse_workers, agg_workers) = (workers.min(len.div_ceil(CHUNK_SIZE)), workers);
-
-    let mut bounds = vec![0; parse_workers + 1];
-    let mut buf = [0u8; 1024];
-    for w in 1..parse_workers {
-        let mut pos = len * w / parse_workers;
-        while let Ok(n) = file.read_at(&mut buf[..1024.min(len - pos)], pos as u64) {
-            if let Some(i) = buf[..n].iter().position(|&b| b == b'\n') {
-                pos += i + 1;
-                break;
+    // SAFETY: Read-only private mapping of immutable input log file; unmapped at Barrier 2 before output writes.
+    unsafe {
+        let data_ptr = mmap(std::ptr::null_mut(), len, 1, 2, fd, 0);
+        madvise(data_ptr, len, 3);
+        let data = std::slice::from_raw_parts(data_ptr, len);
+        let workers = std::env::var("THREADS")
+            .map_or(12, |v| v.parse().unwrap_or(12))
+            .clamp(1, 12)
+            .min(len.div_ceil(64 * 1024));
+        let mut bounds = vec![0; workers + 1];
+        bounds[workers] = len;
+        for w in 1..workers {
+            let mut p = len * w / workers;
+            while p < len && data[p] != b'\n' {
+                p += 1;
             }
-            pos += n;
+            bounds[w] = (p + 1).min(len);
         }
-        bounds[w] = pos;
-    }
-    bounds[parse_workers] = len;
-    bounds.dedup();
-
-    let (tables, hours_by_worker): (Vec<Table>, Vec<Vec<HourData>>) = thread::scope(|s| {
-        let tasks: Vec<_> = bounds
-            .windows(2)
-            .map(|w| {
-                let (start, end) = (w[0], w[1]);
+        bounds.dedup();
+        let nw = bounds.len() - 1;
+        let barrier = Barrier::new(nw);
+        let addr = data_ptr as usize;
+        std::thread::scope(|s| {
+            for w in 0..nw {
+                let (st, en, b, out_r) = (bounds[w], bounds[w + 1], &barrier, &out_f);
                 s.spawn(move || {
-                    let loc = parse_worker_range(&File::open(input).expect("open"), start, end);
-                    (loc.table, loc.hours)
-                })
-            })
-            .collect();
-        tasks.into_iter().map(|t| t.join().unwrap()).unzip()
-    });
-
-    let mut names: Vec<&[u8]> = Vec::with_capacity(2048);
-    let mut slots = [0u64; 4096];
-    for t in &tables {
-        for id in 0..t.offsets.len() as u16 {
-            let name = t.get_name(id);
-            let (tag, h) = Table::hash(name);
-            let mut i = h & 4095;
-            loop {
-                let slot = slots[i];
-                if slot == 0 {
-                    assert!(names.len() < 2048, "endpoints > 2047");
-                    slots[i] = ((tag as u64) << 32) | ((names.len() + 1) as u64);
-                    names.push(name);
-                    break;
-                }
-                if (slot >> 32) as u32 == tag && names[(slot as u32 - 1) as usize] == name {
-                    break;
-                }
-                i = (i + 1) & 4095;
+                    parse_worker(data, st, en);
+                    if b.wait().is_leader() {
+                        let (n_eps, a_bytes) = *LOCK.lock().unwrap();
+                        N_EPS.store(n_eps, Release);
+                        ARENA_BYTES.store(a_bytes, Release);
+                        let mut hrs: Vec<usize> = (0..H_SLOTS)
+                            .filter(|&h| HOUR_EPOCH[h].load(Relaxed) != 0)
+                            .collect();
+                        hrs.sort_unstable_by_key(|&h| HOUR_EPOCH[h].load(Relaxed));
+                        for (idx, &h) in hrs.iter().enumerate() {
+                            ACTIVE_H[idx].store(h, Relaxed);
+                        }
+                        N_HOURS.store(hrs.len(), Release);
+                    }
+                    b.wait();
+                    process_hours();
+                    if b.wait().is_leader() {
+                        munmap(addr as *mut u8, len);
+                        malloc_trim(0);
+                        let n_eps = N_EPS.load(Relaxed);
+                        let mut ord: Vec<u16> = (0..n_eps as u16).collect();
+                        ord.sort_unstable_by_key(|&id| get_name_sp(id as usize));
+                        for (i, &id) in ord.iter().enumerate() {
+                            ORDER[i].store(id, Relaxed);
+                        }
+                    }
+                    b.wait();
+                    format_hours(out_r);
+                });
             }
-        }
+        });
+        (&out_f).flush().expect("flush");
+        std::process::exit(0);
     }
-    names.sort_unstable();
-    let num_endpoints = names.len();
-
-    slots.fill(0);
-    for (gid, &name) in names.iter().enumerate() {
-        let (tag, h) = Table::hash(name);
-        let mut i = h & 4095;
-        loop {
-            if slots[i] == 0 {
-                slots[i] = ((tag as u64) << 32) | ((gid + 1) as u64);
-                break;
-            }
-            i = (i + 1) & 4095;
-        }
-    }
-
-    let remaps: Vec<Vec<u16>> = tables
-        .iter()
-        .map(|t| {
-            (0..t.offsets.len() as u16)
-                .map(|id| {
-                    let name = t.get_name(id);
-                    let (tag, h) = Table::hash(name);
-                    let mut i = h & 4095;
-                    loop {
-                        let slot = slots[i];
-                        if (slot >> 32) as u32 == tag {
-                            let cand = (slot as u32 - 1) as usize;
-                            if names[cand] == name {
-                                return cand as u16;
-                            }
-                        }
-                        i = (i + 1) & 4095;
-                    }
-                })
-                .collect()
-        })
-        .collect();
-
-    let mut hourly: Vec<_> = (0..HOURS).map(|_| Some(Vec::new())).collect();
-    for hours in hours_by_worker {
-        for (h, hd) in hours.into_iter().enumerate() {
-            hourly[h].as_mut().unwrap().push(hd);
-        }
-    }
-    let hourly = Mutex::new(hourly);
-
-    let mut prefixes = [[0u8; 21]; HOURS];
-    for (hour, p) in prefixes.iter_mut().enumerate() {
-        let (h, d) = ((hour + 18) % 24, (hour + 18) / 24);
-        p[0..10].copy_from_slice(DATES[d].as_bytes());
-        p[10] = b'T';
-        p[11] = b'0' + (h / 10) as u8;
-        p[12] = b'0' + (h % 10) as u8;
-        p[13..21].copy_from_slice(b":00:00Z ");
-    }
-
-    let next_hour = AtomicUsize::new(0);
-    let (tx, rx) = mpsc::channel();
-
-    thread::scope(|scope| {
-        for _ in 0..agg_workers {
-            let next = &next_hour;
-            let names = &names;
-            let hourly = &hourly;
-            let remaps = &remaps;
-            let prefixes = &prefixes;
-            let tx = tx.clone();
-            scope.spawn(move || {
-                let mut flat_lats: Vec<u32> = Vec::with_capacity(65536);
-                let mut counts = vec![0u32; num_endpoints];
-                let mut err_counts = vec![0u32; num_endpoints];
-                let mut cursors = vec![0u32; num_endpoints];
-
-                loop {
-                    let hour = next.fetch_add(1, Ordering::Relaxed);
-                    if hour >= HOURS {
-                        break;
-                    }
-                    let hour_data = hourly.lock().unwrap()[hour].take().unwrap();
-                    counts.fill(0);
-                    err_counts.fill(0);
-
-                    for (w, hd) in hour_data.iter().enumerate() {
-                        let w_remap = &remaps[w];
-                        for &r in &hd.records {
-                            let gid = w_remap[(r & 0x7FF) as usize] as usize;
-                            counts[gid] += 1;
-                            if (r & 0x800) != 0 {
-                                err_counts[gid] += 1;
-                            }
-                        }
-                    }
-
-                    let mut sum = 0u32;
-                    for i in 0..num_endpoints {
-                        cursors[i] = sum;
-                        sum += counts[i];
-                    }
-                    if flat_lats.len() < sum as usize {
-                        flat_lats.resize(sum as usize, 0);
-                    }
-
-                    for (w, hd) in hour_data.iter().enumerate() {
-                        let w_remap = &remaps[w];
-                        let mut of_idx = 0;
-                        for &r in &hd.records {
-                            let gid = w_remap[(r & 0x7FF) as usize] as usize;
-                            let slot = cursors[gid] as usize;
-                            cursors[gid] += 1;
-                            let lat = r >> 12;
-                            let lat = if lat == 0xFFFFF {
-                                let full = hd.overflow[of_idx].1;
-                                of_idx += 1;
-                                full
-                            } else {
-                                lat
-                            };
-                            flat_lats[slot] = lat;
-                        }
-                    }
-                    drop(hour_data);
-
-                    let mut out = Vec::with_capacity(160 * 1024);
-                    for ep in 0..num_endpoints {
-                        let n = counts[ep] as usize;
-                        if n == 0 {
-                            continue;
-                        }
-                        let end = cursors[ep] as usize;
-                        let start = end - n;
-                        let ep_lats = &mut flat_lats[start..end];
-                        let (p50, p95, p99) = percentile_values(ep_lats);
-                        let errors = err_counts[ep];
-                        out.extend_from_slice(&prefixes[hour]);
-                        out.extend_from_slice(names[ep]);
-                        out.push(b' ');
-                        push_field(&mut out, n as u32, b' ');
-                        push_field(&mut out, p50, b' ');
-                        push_field(&mut out, p95, b' ');
-                        push_field(&mut out, p99, b' ');
-                        push_field(&mut out, errors, b' ');
-                        push_field(
-                            &mut out,
-                            (errors as u64 * 1_000_000 / n as u64) as u32,
-                            b'\n',
-                        );
-                    }
-                    let _ = tx.send((hour, out));
-                }
-            });
-        }
-        drop(tx);
-
-        let mut out = File::create(output).expect("create output");
-        let mut pending = vec![None; HOURS];
-        let mut next_to_write = 0;
-
-        while next_to_write < HOURS {
-            let (h, buf) = rx.recv().expect("receive hour");
-            pending[h] = Some(buf);
-            while next_to_write < HOURS && pending[next_to_write].is_some() {
-                let b = pending[next_to_write].take().unwrap();
-                out.write_all(&b).expect("write summary.txt");
-                drop(b);
-                next_to_write += 1;
-            }
-        }
-    });
 }

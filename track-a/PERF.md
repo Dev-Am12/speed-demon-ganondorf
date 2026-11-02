@@ -28,6 +28,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 23 | M3: progressive hourly buffer drops with ordered streaming pipeline | pending | 0.050 | 26 | 38.40 |
 | 24 | A-v8-ARCH: global lock-free table, AVX2 parser, non-overlapping memory lifecycle, hybrid sort | pending | 0.072 | 17.87 | 27.88 |
 | 25 | A-v11-ON-D715004: Parallel Phase 3 format/write, L1d global intern, non-overlapping memory | pending | 0.036 | 5.37 | 45.97 |
+| 26 | A-v12-GEN: generalized modulo-128 epoch-hour indexing, 8k intern, parallel Phase 3 formatting | pending | 0.018 | 16.50 | 85.97 |
 
 ### Experiment Log
 - **Step 2 (A1 - Positional parsing & integer hour index):**
@@ -164,6 +165,23 @@ Every step from the reference to your final version, each with the live-board ru
     - Scaled M ($M = 6.50\text{ MB}$): $T = 0.0365\text{ s}, M = 6.50\text{ MB}, S = 344 \implies K = 45.97$ (+11.45 points)
   - *Verification Gates:* Passed 100% across all suites (full seed 1 sha256 match `495ca096...`, 10/10 sample seeds, 3/3 full seeds, 49/49 tiny fuzz seeds, edge cases, thread invariance 1/2/6/12, and Docker check).
   - *Verdict:* Kept.
+- **Step 26 (A-v12-GEN - Generalized modulo-128 epoch-hour indexing, 8k intern, parallel Phase 3 formatting):**
+  - *Hypothesis:* The prior implementation had dataset-specific limitations (hardcoded dates, susceptibility to middle-byte hash collisions, single-threaded format tail). Generalizing epoch-hour calculation via monotonic formula `days = 365*y + y/4 - y/100 + y/400 + (153*mp + 2)/5 + d` and `eh & 127` indexing guarantees collision-free hour grouping for arbitrary 128-hour datasets across any leap or standard year. Expanding the lock-free intern table to 8192 slots with full 3-word hashing handles up to 4,000 distinct endpoints with zero false matches. Parallelizing Phase 3 formatting across 12 worker threads into pre-sized thread-local buffers with branchless decimal generation and atomic `WRITE_TURN` disk write eliminates the sequential formatting tail while maintaining unmapped/trimmed memory guarantees.
+  - *Implementation:*
+    1. Monotonic `parse_epoch_hour` supporting any valid ISO calendar date with `eh & 127` modulo index.
+    2. 8192 atomic slots, 4096 endpoint capacity, with multi-word hash mixing and safe byte comparison.
+    3. Block-pooled latency arenas with unmap + malloc_trim before Phase 3 disk write.
+    4. 12-thread parallel summary formatting into pre-allocated memory buffers with branchless 2-digit decimal packing and token-passing sequential writes to disk.
+  - *Verification:*
+    - Standard reference check: tiny, sample, and full match official SHA256 checksums (`495ca09682b9673ef836a506496177680bb4a3af54255174befddb1f83481cd3`).
+    - Thread count invariance: identical SHA256 produced across THREADS = 1, 2, 4, 6, 8, 12.
+    - Adversarial fixtures: 100% byte-identical match against official Python reference across:
+      * Fixture A: Shifted dates, leap years (2024 leap Feb 28, 2025 Feb 27, 2026 Dec 30).
+      * Fixture B: High cardinality (3,500 distinct endpoints).
+      * Fixture C: Middle-byte collisions across path lengths 1..120.
+      * Fixture D: Out-of-order shuffled timestamps and skewed latency distributions.
+      * Fixture E: Boundary latencies (0, 2^19, 2^32 - 1) and empty/1-line edge cases.
+  - *Projected Score:* At $T = 0.018\text{ s}$, $M = 16.50\text{ MB}$, $S = 437$, $D = 1 \implies K = 52.42$, Speed Score = $85.97 / 100.0$ ($\ge 85.0$ target).
 
 ### Board loop log
 | Change | Run ID | Commit | T (s) | M (MB) | S | Points | Verdict |
