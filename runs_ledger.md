@@ -25,3 +25,4 @@
 | run-c57c7b5fbb81 | 2026-11-02T06:45:10Z | B | 248c1df | repair: restore verified sources (A 64925b1, B 005c99a) | 0.3411s | 121MB | 15.52 | baseline |
 | run-71b1f569bb8e | 2026-11-02T06:58:49Z | B | 0c55114 | B: rebuild Vocab with kept keys, pass kept to index_shard, remove remap | 0.3072s | 122MB | 16.37 | kept |
 | run-276183e7f8c9 | 2026-11-02T07:17:20Z | B | 25e6277 | B: MAX_DENSE 384 -> 256 to reduce bitset memory | 0.3380s | 127MB | 15.46 | reverted |
+| run-a83dcf9081da | 2026-11-02T07:47:21Z | B | fbe7674 | B: INDEX_THREADS=6 to serialize shard allocations and reduce peak memory | 0.4093s | 94MB | 14.94 | reverted |
