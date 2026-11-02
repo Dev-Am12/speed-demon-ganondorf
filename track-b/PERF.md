@@ -102,3 +102,8 @@ These are diagnostic-build measurements, not production timings. Passes 1 and 2 
 ### Other compact source experiments
 
 Reusing pass-1 state as the pass-2 cursor did not reduce RSS and was slightly slower; it was reverted. Removing one unreachable match arm saved one scc Code line, but paired timings were noisy and the all-CPU result regressed, so it was reverted. Neither change is part of e7c9ea6.
+
+### Board loop log
+| Change | Run ID | Commit | T (s) | M (MB) | S | Points | Verdict |
+|---|---|---|---|---|---|---|---|
+| repair: restore verified sources (A 64925b1, B 005c99a) | run-c57c7b5fbb81 | 248c1df | 0.341 | 121.2 | 1235 | 59.546 | baseline |
