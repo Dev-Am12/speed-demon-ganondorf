@@ -16,6 +16,7 @@ const ID_BITS: u32 = 18; // table payload is id + 1, so ids stay below 2^18 - 1
 const ID_MASK: u64 = (1 << ID_BITS) - 1;
 const TAG_MASK: u64 = (1 << 46) - 1; // 46-bit tag from the low bits of the slot hash
 const SAMPLE_DIV: usize = 32; // dense = document frequency >= 1/32 (measured on a sample)
+const MAX_DENSE: usize = 512; // bitset rows per shard, at most (the most frequent terms)
 const BUCKET: usize = 256; // sparse term ids per log bucket
 const K_MUL: u64 = 0x517c_c1b7_2722_0a95;
 const POS_MASK: [u64; 6] = [
@@ -30,6 +31,7 @@ const POS_MASK: [u64; 6] = [
 // SAFETY: same mmap declaration as the current track (POSIX ABI, fixed-width arguments).
 unsafe extern "C" {
     fn mmap(a: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut c_void;
+    fn prctl(option: i32, ...) -> i32;
 }
 
 #[derive(Clone, Copy)]
@@ -1182,7 +1184,7 @@ fn run(docs: &[u8]) -> io::Result<()> {
     let is_dense = |t: usize| scount[t] > 0 && scount[t] as usize * SAMPLE_DIV >= sample_n;
     let mut order: Vec<usize> = (0..nterms).collect();
     order.sort_unstable_by_key(|&t| (!is_dense(t), std::cmp::Reverse(scount[t]), t));
-    let d_count = (0..nterms).filter(|&t| is_dense(t)).count();
+    let d_count = (0..nterms).filter(|&t| is_dense(t)).count().min(MAX_DENSE);
 
     // Renumber: order[new] = old. Table payloads, query terms and text all follow.
     let mut map = vec![0u32; nterms];
@@ -1284,13 +1286,17 @@ fn run(docs: &[u8]) -> io::Result<()> {
             tb: vec![0u64; max_words],
         },
         |b, sc| {
-            let mut out = Vec::with_capacity(BLOCK * 48);
-            for q in &queries[b * BLOCK..((b + 1) * BLOCK).min(queries.len())] {
-                let mut a = Acc10::default();
-                for sh in &shards {
-                    eval(q, &plans, docs, &texts, sh, sc, &mut a);
+            // Shard-major inside a block: one shard's lists stay cache-hot for all its queries.
+            let qs = &queries[b * BLOCK..((b + 1) * BLOCK).min(queries.len())];
+            let mut accs: Vec<Acc10> = qs.iter().map(|_| Acc10::default()).collect();
+            for sh in &shards {
+                for (q, a) in qs.iter().zip(accs.iter_mut()) {
+                    eval(q, &plans, docs, &texts, sh, sc, a);
                 }
-                write_acc(&mut out, &a);
+            }
+            let mut out = Vec::with_capacity(BLOCK * 48);
+            for a in &accs {
+                write_acc(&mut out, a);
             }
             out
         },
@@ -1305,6 +1311,11 @@ fn run(docs: &[u8]) -> io::Result<()> {
 }
 
 fn main() -> io::Result<()> {
+    // SAFETY: PR_SET_THP_DISABLE (41) only changes this process's page-size policy, so scattered
+    // small buffers stay as small as their contents; a failure is harmless and ignored.
+    unsafe {
+        prctl(41, 1u64, 0u64, 0u64, 0u64);
+    }
     let file = File::open("/data/docs.txt")?;
     let len = usize::try_from(file.metadata()?.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "docs.txt too large"))?;
