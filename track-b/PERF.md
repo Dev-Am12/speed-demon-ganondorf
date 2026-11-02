@@ -109,3 +109,4 @@ Reusing pass-1 state as the pass-2 cursor did not reduce RSS and was slightly sl
 | repair: restore verified sources (A 64925b1, B 005c99a) | run-c57c7b5fbb81 | 248c1df | 0.341 | 121.2 | 1235 | 59.546 | baseline |
 | B: rebuild Vocab with kept keys, pass kept to index_shard, remove remap | run-71b1f569bb8e | 0c55114 | 0.307 | 121.6 | 1224 | 60.697 | kept |
 | B: MAX_DENSE 384 -> 256 to reduce bitset memory | run-276183e7f8c9 | 25e6277 | 0.338 | 127.3 | 1224 | 59.459 | reverted |
+| B: INDEX_THREADS=6 to serialize shard allocations and reduce peak memory | run-a83dcf9081da | fbe7674 | 0.409 | 93.7 | 1225 | 58.712 | reverted |

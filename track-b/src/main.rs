@@ -9,7 +9,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 const MAX_THREADS: usize = 12;
-const INDEX_THREADS: usize = 6;
 const MAX_DOCS: usize = 65_534; // local doc ids are u16 and 0 is never used as a sentinel here
 const BLOCK: usize = 256; // queries per work item
 const NONE: u32 = u32::MAX; // table code of a token that is not a query term
@@ -798,7 +797,7 @@ fn at(
     false
 }
 
-/// Finds the rarest term's occurrences in a candidate document with a 16-byte prefilter on its
+/// Finds the rarest term's occurrences in a candidate document with a 32-byte prefilter on its
 /// first byte (case-folded), then checks each occurrence with `at`. The prefilter can pass
 /// extra bytes but never misses a real occurrence.
 fn verify(text: &[u8], seed: (u8, u8, u8), positions: u8, keys: &[(u64, u64)]) -> bool {
@@ -808,13 +807,13 @@ fn verify(text: &[u8], seed: (u8, u8, u8), positions: u8, keys: &[(u64, u64)]) -
     }
     let b0 = seed.0;
     let mut i = 0usize;
-    // SAFETY: SSE2 is part of the x86-64 baseline; each load reads 16 bytes at i with i + 16 <= n.
+    // SAFETY: AVX2 is guaranteed by x86-64-v3; each load reads 32 bytes at i with i + 32 <= n.
     unsafe {
-        let want = _mm_set1_epi8(b0 as i8);
-        let fold = _mm_set1_epi8(0x20);
-        while i + 16 <= n {
-            let v = _mm_loadu_si128(text.as_ptr().add(i).cast::<__m128i>());
-            let mut m = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_or_si128(v, fold), want)) as u32;
+        let want = _mm256_set1_epi8(b0 as i8);
+        let fold = _mm256_set1_epi8(0x20);
+        while i + 32 <= n {
+            let v = _mm256_loadu_si256(text.as_ptr().add(i).cast::<__m256i>());
+            let mut m = _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_or_si256(v, fold), want)) as u32;
             while m != 0 {
                 let j = m.trailing_zeros() as usize;
                 m &= m - 1;
@@ -822,7 +821,7 @@ fn verify(text: &[u8], seed: (u8, u8, u8), positions: u8, keys: &[(u64, u64)]) -
                     return true;
                 }
             }
-            i += 16;
+            i += 32;
         }
     }
     while i < n {
@@ -1250,7 +1249,7 @@ fn run(docs: &[u8]) -> io::Result<()> {
 
     // Index every shard on its own thread (no shared writes, no barrier).
     let mut shards: Vec<Shard> = par_map(
-        threads.min(INDEX_THREADS),
+        threads,
         n,
         || (),
         |i, _| index_shard(docs, cuts[i], cuts[i + 1], counts[i], &vocab, d_count, kept),
