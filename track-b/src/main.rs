@@ -9,7 +9,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 const MAX_THREADS: usize = 12;
-const INDEX_THREADS: usize = 6;
 const MAX_DOCS: usize = 65_534; // local doc ids are u16 and 0 is never used as a sentinel here
 const BLOCK: usize = 256; // queries per work item
 const NONE: u32 = u32::MAX; // table code of a token that is not a query term
@@ -17,14 +16,22 @@ const ID_BITS: u32 = 18; // table payload is id + 1, so ids stay below 2^18 - 1
 const ID_MASK: u64 = (1 << ID_BITS) - 1;
 const TAG_MASK: u64 = (1 << 46) - 1; // 46-bit tag from the low bits of the slot hash
 const SAMPLE_DIV: usize = 32; // dense = document frequency >= 1/32 (measured on a sample)
-const MAX_DENSE: usize = 256; // bitset rows per shard, at most (the most frequent terms)
+const MAX_DENSE: usize = 384; // bitset rows per shard, at most (the most frequent terms)
 const BUCKET: usize = 256; // sparse term ids per log bucket
 const K_MUL: u64 = 0x517c_c1b7_2722_0a95;
+const POS_MASK: [u64; 6] = [
+    0xAAAA_AAAA_AAAA_AAAA,
+    0xCCCC_CCCC_CCCC_CCCC,
+    0xF0F0_F0F0_F0F0_F0F0,
+    0xFF00_FF00_FF00_FF00,
+    0xFFFF_0000_FFFF_0000,
+    0xFFFF_FFFF_0000_0000,
+];
+
 // SAFETY: same mmap declaration as the current track (POSIX ABI, fixed-width arguments).
 unsafe extern "C" {
     fn mmap(a: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut c_void;
     fn prctl(option: i32, ...) -> i32;
-    fn malloc_trim(pad: usize) -> i32;
 }
 
 #[derive(Clone, Copy)]
@@ -71,12 +78,6 @@ fn mix64(mut x: u64) -> u64 {
     x ^ (x >> 31)
 }
 
-#[inline(always)]
-fn wymix(a: u64, b: u64) -> u64 {
-    let r = (a as u128).wrapping_mul(b as u128);
-    (r as u64) ^ ((r >> 64) as u64)
-}
-
 /// Key of a query term: up to 16 bytes are stored verbatim (lo, hi); 17..=32 bytes are hashed
 /// exactly like the tokenizer hashes document tokens; longer terms never match (key (0, 0)).
 fn pack(term: &[u8]) -> (u64, u64) {
@@ -97,10 +98,10 @@ fn pack(term: &[u8]) -> (u64, u64) {
 
 #[inline(always)]
 fn slot_hash(k: (u64, u64), seed: u64) -> u64 {
-    wymix(
-        k.0 ^ seed,
-        k.1.wrapping_add(k.0.rotate_left(23)) ^ seed.wrapping_mul(K_MUL),
-    )
+    let a = k.0.wrapping_add(seed);
+    let b = k.1.wrapping_add(seed.wrapping_mul(K_MUL)) ^ k.0.rotate_left(29) ^ K_MUL;
+    let r = (a as u128).wrapping_mul(b as u128);
+    (r as u64) ^ ((r >> 64) as u64)
 }
 
 #[derive(Default)]
@@ -180,7 +181,7 @@ impl Vocab {
             "vocabulary too large for table ids"
         );
         let mut bits = 4u32;
-        while (4usize << bits) * 7 < keys.len() * 8 {
+        while (4usize << bits) * 2 < keys.len() * 3 {
             bits += 1;
         }
         let mask = (1usize << bits) - 1;
@@ -392,7 +393,7 @@ unsafe fn scan_avx2<F: FnMut(usize, Option<(u64, u64)>) -> bool>(
             bits &= bits - 1;
             let pos = p + b;
             let run = (!(alnum >> b)).trailing_zeros() as usize;
-            if b + run < 64 && run <= 16 && pos + 16 <= n {
+            if b + run < 64 && run <= 15 && pos + 16 <= n {
                 // SAFETY: guarded loads remain within t and BMI2 is enabled on this target path.
                 unsafe {
                     let ptr = t.as_ptr().add(pos);
@@ -537,11 +538,6 @@ impl Shard {
 }
 
 /// Indexes one shard; sparse hits are compacted bucket-by-bucket into an exact-sized arena.
-struct IndexScratch {
-    logs: Vec<Vec<u32>>,
-    seen: Vec<u32>,
-}
-
 fn index_shard(
     docs: &[u8],
     a: usize,
@@ -549,17 +545,15 @@ fn index_shard(
     nd: usize,
     vocab: &Vocab,
     d_count: usize,
-    kept: usize,
-    sc: &mut IndexScratch,
+    nterms: usize,
 ) -> Shard {
     let words = nd.div_ceil(64);
-    let nb = (kept - d_count).div_ceil(BUCKET);
-    for log in &mut sc.logs {
-        log.clear();
-    }
-    sc.seen.fill(u32::MAX);
+    let nb = (nterms - d_count).div_ceil(BUCKET);
+    let cap = ((b - a) / 64 / nb.max(1)).max(32);
+    let mut logs: Vec<Vec<u32>> = (0..nb).map(|_| Vec::with_capacity(cap)).collect();
     let mut bits = vec![0u64; d_count * words];
     let mut spans = Vec::with_capacity(nd);
+    let mut seen = [u32::MAX; 1024];
     let mut pos = a;
     let mut d = 0usize;
     while pos < b {
@@ -571,22 +565,21 @@ fn index_shard(
                 let Some(k) = tok else {
                     return true;
                 };
-                let c = vocab.code(k);
-                if c < kept as u32 {
-                    let c = c as usize;
+                let c = vocab.code(k) as usize;
+                if c < nterms {
                     if c < d_count {
-                        // SAFETY: c and the document word lie in the allocated dense rows.
+                        // SAFETY: term and document word are within the dense row allocation.
                         unsafe {
                             *bits.get_unchecked_mut(c * words + (d >> 6)) |= bit;
                         }
                     } else {
                         let r = c - d_count;
                         let entry = ((r % BUCKET) as u32) << 16 | du;
-                        // The compact tag is exact through u16::MAX sparse ids; larger ids bypass
-                        // it and are deduplicated by the exact per-bucket pass below.
+                        // This exact packed tag handles the first 65,536 sparse terms; higher ids
+                        // bypass the filter and are deduplicated during the bucket compaction.
                         let fresh = if r <= u16::MAX as usize {
                             let tag = ((r as u32) << 16) | du;
-                            let slot = &mut sc.seen[r & 2047];
+                            let slot = &mut seen[r & 1023];
                             if *slot == tag {
                                 false
                             } else {
@@ -597,7 +590,7 @@ fn index_shard(
                             true
                         };
                         if fresh {
-                            sc.logs[r / BUCKET].push(entry);
+                            logs[r / BUCKET].push(entry);
                         }
                     }
                 }
@@ -617,55 +610,56 @@ fn index_shard(
         "line count changed between the cut pass and indexing"
     );
 
-    let mut offs = Vec::with_capacity(kept - d_count + 1);
+    let mut offs: Vec<u32> = Vec::with_capacity(nterms - d_count + 1);
     let mut cnt = [0u32; BUCKET];
     let mut last = [u32::MAX; BUCKET];
-    let mut total = 0usize;
-    for (k, log) in sc.logs.iter_mut().take(nb).enumerate() {
+    let mut total_postings = 0usize;
+    for (k, log) in logs.iter_mut().enumerate() {
         cnt.fill(0);
         last.fill(u32::MAX);
-        let mut w = 0;
+        let mut w = 0usize;
         for i in 0..log.len() {
             let e = log[i];
-            let (term, doc) = ((e >> 16) as usize, e & 0xffff);
-            if last[term] != doc {
-                last[term] = doc;
-                cnt[term] += 1;
+            let (kk, doc) = ((e >> 16) as usize, e & 0xFFFF);
+            if last[kk] != doc {
+                last[kk] = doc;
+                cnt[kk] += 1;
                 log[w] = e;
                 w += 1;
             }
         }
         log.truncate(w);
-        let lim = (kept - d_count - k * BUCKET).min(BUCKET);
-        for n in 0..lim {
-            offs.push(total as u32);
-            total += cnt[n] as usize;
+        let base_t = k * BUCKET;
+        let lim = (nterms - d_count - base_t).min(BUCKET);
+        for kk in 0..lim {
+            offs.push(total_postings as u32);
+            total_postings += cnt[kk] as usize;
         }
     }
-    offs.push(total as u32);
+    offs.push(total_postings as u32);
 
-    let mut arena = Vec::<u16>::with_capacity(total);
-    let ptr = arena.as_mut_ptr();
+    let mut arena: Vec<u16> = Vec::with_capacity(total_postings);
+    let arena_ptr = arena.as_mut_ptr();
     let mut start = [0usize; BUCKET];
-    for (k, log) in sc.logs.iter().take(nb).enumerate() {
-        let base = k * BUCKET;
-        let lim = (kept - d_count - base).min(BUCKET);
-        for n in 0..lim {
-            start[n] = offs[base + n] as usize;
+    for (k, log) in logs.into_iter().enumerate() {
+        let base_t = k * BUCKET;
+        let lim = (nterms - d_count - base_t).min(BUCKET);
+        for kk in 0..lim {
+            start[kk] = offs[base_t + kk] as usize;
         }
-        for &e in log {
-            let term = (e >> 16) as usize;
-            // SAFETY: offsets from the exact count pass reserve disjoint term ranges.
+        for e in log {
+            let kk = (e >> 16) as usize;
+            // SAFETY: the count pass bounds each term's disjoint scatter range.
             unsafe {
-                let at = *start.get_unchecked(term);
-                *ptr.add(at) = e as u16;
-                *start.get_unchecked_mut(term) = at + 1;
+                let p = *start.get_unchecked(kk);
+                *arena_ptr.add(p) = e as u16;
+                *start.get_unchecked_mut(kk) = p + 1;
             }
         }
     }
-    // SAFETY: the scatter wrote exactly total postings into the reserved allocation.
+    // SAFETY: the scatter initialized exactly total_postings elements.
     unsafe {
-        arena.set_len(total);
+        arena.set_len(total_postings);
     }
     Shard {
         base: 0,
@@ -1025,9 +1019,16 @@ impl Acc10 {
                     }
                     let first = base + 64 * i as u32;
                     let mut r = w;
-                    while r != 0 {
-                        self.push(first + r.trailing_zeros());
+                    while r != 0 && self.len < 10 {
+                        self.ids[self.len] = first + r.trailing_zeros();
+                        self.len += 1;
                         r &= r - 1;
+                    }
+                    let c = w.count_ones() as u64;
+                    self.count += c;
+                    self.sum += c * first as u64;
+                    for (k, &m) in POS_MASK.iter().enumerate() {
+                        self.sum += ((w & m).count_ones() as u64) << k;
                     }
                 }
             }
@@ -1229,18 +1230,14 @@ fn run(docs: &[u8]) -> io::Result<()> {
         .take_while(|&i| is_dense(order[i]))
         .count()
         .min(MAX_DENSE);
-    let mut map = vec![NONE; nterms];
+    // Discarded terms map to a nonzero sentinel, preserving vocabulary spill chains.
+    let mut map = vec![kept as u32; nterms];
     for (new, &old) in order.iter().enumerate() {
         map[old] = new as u32;
     }
-    let kept_keys: Vec<(u64, u64)> = order.iter().map(|&old| terms.keys[old]).collect();
+    vocab.remap(&map);
     let meta: Vec<(u8, u8, u8)> = order.iter().map(|&old| terms.meta[old]).collect();
     drop(terms);
-    drop(scount);
-    drop(order);
-    drop(vocab);
-    let vocab = Vocab::build(&kept_keys);
-    drop(kept_keys);
     for q in &mut queries {
         if let Query::Bool { terms: t, len, .. } = q {
             for x in &mut t[..*len as usize] {
