@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 const MAX_THREADS: usize = 12;
+const INDEX_THREADS: usize = 6;
 const MAX_DOCS: usize = 65_534; // local doc ids are u16 and 0 is never used as a sentinel here
 const BLOCK: usize = 256; // queries per work item
 const NONE: u32 = u32::MAX; // table code of a token that is not a query term
@@ -16,7 +17,7 @@ const ID_BITS: u32 = 18; // table payload is id + 1, so ids stay below 2^18 - 1
 const ID_MASK: u64 = (1 << ID_BITS) - 1;
 const TAG_MASK: u64 = (1 << 46) - 1; // 46-bit tag from the low bits of the slot hash
 const SAMPLE_DIV: usize = 32; // dense = document frequency >= 1/32 (measured on a sample)
-const MAX_DENSE: usize = 256; // bitset rows per shard, at most (the most frequent terms)
+const MAX_DENSE: usize = 384; // bitset rows per shard, at most (the most frequent terms)
 const BUCKET: usize = 256; // sparse term ids per log bucket
 const K_MUL: u64 = 0x517c_c1b7_2722_0a95;
 const POS_MASK: [u64; 6] = [
@@ -1249,7 +1250,7 @@ fn run(docs: &[u8]) -> io::Result<()> {
 
     // Index every shard on its own thread (no shared writes, no barrier).
     let mut shards: Vec<Shard> = par_map(
-        threads,
+        threads.min(INDEX_THREADS),
         n,
         || (),
         |i, _| index_shard(docs, cuts[i], cuts[i + 1], counts[i], &vocab, d_count, kept),
