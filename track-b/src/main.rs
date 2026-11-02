@@ -16,7 +16,7 @@ const ID_BITS: u32 = 18; // table payload is id + 1, so ids stay below 2^18 - 1
 const ID_MASK: u64 = (1 << ID_BITS) - 1;
 const TAG_MASK: u64 = (1 << 46) - 1; // 46-bit tag from the low bits of the slot hash
 const SAMPLE_DIV: usize = 32; // dense = document frequency >= 1/32 (measured on a sample)
-const MAX_DENSE: usize = 512; // bitset rows per shard, at most (the most frequent terms)
+const MAX_DENSE: usize = 384; // bitset rows per shard, at most (the most frequent terms)
 const BUCKET: usize = 256; // sparse term ids per log bucket
 const K_MUL: u64 = 0x517c_c1b7_2722_0a95;
 const POS_MASK: [u64; 6] = [
@@ -43,8 +43,14 @@ enum Op {
 
 #[derive(Clone, Copy)]
 enum Query {
-    Bool { terms: [u32; 6], ops: [Op; 5], len: u8 },
-    Phrase { plan: u32 },
+    Bool {
+        terms: [u32; 6],
+        ops: [Op; 5],
+        len: u8,
+    },
+    Phrase {
+        plan: u32,
+    },
 }
 
 /// Phrase plan. `keys` and `terms` follow phrase order; `dterms` are the distinct terms,
@@ -57,6 +63,8 @@ struct PhrasePlan {
     dterms: [u32; 8],
     dn: u8,
     seed_positions: u8,
+    seed_meta: (u8, u8, u8),
+    bad: bool,
 }
 
 // ---------------------------------------------------------------- hashing
@@ -77,7 +85,9 @@ fn pack(term: &[u8]) -> (u64, u64) {
         return (0, 0);
     }
     let mut b = [0u8; 32];
-    b[..term.len()].copy_from_slice(term);
+    for (d, &c) in b[..term.len()].iter_mut().zip(term) {
+        *d = c | 0x20;
+    }
     let w = |i: usize| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap());
     if term.len() <= 16 {
         return (w(0), w(1));
@@ -86,11 +96,12 @@ fn pack(term: &[u8]) -> (u64, u64) {
     (lo, mix64(w(1) ^ w(3).rotate_left(37) ^ lo) | (1u64 << 63))
 }
 
-/// One multiply plus one finalizer. The seed enters through the multiplier input, so two keys
-/// that collide under one seed (only possible with different `hi` words) rarely do under the next.
 #[inline(always)]
 fn slot_hash(k: (u64, u64), seed: u64) -> u64 {
-    mix64(k.0 ^ (k.1 ^ seed).wrapping_mul(K_MUL))
+    let a = k.0.wrapping_add(seed);
+    let b = k.1.wrapping_add(seed.wrapping_mul(K_MUL)) ^ k.0.rotate_left(29) ^ K_MUL;
+    let r = (a as u128).wrapping_mul(b as u128);
+    (r as u64) ^ ((r >> 64) as u64)
 }
 
 #[derive(Default)]
@@ -119,7 +130,7 @@ type FxMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
 struct Terms {
     ids: FxMap<(u64, u64), u32>,
     keys: Vec<(u64, u64)>,
-    texts: Vec<([u8; 32], u8)>, // length 0 for terms longer than 32 bytes (never matched)
+    meta: Vec<(u8, u8, u8)>, // compact phrase seed metadata
 }
 
 impl Terms {
@@ -131,13 +142,15 @@ impl Terms {
         let id = self.keys.len() as u32;
         self.ids.insert(k, id);
         self.keys.push(k);
-        let mut text = [0u8; 32];
-        let mut len = 0u8;
-        if term.len() <= 32 {
-            text[..term.len()].copy_from_slice(term);
-            len = term.len() as u8;
-        }
-        self.texts.push((text, len));
+        self.meta.push(if (1..=32).contains(&term.len()) {
+            (
+                term[0] | 0x20,
+                term[term.len() - 1] | 0x20,
+                term.len() as u8,
+            )
+        } else {
+            (0, 0, 0)
+        });
         id
     }
 }
@@ -163,7 +176,10 @@ struct Vocab {
 
 impl Vocab {
     fn build(keys: &[(u64, u64)]) -> Vocab {
-        assert!(keys.len() < ID_MASK as usize, "vocabulary too large for table ids");
+        assert!(
+            keys.len() < ID_MASK as usize,
+            "vocabulary too large for table ids"
+        );
         let mut bits = 4u32;
         while (4usize << bits) * 2 < keys.len() * 3 {
             bits += 1;
@@ -189,7 +205,11 @@ impl Vocab {
                 seed,
                 shift: 64 - bits,
             };
-            if keys.iter().enumerate().all(|(id, &k)| v.code(k) == id as u32) {
+            if keys
+                .iter()
+                .enumerate()
+                .all(|(id, &k)| v.code(k) == id as u32)
+            {
                 return v;
             }
             seed += 1;
@@ -277,80 +297,34 @@ fn mapped(t: &[u8], i: usize) -> u8 {
     unsafe { BYTE_MAP[*t.get_unchecked(i) as usize] }
 }
 
-/// Tokenizes t[i..] up to the first LF (or the end). `f` receives each token's key (None for a
-/// token longer than 32 bytes, which still occupies a position) plus its byte offset, and
-/// returns false to stop early. Returns the index where the scan stopped: the LF, or t.len().
+#[inline(always)]
+fn token_key(t: &[u8], s: usize) -> Option<(u64, u64)> {
+    let mut e = s + 1;
+    while e < t.len() && BYTE_MAP[t[e] as usize] != 0 {
+        e += 1;
+    }
+    (e - s <= 32).then(|| pack(&t[s..e]))
+}
+
 #[inline(always)]
 fn scan<F: FnMut(usize, Option<(u64, u64)>) -> bool>(t: &[u8], mut i: usize, mut f: F) -> usize {
     let n = t.len();
     while i < n {
-        let c = mapped(t, i);
-        if c == 0 {
+        if mapped(t, i) == 0 {
             if t[i] == b'\n' {
                 return i;
             }
             i += 1;
             continue;
         }
-        let token_start = i;
-        let mut lo = c as u64;
-        let mut shift = 8u32;
+        let s = i;
         i += 1;
-        while i < n && shift < 64 {
-            let b = mapped(t, i);
-            if b == 0 {
-                break;
-            }
-            lo |= (b as u64) << shift;
-            shift += 8;
+        while i < n && mapped(t, i) != 0 {
             i += 1;
         }
-        let key = 'tok: {
-            if i == n || mapped(t, i) == 0 {
-                break 'tok Some((lo, 0));
-            }
-            let mut hi = 0u64;
-            shift = 0;
-            while i < n && shift < 64 {
-                let b = mapped(t, i);
-                if b == 0 {
-                    break;
-                }
-                hi |= (b as u64) << shift;
-                shift += 8;
-                i += 1;
-            }
-            if i == n || mapped(t, i) == 0 {
-                break 'tok Some((lo, hi));
-            }
-            let mut extra = [0u8; 16];
-            let mut m = 0usize;
-            while i < n {
-                let b = mapped(t, i);
-                if b == 0 {
-                    break;
-                }
-                if m < 16 {
-                    extra[m] = b;
-                }
-                m += 1;
-                i += 1;
-            }
-            if m > 16 {
-                break 'tok None;
-            }
-            let w2 = u64::from_le_bytes(extra[0..8].try_into().unwrap());
-            let w3 = u64::from_le_bytes(extra[8..16].try_into().unwrap());
-            let h_lo = mix64(lo ^ w2.rotate_left(17) ^ (16 + m) as u64).max(1);
-            Some((h_lo, mix64(hi ^ w3.rotate_left(37) ^ h_lo) | (1u64 << 63)))
-        };
-        if !f(token_start, key) {
+        if !f(s, (i - s <= 32).then(|| pack(&t[s..i]))) {
             return n;
         }
-        if i < n && t[i] == b'\n' {
-            return i;
-        }
-        i += 1;
     }
     n
 }
@@ -363,19 +337,16 @@ unsafe fn classify64(p: *const u8) -> (u64, u64) {
         let v0 = _mm256_loadu_si256(p.cast::<__m256i>());
         let v1 = _mm256_loadu_si256(p.add(32).cast::<__m256i>());
         let alnum = |v: __m256i| {
+            let vl = _mm256_or_si256(v, _mm256_set1_epi8(0x20));
             let d = _mm256_and_si256(
                 _mm256_cmpgt_epi8(v, _mm256_set1_epi8(0x2F)),
                 _mm256_cmpgt_epi8(_mm256_set1_epi8(0x3A), v),
             );
-            let u = _mm256_and_si256(
-                _mm256_cmpgt_epi8(v, _mm256_set1_epi8(0x40)),
-                _mm256_cmpgt_epi8(_mm256_set1_epi8(0x5B), v),
+            let a = _mm256_and_si256(
+                _mm256_cmpgt_epi8(vl, _mm256_set1_epi8(0x60)),
+                _mm256_cmpgt_epi8(_mm256_set1_epi8(0x7B), vl),
             );
-            let l = _mm256_and_si256(
-                _mm256_cmpgt_epi8(v, _mm256_set1_epi8(0x60)),
-                _mm256_cmpgt_epi8(_mm256_set1_epi8(0x7B), v),
-            );
-            _mm256_or_si256(d, _mm256_or_si256(u, l))
+            _mm256_or_si256(d, a)
         };
         let nl = _mm256_set1_epi8(b'\n' as i8);
         let a = (_mm256_movemask_epi8(alnum(v0)) as u32 as u64)
@@ -386,54 +357,14 @@ unsafe fn classify64(p: *const u8) -> (u64, u64) {
     }
 }
 
-/// Key of the token starting at s. Tokens of 1..=15 bytes take a 16-byte load; anything
-/// longer (or too close to the end of the buffer) uses the exact scalar tokenizer.
-#[inline(always)]
-unsafe fn token_key(t: &[u8], s: usize) -> Option<(u64, u64)> {
-    if s + 16 <= t.len() {
-        // SAFETY: s + 16 <= t.len().
-        unsafe {
-            let v = _mm_loadu_si128(t.as_ptr().add(s).cast::<__m128i>());
-            let up = _mm_and_si128(
-                _mm_cmpgt_epi8(v, _mm_set1_epi8(0x40)),
-                _mm_cmpgt_epi8(_mm_set1_epi8(0x5B), v),
-            );
-            let lo_c = _mm_and_si128(
-                _mm_cmpgt_epi8(v, _mm_set1_epi8(0x60)),
-                _mm_cmpgt_epi8(_mm_set1_epi8(0x7B), v),
-            );
-            let dg = _mm_and_si128(
-                _mm_cmpgt_epi8(v, _mm_set1_epi8(0x2F)),
-                _mm_cmpgt_epi8(_mm_set1_epi8(0x3A), v),
-            );
-            let alnum = (_mm_movemask_epi8(_mm_or_si128(up, _mm_or_si128(lo_c, dg))) as u32) & 0xFFFF;
-            if alnum != 0xFFFF {
-                let len = (!alnum).trailing_zeros() as usize; // 1..=15
-                // Setting bit 5 lower-cases A-Z and leaves digits and a-z unchanged; bytes past
-                // the token are masked off below.
-                let lowered = _mm_or_si128(v, _mm_set1_epi8(0x20));
-                let w0 = _mm_cvtsi128_si64(lowered) as u64;
-                let w1 = _mm_cvtsi128_si64(_mm_unpackhi_epi64(lowered, lowered)) as u64;
-                let lo = w0 & (u64::MAX >> (64 - 8 * len.min(8)));
-                let hi = w1 & ((1u64 << (8 * (len.max(8) - 8))) - 1);
-                return Some((lo, hi));
-            }
-        }
-    }
-    // Exact scalar path for long tokens and the last few bytes of the buffer.
-    let end = s + t[s..].iter().take_while(|&&c| BYTE_MAP[c as usize] != 0).count();
-    let mut key = None;
-    scan(&t[s..end], 0, |_, k| {
-        key = k;
-        true
-    });
-    key
-}
-
 /// Same contract as `scan`, for text that starts at a token boundary: it classifies 64 bytes
 /// per step and visits token starts found in the masks instead of every byte.
 #[target_feature(enable = "avx2,bmi1,bmi2,popcnt")]
-unsafe fn scan_avx2<F: FnMut(usize, Option<(u64, u64)>) -> bool>(t: &[u8], i0: usize, mut f: F) -> usize {
+unsafe fn scan_avx2<F: FnMut(usize, Option<(u64, u64)>) -> bool>(
+    t: &[u8],
+    i0: usize,
+    mut f: F,
+) -> usize {
     let n = t.len();
     let mut prev = 0u64; // 1 when the byte before the current block is alphanumeric
     let mut p = i0;
@@ -452,13 +383,33 @@ unsafe fn scan_avx2<F: FnMut(usize, Option<(u64, u64)>) -> bool>(t: &[u8], i0: u
         let starts = alnum & !((alnum << 1) | prev);
         prev = alnum >> 63;
         let limit = if lf != 0 { lf.trailing_zeros() } else { 64 };
-        let mut bits = if limit >= 64 { starts } else { starts & ((1u64 << limit) - 1) };
+        let mut bits = if limit >= 64 {
+            starts
+        } else {
+            starts & ((1u64 << limit) - 1)
+        };
         while bits != 0 {
             let b = bits.trailing_zeros() as usize;
             bits &= bits - 1;
             let pos = p + b;
-            // SAFETY: pos < n.
-            if !f(pos, unsafe { token_key(t, pos) }) {
+            let run = (!(alnum >> b)).trailing_zeros() as usize;
+            if b + run < 64 && run <= 15 && pos + 16 <= n {
+                // SAFETY: guarded loads remain within t and BMI2 is enabled on this target path.
+                unsafe {
+                    let ptr = t.as_ptr().add(pos);
+                    let w0 = ptr.cast::<u64>().read_unaligned() | 0x2020_2020_2020_2020;
+                    let lo = _bzhi_u64(w0, (run.min(8) * 8) as u32);
+                    let hi = if run <= 8 {
+                        0
+                    } else {
+                        let w1 = ptr.add(8).cast::<u64>().read_unaligned() | 0x2020_2020_2020_2020;
+                        _bzhi_u64(w1, ((run - 8) * 8) as u32)
+                    };
+                    if !f(pos, Some((lo, hi))) {
+                        return n;
+                    }
+                }
+            } else if !f(pos, token_key(t, pos)) {
                 return n;
             }
         }
@@ -586,113 +537,130 @@ impl Shard {
     }
 }
 
-/// Copies the current 64-document window of every dense accumulator into its bitset row.
-fn flush_window(acc: &mut [u64], bits: &mut [u64], words: usize, w: usize) {
-    if words == 0 {
-        return;
-    }
-    for (r, a) in acc.iter_mut().enumerate() {
-        bits[r * words + w] = *a;
-        *a = 0;
-    }
-}
-
-/// Indexes documents [a, b) (`nd` of them) in one sequential scan. Dense terms (ids below
-/// d_count) set bits in a 64-document accumulator that stays in L1. Sparse hits are appended to
-/// a per-bucket log, and each bucket is then drained into exact, duplicate-free lists, so the
-/// random writes of a whole-corpus pass are replaced by small, cache-local ones. Every token
-/// performs the same stores whatever it is: dense and absent tokens land in a scratch
-/// accumulator slot and a scratch log that is never advanced, so the loop has no branch that
-/// depends on the token.
-fn index_shard(docs: &[u8], a: usize, b: usize, nd: usize, vocab: &Vocab, d_count: usize, nterms: usize) -> Shard {
+/// Indexes one shard; sparse hits are compacted bucket-by-bucket into an exact-sized arena.
+fn index_shard(
+    docs: &[u8],
+    a: usize,
+    b: usize,
+    nd: usize,
+    vocab: &Vocab,
+    d_count: usize,
+    nterms: usize,
+) -> Shard {
     let words = nd.div_ceil(64);
     let nb = (nterms - d_count).div_ceil(BUCKET);
-    let cap = ((b - a) / 16 / nb.max(1)).max(16);
-    let mut logs: Vec<Vec<u32>> = (0..=nb).map(|_| Vec::with_capacity(cap)).collect(); // logs[nb]: scratch
-    let mut acc = vec![0u64; d_count + 1]; // acc[d_count]: scratch
+    let cap = ((b - a) / 64 / nb.max(1)).max(32);
+    let mut logs: Vec<Vec<u32>> = (0..nb).map(|_| Vec::with_capacity(cap)).collect();
     let mut bits = vec![0u64; d_count * words];
     let mut spans = Vec::with_capacity(nd);
-    let mut window = 0usize;
+    let mut seen = [u32::MAX; 1024];
     let mut pos = a;
     let mut d = 0usize;
     while pos < b {
-        if d >> 6 != window {
-            flush_window(&mut acc[..d_count], &mut bits, words, window);
-            window = d >> 6;
-        }
         let du = d as u32;
         let bit = 1u64 << (d & 63);
         let tab = text_start(docs, pos, b);
         let end = match tab {
             Some(ts) => scan_fast(&docs[..b], ts, |_, tok| {
-                let c = tok.map_or(NONE, |k| vocab.code(k)) as usize;
-                let r = c.wrapping_sub(d_count); // sparse term index; huge for dense and absent
-                let kb = (r / BUCKET).min(nb); // nb for dense and absent tokens
-                // SAFETY: c.min(d_count) <= d_count < acc.len() and kb <= nb < logs.len(); the
-                // write lands inside the reserved capacity, and the length only grows for kb < nb.
-                unsafe {
-                    *acc.get_unchecked_mut(c.min(d_count)) |= bit;
-                    let log = logs.get_unchecked_mut(kb);
-                    if log.len() == log.capacity() {
-                        log.reserve(1);
+                let Some(k) = tok else {
+                    return true;
+                };
+                let c = vocab.code(k) as usize;
+                if c < nterms {
+                    if c < d_count {
+                        // SAFETY: term and document word are within the dense row allocation.
+                        unsafe {
+                            *bits.get_unchecked_mut(c * words + (d >> 6)) |= bit;
+                        }
+                    } else {
+                        let r = c - d_count;
+                        let entry = ((r % BUCKET) as u32) << 16 | du;
+                        // This exact packed tag handles the first 65,536 sparse terms; higher ids
+                        // bypass the filter and are deduplicated during the bucket compaction.
+                        let fresh = if r <= u16::MAX as usize {
+                            let tag = ((r as u32) << 16) | du;
+                            let slot = &mut seen[r & 1023];
+                            if *slot == tag {
+                                false
+                            } else {
+                                *slot = tag;
+                                true
+                            }
+                        } else {
+                            true
+                        };
+                        if fresh {
+                            logs[r / BUCKET].push(entry);
+                        }
                     }
-                    let len = log.len();
-                    log.as_mut_ptr().add(len).write(((r % BUCKET) as u32) << 16 | du);
-                    log.set_len(len + (kb < nb) as usize);
                 }
                 true
             }),
-            None => docs[pos..b].iter().position(|&x| x == b'\n').map_or(b, |p| pos + p),
+            None => docs[pos..b]
+                .iter()
+                .position(|&x| x == b'\n')
+                .map_or(b, |p| pos + p),
         };
         spans.push((tab.unwrap_or(end) as u32, end as u32));
         pos = end + 1;
         d += 1;
     }
-    flush_window(&mut acc[..d_count], &mut bits, words, window);
-    assert_eq!(d, nd, "line count changed between the cut pass and indexing");
+    assert_eq!(
+        d, nd,
+        "line count changed between the cut pass and indexing"
+    );
 
-    let mut arena: Vec<u16> = Vec::new();
     let mut offs: Vec<u32> = Vec::with_capacity(nterms - d_count + 1);
     let mut cnt = [0u32; BUCKET];
     let mut last = [u32::MAX; BUCKET];
-    let mut start = [0usize; BUCKET];
-    for (k, log) in logs.iter().take(nb).enumerate() {
-        // Pass 1: exact per-term counts. Entries are in document order, so `last` removes
-        // repeats of a term inside one document.
+    let mut total_postings = 0usize;
+    for (k, log) in logs.iter_mut().enumerate() {
         cnt.fill(0);
         last.fill(u32::MAX);
-        for &e in log {
+        let mut w = 0usize;
+        for i in 0..log.len() {
+            let e = log[i];
             let (kk, doc) = ((e >> 16) as usize, e & 0xFFFF);
             if last[kk] != doc {
                 last[kk] = doc;
                 cnt[kk] += 1;
+                log[w] = e;
+                w += 1;
             }
         }
-        // Pass 2: place every list at its offset in the shared arena.
-        let mut run = arena.len();
-        for kk in 0..BUCKET {
-            start[kk] = run;
-            run += cnt[kk] as usize;
+        log.truncate(w);
+        let base_t = k * BUCKET;
+        let lim = (nterms - d_count - base_t).min(BUCKET);
+        for kk in 0..lim {
+            offs.push(total_postings as u32);
+            total_postings += cnt[kk] as usize;
         }
-        arena.resize(run, 0);
-        let mut fill = start;
-        last.fill(u32::MAX);
-        for &e in log {
-            let (kk, doc) = ((e >> 16) as usize, e & 0xFFFF);
-            if last[kk] != doc {
-                last[kk] = doc;
-                arena[fill[kk]] = doc as u16;
-                fill[kk] += 1;
-            }
+    }
+    offs.push(total_postings as u32);
+
+    let mut arena: Vec<u16> = Vec::with_capacity(total_postings);
+    let arena_ptr = arena.as_mut_ptr();
+    let mut start = [0usize; BUCKET];
+    for (k, log) in logs.into_iter().enumerate() {
+        let base_t = k * BUCKET;
+        let lim = (nterms - d_count - base_t).min(BUCKET);
+        for kk in 0..lim {
+            start[kk] = offs[base_t + kk] as usize;
         }
-        for kk in 0..BUCKET {
-            if d_count + k * BUCKET + kk < nterms {
-                offs.push(start[kk] as u32);
+        for e in log {
+            let kk = (e >> 16) as usize;
+            // SAFETY: the count pass bounds each term's disjoint scatter range.
+            unsafe {
+                let p = *start.get_unchecked(kk);
+                *arena_ptr.add(p) = e as u16;
+                *start.get_unchecked_mut(kk) = p + 1;
             }
         }
     }
-    offs.push(arena.len() as u32);
-    drop(logs);
+    // SAFETY: the scatter initialized exactly total_postings elements.
+    unsafe {
+        arena.set_len(total_postings);
+    }
     Shard {
         base: 0,
         words,
@@ -723,7 +691,10 @@ fn sample_counts(part: &[u8], vocab: &Vocab, nterms: usize) -> (Vec<u32>, usize)
                 }
                 true
             }),
-            None => part[pos..].iter().position(|&x| x == b'\n').map_or(part.len(), |p| pos + p),
+            None => part[pos..]
+                .iter()
+                .position(|&x| x == b'\n')
+                .map_or(part.len(), |p| pos + p),
         };
         pos = end + 1;
         d += 1;
@@ -764,6 +735,7 @@ fn parse_queries(qb: &[u8], terms: &mut Terms) -> (Vec<Query>, Vec<PhrasePlan>) 
             let mut p = PhrasePlan::default();
             for term in line[8..line.len() - 1].split(|&b| b == b' ') {
                 let id = terms.intern(term);
+                p.bad |= term.is_empty() || term.len() > 32;
                 p.terms[p.len as usize] = id;
                 p.keys[p.len as usize] = terms.keys[id as usize];
                 p.len += 1;
@@ -807,18 +779,19 @@ fn phrase_at(text: &[u8], anchor: usize, anchor_pos: usize, keys: &[(u64, u64)])
     matched == keys.len()
 }
 
-/// Occurrence of the rarest term at byte `p` as a whole token, plus an exact phrase match
-/// for any of its phrase positions.
 #[inline]
-fn at(text: &[u8], p: usize, seed: &[u8], positions: u8, keys: &[(u64, u64)]) -> bool {
-    let (n, l) = (text.len(), seed.len());
-    if (p > 0 && text[p - 1].is_ascii_alphanumeric()) || p + l > n {
+fn at(
+    text: &[u8],
+    p: usize,
+    (b0, blast, l): (u8, u8, u8),
+    positions: u8,
+    keys: &[(u64, u64)],
+) -> bool {
+    let (n, l) = (text.len(), l as usize);
+    if (p > 0 && mapped(text, p - 1) != 0) || p + l > n || (p + l < n && mapped(text, p + l) != 0) {
         return false;
     }
-    if !text[p..p + l].iter().zip(seed).all(|(&x, &y)| x.to_ascii_lowercase() == y) {
-        return false;
-    }
-    if p + l < n && text[p + l].is_ascii_alphanumeric() {
+    if (text[p] | 0x20) != b0 || (text[p + l - 1] | 0x20) != blast {
         return false;
     }
     let mut mask = positions;
@@ -835,12 +808,12 @@ fn at(text: &[u8], p: usize, seed: &[u8], positions: u8, keys: &[(u64, u64)]) ->
 /// Finds the rarest term's occurrences in a candidate document with a 16-byte prefilter on its
 /// first byte (case-folded), then checks each occurrence with `at`. The prefilter can pass
 /// extra bytes but never misses a real occurrence.
-fn verify(text: &[u8], seed: &[u8], positions: u8, keys: &[(u64, u64)]) -> bool {
-    let (n, l) = (text.len(), seed.len());
+fn verify(text: &[u8], seed: (u8, u8, u8), positions: u8, keys: &[(u64, u64)]) -> bool {
+    let (n, l) = (text.len(), seed.2 as usize);
     if l == 0 || l > n {
         return false;
     }
-    let b0 = seed[0];
+    let b0 = seed.0;
     let mut i = 0usize;
     // SAFETY: SSE2 is part of the x86-64 baseline; each load reads 16 bytes at i with i + 16 <= n.
     unsafe {
@@ -907,7 +880,14 @@ fn mark(v: SetView<'_>, out: &mut [u64]) {
 
 /// One binary BOOL operation (left op right). Writes a bitset into `ob` and returns true when
 /// the result is a bitset, or writes a sorted list into `ol` and returns false.
-fn combine(l: SetView<'_>, r: SetView<'_>, op: Op, w: usize, ob: &mut [u64], ol: &mut Vec<u16>) -> bool {
+fn combine(
+    l: SetView<'_>,
+    r: SetView<'_>,
+    op: Op,
+    w: usize,
+    ob: &mut [u64],
+    ol: &mut Vec<u16>,
+) -> bool {
     match (op, l, r) {
         (Op::And, SetView::Bits(lw), SetView::Bits(rw)) => {
             for i in 0..w {
@@ -920,7 +900,15 @@ fn combine(l: SetView<'_>, r: SetView<'_>, op: Op, w: usize, ob: &mut [u64], ol:
             ol.extend(rl.iter().copied().filter(|&x| l.contains(x)));
             false
         }
-        (Op::And, SetView::List(ll), _) => {
+        (Op::And, SetView::List(a), SetView::List(b)) => {
+            ol.clear();
+            let (sm, lg) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+            if !lg.is_empty() {
+                ol.extend(sm.iter().copied().filter(|&x| lg.binary_search(&x).is_ok()));
+            }
+            false
+        }
+        (Op::And, SetView::List(ll), r) => {
             ol.clear();
             ol.extend(ll.iter().copied().filter(|&x| r.contains(x)));
             false
@@ -1056,7 +1044,7 @@ fn write_acc(out: &mut Vec<u8>, a: &Acc10) {
     out.push(b'\n');
 }
 
-fn eval(q: &Query, plans: &[PhrasePlan], docs: &[u8], texts: &[([u8; 32], u8)], sh: &Shard, sc: &mut Scratch, a: &mut Acc10) {
+fn eval(q: &Query, plans: &[PhrasePlan], docs: &[u8], sh: &Shard, sc: &mut Scratch, a: &mut Acc10) {
     match *q {
         Query::Bool { terms, ops, len } => {
             let m = len as usize;
@@ -1077,15 +1065,25 @@ fn eval(q: &Query, plans: &[PhrasePlan], docs: &[u8], texts: &[([u8; 32], u8)], 
                 return;
             }
             let seed = p.dterms[0];
-            let (seed_text, seed_len) = texts[seed as usize];
-            let seed_bytes = &seed_text[..seed_len as usize];
+            let seed_meta = p.seed_meta;
             let keys = &p.keys[..p.len as usize];
             let others = &p.dterms[1..p.dn as usize];
             // Candidates: documents holding every distinct term, visited rarest-term first.
+            if others
+                .iter()
+                .any(|&t| matches!(sh.view(t), SetView::List(l) if l.is_empty()))
+            {
+                return;
+            }
             sh.view(seed).each(|d| {
                 if others.iter().all(|&t| sh.view(t).contains(d)) {
                     let (s, e) = sh.spans[d as usize];
-                    if verify(&docs[s as usize..e as usize], seed_bytes, p.seed_positions, keys) {
+                    if verify(
+                        &docs[s as usize..e as usize],
+                        seed_meta,
+                        p.seed_positions,
+                        keys,
+                    ) {
                         a.push(sh.base + d as u32);
                     }
                 }
@@ -1115,14 +1113,19 @@ fn cut_and_count(docs: &[u8], threads: usize) -> (Vec<usize>, Vec<usize>) {
             .collect();
         cuts.push(docs.len());
         cuts.dedup();
-        let counts = par_map(threads, cuts.len() - 1, || (), |i, _| {
-            let part = &docs[cuts[i]..cuts[i + 1]];
-            let mut n = part.iter().filter(|&&b| b == b'\n').count();
-            if cuts[i + 1] == docs.len() && part.last() != Some(&b'\n') {
-                n += 1; // final line without LF
-            }
-            n
-        });
+        let counts = par_map(
+            threads,
+            cuts.len() - 1,
+            || (),
+            |i, _| {
+                let part = &docs[cuts[i]..cuts[i + 1]];
+                let mut n = part.iter().filter(|&&b| b == b'\n').count();
+                if cuts[i + 1] == docs.len() && part.last() != Some(&b'\n') {
+                    n += 1; // final line without LF
+                }
+                n
+            },
+        );
         if counts.iter().all(|&n| n <= MAX_DOCS) {
             return (cuts, counts);
         }
@@ -1167,12 +1170,20 @@ fn run(docs: &[u8]) -> io::Result<()> {
     let mut vocab = Vocab::build(&terms.keys);
     let snap = |raw: usize| match raw {
         0 => 0,
-        _ => docs[raw..].iter().position(|&b| b == b'\n').map_or(docs.len(), |p| raw + p + 1),
+        _ => docs[raw..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(docs.len(), |p| raw + p + 1),
     };
-    let pieces: Vec<usize> = (0..=threads).map(|k| snap(docs.len() / SAMPLE_DIV * k / threads)).collect();
-    let sampled = par_map(threads, threads, || (), |i, _| {
-        sample_counts(&docs[pieces[i]..pieces[i + 1]], &vocab, nterms)
-    });
+    let pieces: Vec<usize> = (0..=threads)
+        .map(|k| snap(docs.len() / SAMPLE_DIV * k / threads))
+        .collect();
+    let sampled = par_map(
+        threads,
+        threads,
+        || (),
+        |i, _| sample_counts(&docs[pieces[i]..pieces[i + 1]], &vocab, nterms),
+    );
     let sample_n: usize = sampled.iter().map(|p| p.1).sum();
     let mut scount = vec![0u32; nterms];
     for (part, _) in &sampled {
@@ -1182,17 +1193,50 @@ fn run(docs: &[u8]) -> io::Result<()> {
     }
     drop(sampled);
     let is_dense = |t: usize| scount[t] > 0 && scount[t] as usize * SAMPLE_DIV >= sample_n;
-    let mut order: Vec<usize> = (0..nterms).collect();
+    let mut needed = vec![false; nterms];
+    for q in &queries {
+        if let Query::Bool { terms: ts, len, .. } = q {
+            for &t in &ts[..*len as usize] {
+                needed[t as usize] = true;
+            }
+        }
+    }
+    for p in &plans {
+        if !p.bad {
+            let mut ds = [0u32; 8];
+            let mut dn = 0usize;
+            for &t in &p.terms[..p.len as usize] {
+                if !ds[..dn].contains(&t) {
+                    ds[dn] = t;
+                    dn += 1;
+                }
+            }
+            ds[..dn].sort_unstable_by_key(|&t| (scount[t as usize], t));
+            if dn > 0 {
+                needed[ds[0] as usize] = true;
+            }
+            if dn > 1 {
+                needed[ds[1] as usize] = true;
+            }
+            if dn > 2 && scount[ds[0] as usize] > 2 {
+                needed[ds[2] as usize] = true;
+            }
+        }
+    }
+    let mut order: Vec<usize> = (0..nterms).filter(|&t| needed[t]).collect();
     order.sort_unstable_by_key(|&t| (!is_dense(t), std::cmp::Reverse(scount[t]), t));
-    let d_count = (0..nterms).filter(|&t| is_dense(t)).count().min(MAX_DENSE);
-
-    // Renumber: order[new] = old. Table payloads, query terms and text all follow.
-    let mut map = vec![0u32; nterms];
+    let kept = order.len();
+    let d_count = (0..kept)
+        .take_while(|&i| is_dense(order[i]))
+        .count()
+        .min(MAX_DENSE);
+    // Discarded terms map to a nonzero sentinel, preserving vocabulary spill chains.
+    let mut map = vec![kept as u32; nterms];
     for (new, &old) in order.iter().enumerate() {
         map[old] = new as u32;
     }
     vocab.remap(&map);
-    let texts: Vec<([u8; 32], u8)> = order.iter().map(|&old| terms.texts[old]).collect();
+    let meta: Vec<(u8, u8, u8)> = order.iter().map(|&old| terms.meta[old]).collect();
     drop(terms);
     for q in &mut queries {
         if let Query::Bool { terms: t, len, .. } = q {
@@ -1208,9 +1252,22 @@ fn run(docs: &[u8]) -> io::Result<()> {
     }
 
     // Index every shard on its own thread (no shared writes, no barrier).
-    let mut shards: Vec<Shard> = par_map(threads, n, || (), |i, _| {
-        index_shard(docs, cuts[i], cuts[i + 1], counts[i], &vocab, d_count, nterms)
-    });
+    let mut shards: Vec<Shard> = par_map(
+        threads,
+        n,
+        || (),
+        |i, _| {
+            index_shard(
+                docs,
+                cuts[i],
+                cuts[i + 1],
+                counts[i],
+                &vocab,
+                d_count,
+                nterms,
+            )
+        },
+    );
     drop(vocab);
     for (i, sh) in shards.iter_mut().enumerate() {
         sh.base = bases[i];
@@ -1248,23 +1305,29 @@ fn run(docs: &[u8]) -> io::Result<()> {
         }
     }
 
-    // Phrase plans: distinct terms rarest first; the seed is the rarest one.
+    // Retained distinct phrase terms are filters ordered by exact document frequency.
     for p in &mut plans {
+        if p.bad {
+            p.dn = 0;
+            continue;
+        }
         let m = p.len as usize;
-        let mut ds = p.terms;
-        ds[..m].sort_unstable_by_key(|&t| (df[t as usize], t));
+        let mut ds = [0u32; 8];
         let mut dn = 0usize;
-        for i in 0..m {
-            if i == 0 || ds[i] != ds[i - 1] {
-                p.dterms[dn] = ds[i];
+        for &t in &p.terms[..m] {
+            if t < kept as u32 && !ds[..dn].contains(&t) {
+                ds[dn] = t;
                 dn += 1;
             }
         }
+        ds[..dn].sort_unstable_by_key(|&t| (df[t as usize], t));
+        p.dterms = ds;
         p.dn = dn as u8;
         if dn == 0 {
             continue;
         }
         let seed = p.dterms[0];
+        p.seed_meta = meta[seed as usize];
         p.seed_positions = 0;
         for i in 0..m {
             if p.terms[i] == seed {
@@ -1291,7 +1354,7 @@ fn run(docs: &[u8]) -> io::Result<()> {
             let mut accs: Vec<Acc10> = qs.iter().map(|_| Acc10::default()).collect();
             for sh in &shards {
                 for (q, a) in qs.iter().zip(accs.iter_mut()) {
-                    eval(q, &plans, docs, &texts, sh, sc, a);
+                    eval(q, &plans, docs, sh, sc, a);
                 }
             }
             let mut out = Vec::with_capacity(BLOCK * 48);
