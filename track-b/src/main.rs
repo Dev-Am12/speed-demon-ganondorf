@@ -12,9 +12,9 @@ const MAX_THREADS: usize = 12;
 const MAX_DOCS: usize = 65_534; // local doc ids are u16 and 0 is never used as a sentinel here
 const BLOCK: usize = 256; // queries per work item
 const NONE: u32 = u32::MAX; // table code of a token that is not a query term
-const ID_BITS: u32 = 18; // table payload is id + 1, so ids stay below 2^18 - 1
+const ID_BITS: u32 = 20; // table payload is id + 1; spec bound is 338,000 query terms, far below 2^20 - 1
 const ID_MASK: u64 = (1 << ID_BITS) - 1;
-const TAG_MASK: u64 = (1 << 46) - 1; // 46-bit tag from the low bits of the slot hash
+const TAG_MASK: u64 = (1 << 44) - 1; // 44-bit tag from the low bits of the slot hash
 const SAMPLE_DIV: usize = 32; // dense = document frequency >= 1/32 (measured on a sample)
 const MAX_DENSE: usize = 384; // bitset rows per shard, at most (the most frequent terms)
 const BUCKET: usize = 256; // sparse term ids per log bucket
@@ -162,16 +162,16 @@ impl Terms {
 #[repr(C, align(32))]
 struct Bucket([u64; 4]);
 
-/// Tag-only bucketed table over the distinct query terms. A slot holds
-/// (46-bit tag << 18) | (id + 1), and 0 is empty. A key goes into the first free slot of its home
-/// bucket, or of the next buckets when that one is full. A lookup compares the four tags of the
-/// home bucket with one vector compare and only walks on when the bucket is full and holds no
-/// match, so an absent token can rarely match a term (about 1e-7 per dataset, as before).
-/// Build keeps a seed only if every present term looks itself up.
+/// Bucketed table over the distinct query terms. A slot holds (44-bit tag << 20) | (id + 1), and
+/// 0 is empty. A key goes into the first free slot of its home bucket, or of the next buckets when
+/// that one is full. A tag match is only a candidate: the stored key of that term must equal the
+/// token's key, so a token never matches a term it does not equal. Build keeps a seed only if every
+/// query term finds itself.
 struct Vocab {
     buckets: Vec<Bucket>,
     seed: u64,
     shift: u32,
+    keys: Vec<(u64, u64)>, // key of each term id, for the exact check on a tag match
 }
 
 impl Vocab {
@@ -204,6 +204,7 @@ impl Vocab {
                 buckets,
                 seed,
                 shift: 64 - bits,
+                keys: keys.to_vec(),
             };
             if keys
                 .iter()
@@ -216,8 +217,8 @@ impl Vocab {
         }
     }
 
-    /// Term id of a token key, or NONE. The common cases (hit, or miss in a bucket with room)
-    /// contain no data-dependent branch.
+    /// Term id of a token key, or NONE. Every tag match in the home bucket is a candidate that
+    /// must also match the stored key; a bucket with a free slot ends the search.
     #[inline(always)]
     fn code(&self, k: (u64, u64)) -> u32 {
         let h = slot_hash(k, self.seed);
@@ -226,7 +227,7 @@ impl Vocab {
         let bk = unsafe { self.buckets.get_unchecked(b) };
         let want = (h & TAG_MASK) << ID_BITS;
         // SAFETY: Bucket is 32-byte aligned; x86-64-v3 includes AVX2 (see the Dockerfile).
-        let m = unsafe {
+        let mut m = unsafe {
             let v = _mm256_load_si256(bk.0.as_ptr().cast::<__m256i>());
             let eq = _mm256_cmpeq_epi64(
                 _mm256_and_si256(v, _mm256_set1_epi64x(!ID_MASK as i64)),
@@ -234,26 +235,32 @@ impl Vocab {
             );
             _mm256_movemask_pd(_mm256_castsi256_pd(eq)) as u32
         };
-        if (m == 0) & (bk.0[3] != 0) {
-            return self.spill(h, b);
+        while m != 0 {
+            let pay = bk.0[(m.trailing_zeros() & 3) as usize] & ID_MASK;
+            if pay != 0 && self.keys[(pay - 1) as usize] == k {
+                return (pay - 1) as u32;
+            }
+            m &= m - 1;
         }
-        let hit = (m != 0) as u64;
-        // Lane 0 is read when nothing matched; `hit - 1` is all ones then, which makes NONE.
-        let payload = bk.0[(m.trailing_zeros() & 3) as usize] & ID_MASK;
-        (payload.wrapping_sub(1) | hit.wrapping_sub(1)) as u32
+        if bk.0[3] == 0 {
+            NONE
+        } else {
+            self.spill(k, h, b)
+        }
     }
 
-    /// Continues a lookup in the buckets after a full home bucket without a match.
+    /// Continues a lookup in the buckets after a full home bucket: same candidate rule.
     #[cold]
     #[inline(never)]
-    fn spill(&self, h: u64, mut b: usize) -> u32 {
+    fn spill(&self, k: (u64, u64), h: u64, mut b: usize) -> u32 {
         let want = (h & TAG_MASK) << ID_BITS;
         loop {
             b = (b + 1) & (self.buckets.len() - 1);
             let bk = &self.buckets[b].0;
             for &e in bk {
-                if e & !ID_MASK == want {
-                    return (e & ID_MASK).wrapping_sub(1) as u32;
+                let pay = e & ID_MASK;
+                if pay != 0 && e & !ID_MASK == want && self.keys[(pay - 1) as usize] == k {
+                    return (pay - 1) as u32;
                 }
             }
             if bk[3] == 0 {

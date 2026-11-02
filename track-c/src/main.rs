@@ -148,10 +148,11 @@ unsafe fn field(q: *const u8) -> (*const u8, usize, usize, *const u8) {
     }
 }
 
-fn load_regions(path: &str) -> (Vec<&'static [u8]>, Vec<u8>) {
+fn load_regions(path: &str) -> (Vec<&'static [u8]>, Vec<u8>, Vec<(u32, u8)>) {
     let raw = mmap_file(path);
     let mut countries: Vec<&'static [u8]> = vec![b"_UNMATCHED"];
     let (mut c_ids, mut rmap) = ([0u8; 32768], vec![0u8; RMAP]);
+    let mut far: Vec<(u32, u8)> = Vec::new(); // region ids at or above RMAP (valid up to 9,999,999)
     let mut i = raw.iter().position(|&b| b == b'\n').map_or(raw.len(), |p| p + 1);
     while i < raw.len() {
         let l = unsafe { ndig(raw.as_ptr().add(i)) };
@@ -168,13 +169,30 @@ fn load_regions(path: &str) -> (Vec<&'static [u8]>, Vec<u8>) {
         }
         if rid < RMAP {
             rmap[rid] = c_ids[idx];
+        } else {
+            far.push((rid as u32, c_ids[idx]));
         }
         i = cs + 3;
         while i < raw.len() && raw[i] < b'0' {
             i += 1;
         }
     }
-    (countries, rmap)
+    far.sort_by_key(|&(r, _)| r); // stable: a repeated id keeps its last line
+    (countries, rmap, far)
+}
+
+// Country index of a region id at or above RMAP; 0 (_UNMATCHED) when the id is not listed.
+#[inline(always)]
+fn far_country(far: &[(u32, u8)], rid: u32) -> u8 {
+    if far.is_empty() {
+        return 0;
+    }
+    let i = far.partition_point(|&(r, _)| r <= rid);
+    if i > 0 && far[i - 1].0 == rid {
+        far[i - 1].1
+    } else {
+        0
+    }
 }
 
 // True when the line feed at `nl` ends a record: the line ends in `,region_id,amount` and a digit follows.
@@ -199,6 +217,7 @@ unsafe fn parse_chunk(
     mut p: *const u8,
     stop: *const u8,
     rmap: &[u8],
+    far: &[(u32, u8)],
     km: (&[AtomicU64], &[AtomicU64]),
     aggs: &mut [[i64; 9]],
 ) {
@@ -230,7 +249,11 @@ unsafe fn parse_chunk(
             n += 1;
         }
         for r in recs.iter_mut().take(n) {
-            let c = if (r[2] as usize) < RMAP { *rmap.get_unchecked(r[2] as usize) as usize } else { 0 };
+            let c = if (r[2] as usize) < RMAP {
+                *rmap.get_unchecked(r[2] as usize) as usize
+            } else {
+                far_country(far, r[2] as u32) as usize
+            };
             let a = aggs.get_unchecked_mut(c);
             let cents = r[3] as i64;
             a[7] |= i64::from(r[0] == 0);
@@ -262,7 +285,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).filter(|a| !a.starts_with("--")).collect();
     let data_dir = args.first().map_or("/data", String::as_str);
     let out_dir = args.get(1).map_or("/out", String::as_str);
-    let (countries, rmap) = load_regions(&format!("{data_dir}/regions.csv"));
+    let (countries, rmap, far) = load_regions(&format!("{data_dir}/regions.csv"));
     let nc = countries.len();
     let raw = mmap_file(&format!("{data_dir}/records.csv"));
     let body = &raw[raw.iter().position(|&b| b == b'\n').map_or(raw.len(), |p| p + 1)..];
@@ -299,7 +322,7 @@ fn main() {
                         }
                         let (a, b) = (cut(c), cut(c + 1));
                         if a < b {
-                            unsafe { parse_chunk(body.as_ptr().add(a), body.as_ptr().add(b), &rmap, km, &mut aggs) };
+                            unsafe { parse_chunk(body.as_ptr().add(a), body.as_ptr().add(b), &rmap, &far, km, &mut aggs) };
                         }
                     }
                 })
