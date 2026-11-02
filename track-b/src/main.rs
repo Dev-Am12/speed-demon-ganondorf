@@ -702,16 +702,14 @@ fn index_shard(docs: &[u8], a: usize, b: usize, nd: usize, vocab: &Vocab, d_coun
     }
 }
 
-/// Distinct-document counts of every term over the first `n` documents of `part`.
-fn sample_counts(part: &[u8], n: usize, vocab: &Vocab, nterms: usize) -> Vec<u32> {
+/// Distinct-document counts of every term over all documents of `part`, plus the document count.
+fn sample_counts(part: &[u8], vocab: &Vocab, nterms: usize) -> (Vec<u32>, usize) {
     let mut cnt = vec![0u32; nterms];
     let mut last = vec![u32::MAX; nterms];
     let mut pos = 0usize;
-    for d in 0..n {
-        if pos >= part.len() {
-            break;
-        }
-        let du = d as u32;
+    let mut d = 0u32;
+    while pos < part.len() {
+        let du = d;
         let end = match text_start(part, pos, part.len()) {
             Some(ts) => scan_fast(part, ts, |_, tok| {
                 if let Some(t) = tok.map(|k| vocab.code(k)).filter(|&c| c != NONE) {
@@ -726,8 +724,9 @@ fn sample_counts(part: &[u8], n: usize, vocab: &Vocab, nterms: usize) -> Vec<u32
             None => part[pos..].iter().position(|&x| x == b'\n').map_or(part.len(), |p| pos + p),
         };
         pos = end + 1;
+        d += 1;
     }
-    cnt
+    (cnt, d as usize)
 }
 
 // ------------------------------------------------------------------ queries
@@ -1159,16 +1158,22 @@ fn run(docs: &[u8]) -> io::Result<()> {
         total += k as u32;
     }
 
-    // Vocabulary table, then the dense/sparse split from the first 1/32 of every shard's
-    // documents (counted in parallel). Dense terms get the lowest ids, so the sample's ids are
-    // still the table's ids here.
+    // Vocabulary table, then the dense/sparse split from the first 1/32 of the file (as bytes,
+    // snapped to line starts and cut into one piece per thread, so the sample is the same
+    // contiguous prefix as before, counted in parallel). Dense terms get the lowest ids, so the
+    // sample's ids are still the table's ids here.
     let mut vocab = Vocab::build(&terms.keys);
-    let sample_n: usize = counts.iter().map(|&c| c / SAMPLE_DIV).sum();
-    let sampled = par_map(threads, n, || (), |i, _| {
-        sample_counts(&docs[cuts[i]..cuts[i + 1]], counts[i] / SAMPLE_DIV, &vocab, nterms)
+    let snap = |raw: usize| match raw {
+        0 => 0,
+        _ => docs[raw..].iter().position(|&b| b == b'\n').map_or(docs.len(), |p| raw + p + 1),
+    };
+    let pieces: Vec<usize> = (0..=threads).map(|k| snap(docs.len() / SAMPLE_DIV * k / threads)).collect();
+    let sampled = par_map(threads, threads, || (), |i, _| {
+        sample_counts(&docs[pieces[i]..pieces[i + 1]], &vocab, nterms)
     });
+    let sample_n: usize = sampled.iter().map(|p| p.1).sum();
     let mut scount = vec![0u32; nterms];
-    for part in &sampled {
+    for (part, _) in &sampled {
         for (s, &c) in scount.iter_mut().zip(part) {
             *s += c;
         }
