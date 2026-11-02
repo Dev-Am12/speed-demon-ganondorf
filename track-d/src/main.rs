@@ -4,10 +4,23 @@
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::FileExt;
+use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-const CHUNK_SIZE: usize = 64 * 1024;
+// SAFETY: Read-only memory map of open file descriptor
+unsafe fn libc_mmap(
+    addr: *mut u8,
+    len: usize,
+    prot: i32,
+    flags: i32,
+    fd: i32,
+    offset: i64,
+) -> *mut u8 {
+    extern "C" {
+        fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
+    }
+    mmap(addr, len, prot, flags, fd, offset)
+}
 
 struct QuadHeap {
     data: Vec<(u64, u32)>,
@@ -161,62 +174,17 @@ impl DistTable {
 }
 
 #[inline(always)]
-fn parse_u32(buf: &[u8], pos: &mut usize) -> u32 {
-    while *pos < buf.len() && buf[*pos] <= b' ' {
+fn next_u32(buf: &[u8], pos: &mut usize) -> u32 {
+    let len = buf.len();
+    while *pos < len && buf[*pos] <= b' ' {
         *pos += 1;
     }
     let mut val = 0u32;
-    while *pos < buf.len() && buf[*pos].is_ascii_digit() {
+    while *pos < len && buf[*pos] >= b'0' && buf[*pos] <= b'9' {
         val = val * 10 + (buf[*pos] - b'0') as u32;
         *pos += 1;
     }
     val
-}
-
-fn for_each_edge(
-    file: &File,
-    bounds: &[usize],
-    workers: usize,
-    on_edge: &(impl Fn(u32, u32, u32) + Sync),
-) {
-    std::thread::scope(|scope| {
-        for w in 0..workers {
-            let (start, end) = (bounds[w], bounds[w + 1]);
-            scope.spawn(move || {
-                let mut buf = [0u8; CHUNK_SIZE];
-                let (mut carried, mut cur) = (0, start);
-                while cur < end {
-                    let to_read = (CHUNK_SIZE - carried).min(end - cur);
-                    let n = file
-                        .read_at(&mut buf[carried..carried + to_read], cur as u64)
-                        .unwrap();
-                    if n == 0 {
-                        break;
-                    }
-                    let valid = carried + n;
-                    let Some(last_nl) = buf[..valid].iter().rposition(|&b| b == b'\n') else {
-                        carried = valid;
-                        cur += n;
-                        continue;
-                    };
-                    let mut pos = 0;
-                    while pos <= last_nl {
-                        let u = parse_u32(&buf, &mut pos);
-                        let v = parse_u32(&buf, &mut pos);
-                        let w = parse_u32(&buf, &mut pos);
-                        on_edge(u, v, w);
-                        while pos <= last_nl && buf[pos] != b'\n' {
-                            pos += 1;
-                        }
-                        pos += 1;
-                    }
-                    buf.copy_within(last_nl + 1..valid, 0);
-                    carried = valid - (last_nl + 1);
-                    cur += n;
-                }
-            });
-        }
-    });
 }
 
 fn shortest_path(
@@ -282,16 +250,30 @@ fn main() {
     let file = File::open(format!("{data_dir}/graph.txt")).expect("open graph");
     let file_len = file.metadata().expect("stat graph").len() as usize;
 
-    let mut header = [0u8; 128];
-    let n_read = file.read_at(&mut header, 0).expect("read header");
-    let nl = header[..n_read]
-        .iter()
-        .position(|&b| b == b'\n')
-        .unwrap_or(n_read);
+    let data: &[u8] = if file_len == 0 {
+        &[]
+    } else {
+        // SAFETY: Mapping graph.txt as read-only shared mapping of length file_len
+        let ptr = unsafe {
+            libc_mmap(
+                std::ptr::null_mut(),
+                file_len,
+                1, // PROT_READ
+                1, // MAP_SHARED
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        assert!(ptr as isize != -1, "mmap graph.txt failed");
+        // SAFETY: Pointer returned by mmap is valid for file_len bytes
+        unsafe { std::slice::from_raw_parts(ptr as *const u8, file_len) }
+    };
+
+    let nl = data.iter().position(|&b| b == b'\n').unwrap_or(data.len());
     let mut p = 0;
     let (n, m, data_start) = (
-        parse_u32(&header[..nl], &mut p) as usize,
-        parse_u32(&header[..nl], &mut p) as usize,
+        next_u32(&data[..nl], &mut p) as usize,
+        next_u32(&data[..nl], &mut p) as usize,
         (nl + 1).min(file_len),
     );
 
@@ -306,35 +288,51 @@ fn main() {
     let workers = threads.min(m.div_ceil(100_000)).max(1);
 
     let (mut bounds, data_len) = (vec![data_start; workers + 1], file_len - data_start);
-    let mut snap = [0u8; 1024];
     for w in 1..workers {
         let mut pos = data_start + data_len * w / workers;
-        while let Ok(n) = file.read_at(&mut snap[..1024.min(file_len - pos)], pos as u64) {
-            if n == 0 {
-                break;
-            }
-            if let Some(i) = snap[..n].iter().position(|&b| b == b'\n') {
-                pos += i + 1;
-                break;
-            }
-            pos += n;
+        while pos < file_len && data[pos] != b'\n' {
+            pos += 1;
         }
-        bounds[w] = pos;
+        bounds[w] = (pos + 1).min(file_len);
     }
     bounds[workers] = file_len;
     bounds.dedup();
     let actual_workers = bounds.len() - 1;
 
     let out_degrees: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
-    let has_incoming: Vec<AtomicU64> = (0..(n + 63) / 64).map(|_| AtomicU64::new(0)).collect();
-    for_each_edge(&file, &bounds, actual_workers, &|u, v, _| {
-        out_degrees[u as usize].fetch_add(1, Ordering::Relaxed);
-        has_incoming[(v as usize) >> 6].fetch_or(1 << ((v as usize) & 63), Ordering::Relaxed);
+    let words = (n + 63) / 64;
+    let mut thread_incs: Vec<Vec<u64>> = (0..actual_workers).map(|_| vec![0u64; words]).collect();
+
+    std::thread::scope(|scope| {
+        for (w, inc) in thread_incs.iter_mut().enumerate() {
+            let chunk = &data[bounds[w]..bounds[w + 1]];
+            let degs = &out_degrees;
+            scope.spawn(move || {
+                let mut pos = 0;
+                let len = chunk.len();
+                while pos < len {
+                    while pos < len && chunk[pos] <= b' ' {
+                        pos += 1;
+                    }
+                    if pos >= len {
+                        break;
+                    }
+                    let u = next_u32(chunk, &mut pos);
+                    let v = next_u32(chunk, &mut pos);
+                    let _w = next_u32(chunk, &mut pos);
+                    degs[u as usize].fetch_add(1, Ordering::Relaxed);
+                    inc[(v as usize) >> 6] |= 1u64 << ((v as usize) & 63);
+                }
+            });
+        }
     });
-    let has_incoming_bits: Vec<u64> = has_incoming
-        .into_iter()
-        .map(AtomicU64::into_inner)
-        .collect();
+
+    let mut has_incoming_bits = vec![0u64; words];
+    for inc in thread_incs {
+        for (dst, src) in has_incoming_bits.iter_mut().zip(inc) {
+            *dst |= src;
+        }
+    }
 
     let mut offsets = vec![0u32; n + 1];
     let mut cursors = Vec::with_capacity(n);
@@ -348,20 +346,50 @@ fn main() {
     drop(out_degrees);
 
     let edges: Vec<AtomicU64> = (0..m).map(|_| AtomicU64::new(0)).collect();
-    for_each_edge(&file, &bounds, actual_workers, &|u, v, w| {
-        let slot = cursors[u as usize].fetch_add(1, Ordering::Relaxed);
-        edges[slot as usize].store(((w as u64) << 32) | (v as u64), Ordering::Relaxed);
+    std::thread::scope(|scope| {
+        for w in 0..actual_workers {
+            let chunk = &data[bounds[w]..bounds[w + 1]];
+            let cur = &cursors;
+            let edg = &edges;
+            scope.spawn(move || {
+                let mut pos = 0;
+                let len = chunk.len();
+                while pos < len {
+                    while pos < len && chunk[pos] <= b' ' {
+                        pos += 1;
+                    }
+                    if pos >= len {
+                        break;
+                    }
+                    let u = next_u32(chunk, &mut pos);
+                    let v = next_u32(chunk, &mut pos);
+                    let w = next_u32(chunk, &mut pos);
+                    let slot = cur[u as usize].fetch_add(1, Ordering::Relaxed);
+                    edg[slot as usize].store(((w as u64) << 32) | (v as u64), Ordering::Relaxed);
+                }
+            });
+        }
     });
     drop(cursors);
+
+    // SAFETY: Drop read-only graph mapping to keep peak memory minimal during queries
+    if file_len > 0 {
+        extern "C" {
+            fn munmap(addr: *mut u8, len: usize) -> i32;
+        }
+        unsafe {
+            munmap(data.as_ptr() as *mut u8, file_len);
+        }
+    }
 
     let qfile = File::open(format!("{data_dir}/queries.txt")).expect("open queries");
     let mut qreader = BufReader::with_capacity(64 * 1024, qfile);
     let (mut queries, mut line) = (Vec::with_capacity(2048), Vec::new());
     while qreader.read_until(b'\n', &mut line).unwrap_or(0) > 0 {
         let mut p = 0;
-        let s = parse_u32(&line, &mut p);
+        let s = next_u32(&line, &mut p);
         if p < line.len() {
-            queries.push((s, parse_u32(&line, &mut p)));
+            queries.push((s, next_u32(&line, &mut p)));
         }
         line.clear();
     }
