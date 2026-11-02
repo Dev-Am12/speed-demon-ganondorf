@@ -23,3 +23,4 @@
 | local-e7c9ea6 | 2026-11-01T09:39:00Z | B | e7c9ea6 | Acc10 push_word set-bit loop; GATE B PASS (68 checks), tiny fuzz 2-40 PASS; four 40-run PSET batches averaged 5.7% faster than B6 but several were noisy; selected by team; board run c35a41d | 1.109s local; 0.435s board | n/a local; 67MB board | 15.741032 board | kept (board selected) |
 | run-8d8dca2d47f6 | 2026-11-02T06:45:04Z | A | 248c1df | repair: restore verified sources (A 64925b1, B 005c99a) | 0.0415s | 24MB | 32.17 | baseline |
 | run-c57c7b5fbb81 | 2026-11-02T06:45:10Z | B | 248c1df | repair: restore verified sources (A 64925b1, B 005c99a) | 0.3411s | 121MB | 15.52 | baseline |
+| run-71b1f569bb8e | 2026-11-02T06:58:49Z | B | 0c55114 | B: rebuild Vocab with kept keys, pass kept to index_shard, remove remap | 0.3072s | 122MB | 16.37 | kept |

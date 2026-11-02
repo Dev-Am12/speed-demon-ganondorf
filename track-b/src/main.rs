@@ -16,7 +16,7 @@ const ID_BITS: u32 = 18; // table payload is id + 1, so ids stay below 2^18 - 1
 const ID_MASK: u64 = (1 << ID_BITS) - 1;
 const TAG_MASK: u64 = (1 << 46) - 1; // 46-bit tag from the low bits of the slot hash
 const SAMPLE_DIV: usize = 32; // dense = document frequency >= 1/32 (measured on a sample)
-const MAX_DENSE: usize = 384; // bitset rows per shard, at most (the most frequent terms)
+const MAX_DENSE: usize = 256; // bitset rows per shard, at most (the most frequent terms)
 const BUCKET: usize = 256; // sparse term ids per log bucket
 const K_MUL: u64 = 0x517c_c1b7_2722_0a95;
 const POS_MASK: [u64; 6] = [

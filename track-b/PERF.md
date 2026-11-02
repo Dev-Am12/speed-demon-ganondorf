@@ -107,3 +107,4 @@ Reusing pass-1 state as the pass-2 cursor did not reduce RSS and was slightly sl
 | Change | Run ID | Commit | T (s) | M (MB) | S | Points | Verdict |
 |---|---|---|---|---|---|---|---|
 | repair: restore verified sources (A 64925b1, B 005c99a) | run-c57c7b5fbb81 | 248c1df | 0.341 | 121.2 | 1235 | 59.546 | baseline |
+| B: rebuild Vocab with kept keys, pass kept to index_shard, remove remap | run-71b1f569bb8e | 0c55114 | 0.307 | 121.6 | 1224 | 60.697 | kept |
